@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""eimg-ocr —— eimg 统一 OCR CLI（参数骨架 + 后端探测）。
+
+本次交付只包含「外壳」：参数解析、退出码框架、后端探测、输出序列化骨架、
+输入校验。真正的识别引擎（rapidocr / tesseract）与 PDF 栅格化属于后续任务。
+
+设计约束（不要在本文件里打破）：
+
+1. 只依赖 Python 标准库（argparse / subprocess / json / os / sys / shutil /
+   pathlib / dataclasses）。这样 `bin/eimg-ocr-setup` 可以在任何系统 python 下
+   复用探测逻辑，不必先装依赖。
+2. **模块顶层零 I/O、零副作用**：`bin/eimg-ocr-setup`（后续任务）会从本文件里
+   取 `probe_backends` 复用，`import` 那一刻不能跑任何探测、不能读配置文件、
+   不能起子进程。因此路径常量一律写成字面量，路径展开放在函数内部延迟做。
+
+   **加载方式有个坑**：本文件没有 `.py` 后缀，`importlib.util.spec_from_file_location`
+   单独用会因为推不出 loader 而返回 loader 为 None 的 spec（`module_from_spec`
+   直接 AttributeError）。必须显式给 SourceFileLoader：
+
+       loader = importlib.machinery.SourceFileLoader("eimg_ocr_cli", path)
+       spec = importlib.util.spec_from_loader(loader.name, loader)
+       mod = importlib.util.module_from_spec(spec)
+       loader.exec_module(mod)          # 此后 mod.probe_backends(...) 可用
+3. 未接入识别引擎的后端路径必须**干净失败**（退出码 4），不允许抛 traceback，
+   也不允许假装成功。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+PROG = "eimg-ocr"
+
+# ─── 退出码契约（与 openspec 计划 D3 一致，elisp 侧依赖这些数值，不要改动） ───
+EXIT_OK = 0            # 成功
+EXIT_NO_BACKEND = 2    # 无可用 OCR 后端（stderr 含「未找到可用的 OCR 后端」）
+EXIT_BAD_INPUT = 3     # 输入不可读 / 不存在 / 不支持格式 / 页码越界（含「无法读取输入」）
+EXIT_OCR_FAILED = 4    # 识别失败（含「识别失败」）
+EXIT_BAD_ARGS = 5      # 参数错误（含「参数错误」）
+
+DEFAULT_LANG = "chi_sim+eng"
+DEFAULT_DPI = 200
+
+# 顺序即 `auto` 后端的优先级顺序（rapidocr 对中文截图质量更好，故排在前）。
+BACKEND_ORDER = ("rapidocr", "tesseract")
+
+# 输入格式白名单：只放图片与 PDF，不做「任意扩展名都试一下」的猜测。
+SUPPORTED_SUFFIXES = (
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".pdf",
+)
+
+# 计划 D4 定的已知 venv：pdf-toc-ocr 里已经装好 rapidocr，首轮复用它避免重复下载。
+KNOWN_VENV_PYTHON = "/home/thomas/Workspace/pdf-toc-ocr/.venv/bin/python"
+
+# rapidocr 导入探测的超时：onnxruntime 首次 import 会加载共享库，冷启动可达数秒，
+# 60 秒是「慢但正常」与「卡死」的分界。
+RAPIDOCR_PROBE_TIMEOUT = 60
+TESSERACT_PROBE_TIMEOUT = 30
+
+
+class EimgError(Exception):
+    """携带退出码的可预期失败。main() 统一捕获后打印 stderr 并返回退出码。"""
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def warn(message: str) -> None:
+    """所有 stderr 输出统一走这里，保证 `eimg-ocr: ` 前缀不遗漏。"""
+    print(f"{PROG}: {message}", file=sys.stderr)
+
+
+def fail(code: int, message: str) -> "EimgError":
+    return EimgError(code, message)
+
+
+# ─── 参数解析 ────────────────────────────────────────────────────────────────
+
+
+class EimgArgumentParser(argparse.ArgumentParser):
+    """把 argparse 的「参数错误」映射到退出码 5。
+
+    argparse 默认对任何参数错误调用 `self.exit(2, ...)`，而退出码 2 在本 CLI 里
+    表示「无可用后端」。不覆盖的话，`--bogus` 会被上游误读成后端缺失，转而提示
+    用户去装 OCR 依赖——排查方向直接跑偏。`--help` 走 `print_help()` + `exit(0)`，
+    不经过 `error()`，因此不受影响。
+    """
+
+    def error(self, message: str) -> None:  # noqa: A003  (覆盖基类同名方法)
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_BAD_ARGS, f"{PROG}: 参数错误: {message}\n")
+
+
+def parse_lang(value: str) -> list[str]:
+    """把 tesseract 风格的语言串拆成列表：`chi_sim+eng` → `["chi_sim", "eng"]`。"""
+    langs = [part.strip() for part in value.split("+")]
+    langs = [part for part in langs if part]
+    if not langs:
+        raise argparse.ArgumentTypeError("--lang 不能为空（示例: chi_sim+eng）")
+    return langs
+
+
+def parse_positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"需要正整数，实际是 {value!r}")
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"需要正整数，实际是 {value!r}")
+    return number
+
+
+def parse_pdf_pages(value: str) -> list[int]:
+    """解析 `1-5` 或 `3` 形式的页码范围（1-based，闭区间）。
+
+    只校验语法与「页码 ≥ 1」；页码是否超过实际页数需要先渲染 PDF 才知道，
+    那属于后续 PDF 任务（届时用实际渲染页数判「页码越界」→ 退出码 3）。
+    """
+    text = value.strip()
+    if not text:
+        raise argparse.ArgumentTypeError("--pdf-pages 不能为空（示例: 1-5 或 3）")
+    if "-" in text:
+        start_text, _, end_text = text.partition("-")
+        try:
+            start, end = int(start_text), int(end_text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"页码范围格式错误: {value!r}（示例: 1-5）")
+        if start < 1 or end < 1:
+            raise argparse.ArgumentTypeError(f"页码从 1 开始: {value!r}")
+        if end < start:
+            raise argparse.ArgumentTypeError(f"页码范围倒序: {value!r}（示例: 1-5）")
+        return list(range(start, end + 1))
+    try:
+        page = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"页码格式错误: {value!r}（示例: 1-5 或 3）")
+    if page < 1:
+        raise argparse.ArgumentTypeError(f"页码从 1 开始: {value!r}")
+    return [page]
+
+
+def build_parser() -> EimgArgumentParser:
+    parser = EimgArgumentParser(
+        prog=PROG,
+        description="eimg 统一 OCR CLI（当前版本只有参数骨架与后端探测，尚未接入识别引擎）。",
+        epilog=(
+            "退出码: 0 成功 / 2 无可用后端 / 3 输入不可读 / 4 识别失败 / 5 参数错误。"
+        ),
+    )
+    parser.add_argument(
+        "files",
+        nargs="*",
+        metavar="FILE",
+        help="待识别文件（png/jpg/jpeg/webp/bmp/tif/tiff/gif/pdf）；给 --list-backends 时可省略",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=BACKEND_ORDER + ("auto",),
+        default="auto",
+        help="后端选择（默认 auto：按 rapidocr → tesseract 顺序取第一个可用者）",
+    )
+    parser.add_argument(
+        "--lang",
+        type=parse_lang,
+        default=parse_lang(DEFAULT_LANG),
+        metavar="LANGS",
+        help=f"识别语言，tesseract 语法（默认 {DEFAULT_LANG}）",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("text", "json", "lines"),
+        default="text",
+        help="输出形态（默认 text：按页输出、页间以 \\f 分隔）",
+    )
+    parser.add_argument(
+        "--pdf-pages",
+        type=parse_pdf_pages,
+        default=None,
+        metavar="PAGES",
+        help="PDF 只识别指定页，如 1-5 或 3（默认全部页）",
+    )
+    parser.add_argument(
+        "--dpi",
+        type=parse_positive_int,
+        default=DEFAULT_DPI,
+        metavar="N",
+        help=f"PDF 栅格化 DPI（默认 {DEFAULT_DPI}）",
+    )
+    parser.add_argument(
+        "--python",
+        default=None,
+        metavar="PATH",
+        help="探测 rapidocr 时优先使用的 Python 解释器（优先级高于环境变量与配置文件）",
+    )
+    parser.add_argument(
+        "--tessdata-dir",
+        default=None,
+        metavar="PATH",
+        help="tesseract 语言数据目录（透传给 --list-langs 与识别命令）",
+    )
+    parser.add_argument(
+        "--list-backends",
+        action="store_true",
+        help="列出后端可用性后退出（查询动作，无论是否有可用后端都返回 0）",
+    )
+    return parser
+
+
+# ─── 后端探测 ────────────────────────────────────────────────────────────────
+
+
+def _config_path() -> Path:
+    """按 XDG 约定算配置路径；延迟到调用时展开，保证 import 期零 I/O。"""
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share"
+    )
+    return Path(base) / "eimg" / "config.json"
+
+
+def _config_python() -> str | None:
+    """读配置文件里的 `python` 键。文件缺失 / 损坏一律静默跳过（返回 None）。"""
+    path = _config_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("python")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _python_candidates(explicit: str | None) -> list[tuple[str, str]]:
+    """按计划 D4 的优先级给出 rapidocr 候选解释器：[(来源标签, 路径), ...]。
+
+    去重按路径文本（同一路径只探测一次），标签保留第一次出现的来源，避免
+    `python3` 与 `EIMG_OCR_PYTHON` 指向同一个二进制时重复跑 import。
+    """
+    raw: list[tuple[str, str]] = [("--python", explicit)] if explicit else [
+        ("--python", "未提供")
+    ]
+
+    env_python = os.environ.get("EIMG_OCR_PYTHON")
+    raw.append(("EIMG_OCR_PYTHON", env_python if env_python else "未设置"))
+
+    cfg_python = _config_python()
+    if cfg_python:
+        raw.append((str(_config_path()), cfg_python))
+    else:
+        raw.append((str(_config_path()), "无 python 键或文件不存在"))
+
+    on_path = shutil.which("python3")
+    raw.append(("PATH 上的 python3", on_path if on_path else "未找到"))
+
+    raw.append((KNOWN_VENV_PYTHON, KNOWN_VENV_PYTHON))
+
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for label, value in raw:
+        if not value or value in ("未提供", "未设置", "未找到", "无 python 键或文件不存在"):
+            # 占位项也要保留：汇总 reason 时需要体现「这一档查过了」。
+            candidates.append((label, value))
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        candidates.append((label, value))
+    return candidates
+
+
+def _check_rapidocr(python_path: str) -> tuple[bool, str]:
+    """对单个候选解释器执行一次 `-c "import rapidocr"`。"""
+    if not Path(python_path).exists():
+        return False, "解释器不存在"
+    if not os.access(python_path, os.X_OK):
+        return False, "解释器不可执行"
+    try:
+        proc = subprocess.run(
+            [python_path, "-c", "import rapidocr"],
+            capture_output=True,
+            text=True,
+            timeout=RAPIDOCR_PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"导入超时（>{RAPIDOCR_PROBE_TIMEOUT}s）"
+    except OSError as exc:
+        return False, f"无法执行: {exc.strerror or exc}"
+    if proc.returncode == 0:
+        return True, ""
+    detail = ""
+    for line in reversed((proc.stderr or "").strip().splitlines()):
+        if line.strip():
+            detail = line.strip()
+            break
+    if not detail:
+        detail = f"退出码 {proc.returncode}"
+    return False, detail
+
+
+def _probe_rapidocr(python: str | None) -> dict:
+    """探测 rapidocr：按优先级挑解释器，第一个能 `import rapidocr` 的即可用。
+
+    注意本进程自身**绝不** import rapidocr——CLI 跑在系统 python 上，rapidocr
+    只可能装在别的环境里，硬 import 只会污染依赖并制造误判。
+    """
+    candidates = _python_candidates(python)
+    notes: list[str] = []
+    for label, value in candidates:
+        if not value or value in ("未提供", "未设置", "未找到", "无 python 键或文件不存在"):
+            notes.append(f"{label} {value}")
+            continue
+        ok, detail = _check_rapidocr(value)
+        if ok:
+            return {"name": "rapidocr", "available": True, "reason": value}
+        notes.append(f"{value}: {detail}")
+    reason = "未找到可导入 rapidocr 的解释器（已探测: " + ", ".join(notes) + "）"
+    return {"name": "rapidocr", "available": False, "reason": reason}
+
+
+def _tesseract_langs(executable: str, tessdata_dir: str | None) -> tuple[list[str], str]:
+    """跑 `tesseract --list-langs` 取语言集合，返回 (语言列表, 错误说明)。"""
+    command = [executable, "--list-langs"]
+    if tessdata_dir:
+        command.extend(["--tessdata-dir", tessdata_dir])
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, text=True, timeout=TESSERACT_PROBE_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        return [], f"--list-langs 超时（>{TESSERACT_PROBE_TIMEOUT}s）"
+    except OSError as exc:
+        return [], f"无法执行 --list-langs: {exc.strerror or exc}"
+
+    langs: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        text = line.strip()
+        if not text or text.lower().startswith("list of available"):
+            continue
+        langs.append(text)
+    if proc.returncode != 0 and not langs:
+        detail = ""
+        for line in (proc.stderr or "").strip().splitlines():
+            if line.strip():
+                detail = line.strip()
+                break
+        return [], detail or f"--list-langs 退出码 {proc.returncode}"
+    return sorted(set(langs)), ""
+
+
+def _probe_tesseract(lang: list[str] | str, tessdata_dir: str | None) -> dict:
+    """探测 tesseract：可执行存在 **且** 请求的语言数据齐全才算可用。
+
+    语言缺失算「不可用」而不是「能用但会报错」——否则 `auto` 会选中一个注定
+    识别失败的 tesseract，用户看到的错误会变成含糊的识别失败。
+    """
+    wanted = parse_lang(lang) if isinstance(lang, str) else list(lang)
+    executable = shutil.which("tesseract")
+    if not executable:
+        return {
+            "name": "tesseract",
+            "available": False,
+            "reason": "未在 PATH 上找到 tesseract",
+        }
+
+    version = ""
+    try:
+        proc = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=TESSERACT_PROBE_TIMEOUT,
+        )
+        for line in (proc.stdout or "").splitlines():
+            if line.strip():
+                version = line.strip()
+                break
+    except (subprocess.TimeoutExpired, OSError):
+        # --version 失败不影响可用性判定（存在性已由 which 确认），
+        # 但要在 reason 里体现拿不到版本号。
+        version = "版本未知"
+
+    langs, lang_error = _tesseract_langs(executable, tessdata_dir)
+    if lang_error:
+        return {
+            "name": "tesseract",
+            "available": False,
+            "reason": (
+                f"tesseract 存在但缺 {'/'.join(wanted)} 语言数据"
+                f"（语言列表取不到: {lang_error}）"
+            ),
+        }
+
+    missing = [item for item in wanted if item not in langs]
+    if missing:
+        present = ", ".join(langs) if langs else "无"
+        return {
+            "name": "tesseract",
+            "available": False,
+            "reason": (
+                f"tesseract 存在但缺 {'/'.join(missing)} 语言数据（现有: {present}）"
+            ),
+        }
+    return {
+        "name": "tesseract",
+        "available": True,
+        "reason": f"{version or 'tesseract'}；语言齐全: {'/'.join(wanted)}",
+    }
+
+
+def probe_backends(
+    lang: list[str] | str = DEFAULT_LANG,
+    python: str | None = None,
+    tessdata_dir: str | None = None,
+) -> list[dict]:
+    """探测可用 OCR 后端，返回 `[{"name", "available", "reason"}, ...]`。
+
+    顺序固定为 rapidocr → tesseract（`auto` 按此优先级取第一个可用者）。
+    模块级纯函数、无全局副作用：`bin/eimg-ocr-setup` 通过
+    `importlib.util.spec_from_file_location` 复用它做 `--check` 体检。
+    """
+    return [
+        _probe_rapidocr(python),
+        _probe_tesseract(lang, tessdata_dir),
+    ]
+
+
+def format_backend_line(entry: dict) -> str:
+    """`--list-backends` 的人读单行格式。"""
+    flag = "true" if entry.get("available") else "false"
+    return f"{entry.get('name')}: available={flag} reason={entry.get('reason', '')}"
+
+
+def resolve_backend(requested: str, backends: list[dict]) -> dict:
+    """按请求挑后端；挑不到抛退出码 2。"""
+    if requested == "auto":
+        for entry in backends:
+            if entry.get("available"):
+                return entry
+        details = "；".join(f"{e['name']}: {e['reason']}" for e in backends)
+        raise fail(EXIT_NO_BACKEND, f"未找到可用的 OCR 后端（{details}）")
+
+    for entry in backends:
+        if entry.get("name") == requested:
+            if entry.get("available"):
+                return entry
+            raise fail(
+                EXIT_NO_BACKEND,
+                f"未找到可用的 OCR 后端: {requested}（{entry.get('reason', '')}）",
+            )
+    raise fail(EXIT_NO_BACKEND, f"未找到可用的 OCR 后端: 未知后端 {requested}")
+
+
+# ─── 输入校验 ────────────────────────────────────────────────────────────────
+
+
+def validate_inputs(paths: list[str]) -> list[Path]:
+    """逐个校验输入文件；任一不合规抛退出码 3。
+
+    三种失败都归到「无法读取输入」：不存在 / 不是普通文件 / 扩展名不支持 /
+    无读权限。上游 elisp 侧只按退出码分支提示，不需要区分细类，但 stderr 里
+    写清具体原因方便手工排查。
+    """
+    validated: list[Path] = []
+    for raw in paths:
+        path = Path(os.path.expanduser(raw))
+        if not path.exists():
+            raise fail(EXIT_BAD_INPUT, f"无法读取输入: {raw}（文件不存在）")
+        if path.is_dir():
+            raise fail(EXIT_BAD_INPUT, f"无法读取输入: {raw}（是目录，不是普通文件）")
+        if not path.is_file():
+            raise fail(EXIT_BAD_INPUT, f"无法读取输入: {raw}（不是普通文件）")
+        if path.suffix.lower() not in SUPPORTED_SUFFIXES:
+            raise fail(
+                EXIT_BAD_INPUT,
+                f"无法读取输入: {raw}（不支持的格式 {path.suffix or '无扩展名'}；"
+                f"支持: {', '.join(SUPPORTED_SUFFIXES)}）",
+            )
+        if not os.access(path, os.R_OK):
+            raise fail(EXIT_BAD_INPUT, f"无法读取输入: {raw}（无读权限）")
+        validated.append(path)
+    return validated
+
+
+# ─── 输出序列化骨架（供后续识别任务复用） ──────────────────────────────────
+#
+# pages 结构约定（T2b 起所有后端都必须产出这个形状）：
+#
+#     [
+#       {"page": 1,
+#        "blocks": [{"text": "Hello", "conf": 0.98, "box": [x0, y0, x1, y1]},
+#                   ...]},
+#       ...
+#     ]
+#
+# `page` 是从 1 开始的页码（图片恒为 1）；`conf` 为 0–1 的置信度，无法给出时
+# 用 None；`box` 是像素坐标，无法给出时用 None。
+
+
+def make_block(text, conf=None, box=None) -> dict:
+    """构造一个符合 pages 约定的文本块。"""
+    return {"text": "" if text is None else str(text), "conf": conf, "box": box}
+
+
+def make_page(number: int, blocks=None) -> dict:
+    return {"page": int(number), "blocks": list(blocks or [])}
+
+
+def page_text(page: dict) -> str:
+    """单页纯文本：块之间换行。"""
+    return "\n".join(
+        block.get("text", "") for block in (page.get("blocks") or [])
+    )
+
+
+def serialize_text(pages: list[dict]) -> str:
+    """text 格式：按页输出，页与页之间以 `\\f`（换页符）分隔。"""
+    return "\f".join(page_text(page) for page in pages)
+
+
+def serialize_lines(pages: list[dict]) -> str:
+    """lines 格式：每行一条文本，页间不加分隔（行序即阅读顺序）。"""
+    lines: list[str] = []
+    for page in pages:
+        for block in page.get("blocks") or []:
+            lines.append(block.get("text", ""))
+    return "\n".join(lines)
+
+
+def serialize_json(pages: list[dict], backend: str | None = None) -> str:
+    """json 格式：`{"backend": ..., "pages": [...]}`，UTF-8 不转义。"""
+    normalized = [
+        {
+            "page": int(page.get("page", index + 1)),
+            "blocks": [
+                {
+                    "text": block.get("text", ""),
+                    "conf": block.get("conf"),
+                    "box": block.get("box"),
+                }
+                for block in (page.get("blocks") or [])
+            ],
+        }
+        for index, page in enumerate(pages)
+    ]
+    return json.dumps(
+        {"backend": backend, "pages": normalized},
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+SERIALIZERS = {
+    "text": serialize_text,
+    "lines": serialize_lines,
+}
+
+TYPE_DESCRIPTIONS = {
+    "png": "PNG 图片",
+    "jpg": "JPEG 图片",
+    "jpeg": "JPEG 图片",
+    "webp": "WebP 图片",
+    "bmp": "BMP 图片",
+    "tif": "TIFF 图片",
+    "tiff": "TIFF 图片",
+    "gif": "GIF 图片",
+    "pdf": "PDF 文档",
+}
+
+
+def serialize_pages(pages: list[dict], output_format: str, backend: str | None = None) -> str:
+    """按 `--format` 分派到具体序列化函数。"""
+    if output_format == "json":
+        return serialize_json(pages, backend=backend)
+    serializer = SERIALIZERS.get(output_format)
+    if serializer is None:  # argparse 的 choices 已拦截，这里是兜底
+        raise fail(EXIT_BAD_ARGS, f"参数错误: 未知输出格式 {output_format}")
+    return serializer(pages)
+
+
+# ─── 识别入口（本任务只有「未实现」分支） ────────────────────────────────────
+
+
+def recognize_file(path: Path, backend: dict, args) -> list[dict]:
+    """识别单个文件，返回 pages 结构。
+
+    当前版本不接引擎：无论图片还是 PDF 都干净失败（退出码 4）。后续任务按
+    文件类型分流——图片走 rapidocr/tesseract（T2b/T2c），PDF 先栅格化再识别
+    （T2d，届时 `--pdf-pages` / `--dpi` 才会真正参与）。
+    """
+    suffix = path.suffix.lower().lstrip(".")
+    kind = TYPE_DESCRIPTIONS.get(suffix, "文件")
+    if suffix == "pdf":
+        detail = "当前版本尚未接入 PDF 栅格化与识别引擎"
+    else:
+        detail = f"当前版本尚未接入识别引擎（{backend.get('name')} 后端已探测到，但识别逻辑待接入）"
+    raise fail(EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；{detail}）")
+
+
+# ─── 主流程 ──────────────────────────────────────────────────────────────────
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # 参数校验优先于任何查询/识别动作：`--list-backends --backend bogus`
+    # 这类组合里，错的是参数，不该因为「查询不需要后端」就放过。
+    # （choices 已在 parse_args 内拦掉取值错误，这里是「缺位置参数」的补充校验。）
+    if not args.list_backends and not args.files:
+        parser.error("至少需要一个 FILE（或用 --list-backends 只查后端）")
+
+    try:
+        if args.list_backends:
+            # --list-backends 是**查询**动作而非识别任务：即便所有后端都不可用，
+            # 命令本身也成功完成了「告诉你哪个后端可用、为什么不可用」这件事，
+            # 故退出码为 0。否则调用方无法区分「查询失败」与「后端全缺」，
+            # 也拿不到已经打印出来的 reason。
+            backends = probe_backends(
+                lang=args.lang, python=args.python, tessdata_dir=args.tessdata_dir
+            )
+            for entry in backends:
+                print(format_backend_line(entry))
+            return EXIT_OK
+
+        inputs = validate_inputs(args.files)
+        backends = probe_backends(
+            lang=args.lang, python=args.python, tessdata_dir=args.tessdata_dir
+        )
+        backend = resolve_backend(args.backend, backends)
+
+        pages: list[dict] = []
+        for path in inputs:
+            file_pages = recognize_file(path, backend, args)
+            if not file_pages:
+                # 后端返回空也属识别失败，不产出「成功但空输出」的假成功。
+                raise fail(EXIT_OCR_FAILED, f"识别失败: {path}（未产出任何文本页）")
+            pages.extend(file_pages)
+
+        sys.stdout.write(serialize_pages(pages, args.format, backend.get("name")))
+        sys.stdout.write("\n")
+        return EXIT_OK
+    except EimgError as exc:
+        warn(exc.message)
+        return exc.code
+    except KeyboardInterrupt:
+        warn("已中断")
+        return 130
+    except subprocess.SubprocessError as exc:  # 探测阶段的子进程异常
+        warn(f"识别失败: 子进程异常（{exc}）")
+        return EXIT_OCR_FAILED
+
+
+if __name__ == "__main__":
+    sys.exit(main())
