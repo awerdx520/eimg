@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""eimg-ocr-setup —— eimg 的 OCR 后端安装与体检脚本（只用标准库）。
+
+为什么单独成脚本、且一条都不要接进 Emacs 配置：这里的动作要么下载 venv 依赖
+（onnxruntime 等大轮子），要么下载语言模型（每个数 MB 到上百 MB），既慢又可能
+失败。让 `init` 或任何 hook 自动触发，等于把启动期变成网络期，首次启动直接卡死
+在下载上。故本脚本只在用户显式运行时动手，配置侧不持有任何安装命令。
+
+四条动作（互斥，一次跑一条）：
+
+- `--check`：只读体检，打印后端可用性、配置文件与安装位置现状。零写入。
+- `--reuse-pdf-toc-ocr`：把已经装好 rapidocr 的 pdf-toc-ocr venv 写进配置文件复用，
+  免去重复下载依赖。
+- `--rapidocr`：新建 `~/.local/share/eimg/venv` 并安装 rapidocr 全家桶。
+- `--tessdata`：把 tesseract 的 chi_sim / eng 语言数据补进
+  `~/.local/share/eimg/tessdata/`。
+
+设计约束（不要在本文件里打破）：
+
+1. **只依赖 Python 标准库**（argparse / importlib / json / os / shutil /
+   subprocess / sys / urllib / pathlib）。本脚本的职责是「在依赖都没装的环境里把
+   依赖装好」，它自己先要依赖就自相矛盾了。
+2. **探测逻辑不复制，直接复用 `bin/eimg-ocr` 的 `probe_backends`**：两处各写一份
+   「怎么判断后端可用」必然漂移（改了 CLI 忘了改安装脚本 → 体检说可用、识别说
+   不可用）。代价是那个文件没有 `.py` 后缀，加载方式见 `load_cli`。
+3. **`--dry-run` 零写入零联网**：只打印将要执行的命令 / 将要访问的 URL 与目标
+   路径，不建目录、不落盘、不发请求。它与 `--check` 的差别只在后者会真的跑探测
+   子进程（仍只读）；两者叠加时等同 `--check`。
+4. **非交互必须能取消，且不抛 traceback**：`input()` 在 stdin 是 /dev/null
+   （cron、管道、编辑器内调用）时立刻抛 EOFError。此时按「用户取消」退出 1 并
+   说明原因，绝不把 EOFError 抛给上游。
+5. **写配置走「临时文件 + 原子替换」**：config.json 是 CLI 每次探测 rapidocr 都要
+   读的文件，写到一半被 Ctrl-C 打断会留下坏 JSON；CLI 侧对坏 JSON 静默忽略，
+   用户看到的现象会变成「明明装了却说没有后端」。原子替换保证读到的要么是旧
+   内容、要么是完整新内容。
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+PROG = "eimg-ocr-setup"
+
+# ─── 退出码契约 ──────────────────────────────────────────────────────────────
+EXIT_OK = 0            # 成功（含「只打印帮助」「dry-run」这类无副作用完成）
+EXIT_FAILED = 1        # 用户取消 / 安装或下载失败
+EXIT_MISSING = 2       # 前置条件不满足（uv 缺失、源解释器不存在、CLI 加载失败）
+EXIT_BAD_ARGS = 5      # 参数错误
+
+# 复用 CLI 的模块名：仅用于 sys.modules 注册，取个不会撞上真包的名字。
+CLI_MODULE_NAME = "eimg_ocr_cli"
+CLI_FILENAME = "eimg-ocr"
+
+# 目标布局（全部挂在 XDG data 目录的 eimg/ 子目录下，与 CLI 的 `_config_path` 一致）。
+DATA_SUBDIR = "eimg"
+CONFIG_NAME = "config.json"
+VENV_DIR_NAME = "venv"
+TESSDATA_DIR_NAME = "tessdata"
+
+# 已知装好 rapidocr 的 venv；实际取值优先从 CLI 模块的 KNOWN_VENV_PYTHON 读，
+# 这里只是 CLI 里那个常量缺失时的兜底（两处不一致时以 CLI 为准）。
+FALLBACK_PDF_TOC_OCR_PYTHON = "/home/thomas/Workspace/pdf-toc-ocr/.venv/bin/python"
+
+# rapidocr 运行所需的最小依赖集：rapidocr 本体 + 推理后端 + 读图 + PDF 处理。
+RAPIDOCR_PACKAGES = ("rapidocr", "onnxruntime", "pillow", "pymupdf")
+
+# tessdata_fast 版（体积小、精度略低于 best，够日常截图 OCR）。
+TESSDATA_URLS = (
+    "https://github.com/tesseract-ocr/tessdata_fast/raw/main/chi_sim.traineddata",
+    "https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata",
+)
+
+# 体积下限：正常 chi_sim 约 2.5 MB、eng 约 4 MB。错误页（GitHub 的 HTML 报错、
+# 代理返回的 503 页面）往往几 KB 就被当成「下载成功」，故设 1 MB 下限兜住。
+MIN_TESSDATA_BYTES = 1024 * 1024
+
+DOWNLOAD_TIMEOUT = 60      # 单次 urlopen 的连接/读取超时（秒）
+DOWNLOAD_CHUNK = 64 * 1024  # 分块读写，避免把整个模型读进内存
+COMMAND_TIMEOUT = 1800     # uv pip install 装 onnxruntime 这类大轮子的上限（秒）
+
+
+class SetupError(Exception):
+    """携带退出码的可预期失败。main() 统一捕获后打印 stderr 并返回退出码。"""
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def warn(message: str) -> None:
+    """所有 stderr 输出统一走这里，保证 `eimg-ocr-setup: ` 前缀不遗漏。"""
+    print(f"{PROG}: {message}", file=sys.stderr)
+
+
+def note(message: str) -> None:
+    """stdout 的进度/计划输出，同样带前缀。"""
+    print(f"{PROG}: {message}")
+
+
+def fail(code: int, message: str) -> SetupError:
+    return SetupError(code, message)
+
+
+# ─── 目标路径（延迟展开，import 期零 I/O） ───────────────────────────────────
+
+
+def data_dir() -> Path:
+    """按 XDG 约定算数据目录，与 CLI 的 `_config_path` 保持同一套规则。"""
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share"
+    )
+    return Path(base) / DATA_SUBDIR
+
+
+def config_path() -> Path:
+    return data_dir() / CONFIG_NAME
+
+
+def venv_python() -> Path:
+    return data_dir() / VENV_DIR_NAME / "bin" / "python"
+
+
+def tessdata_dir(args) -> Path:
+    """`--tessdata-dir` 覆盖默认的 `<data>/tessdata`（探测与下载都用它）。"""
+    if args.tessdata_dir:
+        return Path(os.path.expanduser(args.tessdata_dir))
+    return data_dir() / TESSDATA_DIR_NAME
+
+
+# ─── 复用 CLI 的探测逻辑 ─────────────────────────────────────────────────────
+
+
+_CLI_MODULE = None
+
+
+def load_cli():
+    """加载同目录的无后缀 CLI，返回模块对象（首次调用后缓存）。
+
+    `importlib.util.spec_from_file_location` 对 `bin/eimg-ocr` 会返回 loader 为
+    None 的 spec（没有 `.py` 后缀就推不出 loader），接着 `module_from_spec` 直接
+    AttributeError。必须显式造 SourceFileLoader 再 `spec_from_loader`。
+
+    该模块顶层零 I/O、零副作用（其 docstring 第 2 条正是为本脚本预留的），故加载
+    既不会跑探测、也不会读配置文件或起子进程；`if __name__ == "__main__"` 因为
+    模块名是 `eimg_ocr_cli` 也不会命中。
+    """
+    global _CLI_MODULE
+    if _CLI_MODULE is not None:
+        return _CLI_MODULE
+
+    path = Path(__file__).resolve().parent / CLI_FILENAME
+    if not path.is_file():
+        raise fail(EXIT_MISSING, f"前置条件不满足: 找不到同目录的 CLI（{path}）")
+
+    loader = importlib.machinery.SourceFileLoader(CLI_MODULE_NAME, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise fail(EXIT_MISSING, f"前置条件不满足: 无法为 {path} 构造模块 spec")
+
+    module = importlib.util.module_from_spec(spec)
+    # 先注册再 exec：模块内的类/异常在 pickle、dataclass、`__module__` 自省等路径
+    # 上会按模块名反查 sys.modules，缺失时表现为难以定位的偶发失败。
+    sys.modules[loader.name] = module
+    try:
+        loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001  (加载失败一律降级为「前置条件不满足」)
+        sys.modules.pop(loader.name, None)
+        raise fail(EXIT_MISSING, f"前置条件不满足: 加载 {path} 失败（{exc}）")
+    _CLI_MODULE = module
+    return module
+
+
+def pdf_toc_ocr_python() -> str:
+    """pdf-toc-ocr venv 的解释器路径：优先取 CLI 里的常量，保持单一来源。"""
+    try:
+        cli = load_cli()
+    except SetupError:
+        return FALLBACK_PDF_TOC_OCR_PYTHON
+    return getattr(cli, "KNOWN_VENV_PYTHON", FALLBACK_PDF_TOC_OCR_PYTHON)
+
+
+# ─── 配置文件读写 ────────────────────────────────────────────────────────────
+
+
+def read_config(path: Path) -> dict:
+    """读现有配置；文件缺失、坏 JSON、非对象一律当空字典（写入即修复）。"""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def render_config(values: dict) -> str:
+    return json.dumps(values, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def save_config(values: dict, *, dry_run: bool) -> None:
+    """把 `values` 合并进现有配置并原子落盘；dry-run 只打印将写入的内容。"""
+    path = config_path()
+    merged = read_config(path)
+    merged.update(values)
+    text = render_config(merged)
+
+    if dry_run:
+        note(f"[dry-run] 将写入 {path}：")
+        for line in text.splitlines():
+            note(f"  {line}")
+        note(f"[dry-run] {path} 未被创建或修改")
+        return
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        # 同目录 rename 是原子的：读者要么看到旧文件、要么看到完整新文件。
+        tmp.replace(path)
+    except OSError as exc:
+        raise fail(EXIT_FAILED, f"写入配置失败: {path}（{exc}）")
+    note(f"已写入 {path}")
+
+
+# ─── 交互确认 ────────────────────────────────────────────────────────────────
+
+
+def confirm(question: str) -> None:
+    """无 `--yes` 时的确认；非交互环境（EOFError）与否定回答都按「已取消」退出 1。"""
+    try:
+        reply = input(f"{PROG}: {question} [y/N] ")
+    except EOFError:
+        raise fail(EXIT_FAILED, "已取消：未获得确认（stdin 已关闭，非交互环境请加 --yes）")
+    if reply.strip().lower() not in ("y", "yes"):
+        raise fail(EXIT_FAILED, "已取消：未获得确认")
+
+
+# ─── 动作一：只读体检 ────────────────────────────────────────────────────────
+
+
+def run_check(args) -> int:
+    """只读：跑后端探测 + 报告配置文件与安装位置现状，不建任何文件/目录。"""
+    cli = load_cli()
+    backends = cli.probe_backends(python=args.python, tessdata_dir=args.tessdata_dir)
+    note(f"数据目录: {data_dir()}")
+    for entry in backends:
+        note(cli.format_backend_line(entry))
+
+    path = config_path()
+    if path.exists():
+        note(f"配置文件: {path}（存在）")
+        python = read_config(path).get("python")
+        note(f"配置 python: {python if python else '未设置 python 键'}")
+    else:
+        note(f"配置文件: {path}（不存在）")
+        note("配置 python: 未设置（文件不存在）")
+
+    local_python = venv_python()
+    state = "存在" if local_python.exists() else "不存在"
+    note(f"本脚本会装的解释器: {local_python}（{state}）")
+
+    tessdata = tessdata_dir(args)
+    langs = (
+        sorted(item.name for item in tessdata.glob("*.traineddata"))
+        if tessdata.is_dir()
+        else []
+    )
+    note(
+        f"tessdata 目录: {tessdata}"
+        f"（语言数据: {', '.join(langs) if langs else '无'}）"
+    )
+    return EXIT_OK
+
+
+# ─── 动作二：复用 pdf-toc-ocr 的 venv ────────────────────────────────────────
+
+
+def run_reuse(args) -> int:
+    """把已存在的解释器写进配置的 `python` 键（写前校验存在且可执行）。"""
+    target = Path(args.python or pdf_toc_ocr_python())
+    if not target.exists():
+        raise fail(
+            EXIT_MISSING,
+            f"前置条件不满足: 解释器不存在 {target}"
+            "（可先用 --rapidocr 新建 venv，或用 --python 指定其它解释器）",
+        )
+    if not os.access(target, os.X_OK):
+        raise fail(EXIT_MISSING, f"前置条件不满足: 解释器不可执行 {target}")
+
+    note(f"复用解释器: {target}")
+    if not args.dry_run and not args.yes:
+        confirm(f"把它写入 {config_path()} 的 python 键？")
+    save_config({"python": str(target)}, dry_run=args.dry_run)
+    if not args.dry_run:
+        note("可用 --check 复核 rapidocr 是否已可用")
+    return EXIT_OK
+
+
+# ─── 动作三：新建 venv 并安装 rapidocr ───────────────────────────────────────
+
+
+def run_command(command: list[str]) -> None:
+    """前台执行安装命令（不捕获输出，让 uv 的进度直接显示给用户）。"""
+    try:
+        proc = subprocess.run(command, timeout=COMMAND_TIMEOUT)
+    except FileNotFoundError:
+        raise fail(EXIT_MISSING, f"前置条件不满足: 命令不存在 {command[0]}")
+    except subprocess.TimeoutExpired:
+        raise fail(
+            EXIT_FAILED,
+            f"安装失败: 命令超时（>{COMMAND_TIMEOUT}s）: {' '.join(command)}",
+        )
+    except OSError as exc:
+        raise fail(EXIT_FAILED, f"安装失败: 无法执行 {command[0]}（{exc}）")
+    if proc.returncode != 0:
+        raise fail(
+            EXIT_FAILED, f"安装失败: 命令退出码 {proc.returncode}: {' '.join(command)}"
+        )
+
+
+def run_rapidocr(args) -> int:
+    """`uv venv` + `uv pip install`，成功后把新解释器写进配置。"""
+    uv = shutil.which("uv")
+    if not uv:
+        raise fail(
+            EXIT_MISSING,
+            "前置条件不满足: 未在 PATH 上找到 uv（本脚本用 uv 建 venv 与装依赖）",
+        )
+
+    python = venv_python()
+    commands = [
+        [uv, "venv", str(python.parent.parent)],
+        [uv, "pip", "install", "--python", str(python), *RAPIDOCR_PACKAGES],
+    ]
+    for command in commands:
+        note(f"将执行: {' '.join(command)}")
+
+    if args.dry_run:
+        note(f"[dry-run] 以上命令不会执行；成功后会把 {python} 写入 {config_path()}")
+        return EXIT_OK
+
+    if not args.yes:
+        confirm(f"在建 venv 并安装 {' '.join(RAPIDOCR_PACKAGES)} 到现在这台机器上？")
+
+    for command in commands:
+        run_command(command)
+
+    if not python.exists():
+        raise fail(EXIT_FAILED, f"安装失败: 命令成功但未生成解释器 {python}")
+    save_config({"python": str(python)}, dry_run=False)
+    note("可用 --check 复核 rapidocr 是否已可用")
+    return EXIT_OK
+
+
+# ─── 动作四：补 tesseract 语言数据 ───────────────────────────────────────────
+
+
+def download(url: str, destination: Path) -> None:
+    """下载单个文件；任何失败或体积异常都删掉半成品再抛错，不留垃圾。"""
+    partial = destination.with_name(destination.name + ".part")
+    note(f"下载 {url} → {destination}")
+    try:
+        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response:
+            with partial.open("wb") as handle:
+                shutil.copyfileobj(response, handle, DOWNLOAD_CHUNK)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        partial.unlink(missing_ok=True)
+        raise fail(EXIT_FAILED, f"下载失败: {url}（{exc}）")
+
+    size = partial.stat().st_size
+    if size <= MIN_TESSDATA_BYTES:
+        partial.unlink(missing_ok=True)
+        raise fail(
+            EXIT_FAILED,
+            f"下载失败: {destination.name} 体积异常（{size} 字节 ≤ 1 MB，疑似错误页），"
+            "已删除半成品",
+        )
+    partial.replace(destination)
+    note(f"已下载 {destination}（{size} 字节）")
+
+
+def run_tessdata(args) -> int:
+    """把 chi_sim / eng 语言数据下到 tessdata 目录（默认 `<data>/tessdata`）。"""
+    target_dir = tessdata_dir(args)
+    targets = [(url, target_dir / url.rsplit("/", 1)[-1]) for url in TESSDATA_URLS]
+
+    if args.dry_run:
+        for url, destination in targets:
+            note(f"[dry-run] 将下载 {url} → {destination}")
+        note(f"[dry-run] {target_dir} 未被创建")
+        return EXIT_OK
+
+    if not args.yes:
+        names = "、".join(destination.name for _, destination in targets)
+        confirm(f"下载 {names} 到 {target_dir}？")
+
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise fail(EXIT_FAILED, f"创建目录失败: {target_dir}（{exc}）")
+
+    for url, destination in targets:
+        download(url, destination)
+
+    note(f"语言数据已就绪: {target_dir}")
+    note(f"用 ./bin/eimg-ocr --tessdata-dir {target_dir} 即可让 tesseract 用上")
+    return EXIT_OK
+
+
+# ─── 参数解析与入口 ──────────────────────────────────────────────────────────
+
+
+class SetupArgumentParser(argparse.ArgumentParser):
+    """把 argparse 的「参数错误」映射到退出码 5。
+
+    argparse 默认 `exit(2)`，而本脚本的 2 表示「前置条件不满足」；不覆盖的话
+    `--bogus` 会被上游误读成「环境缺东西，需要装依赖」，排查方向直接跑偏。
+    `--help` 走 `print_help()` + `exit(0)`，不经过 `error()`，不受影响。
+    """
+
+    def error(self, message: str) -> None:  # noqa: A003  (覆盖基类同名方法)
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_BAD_ARGS, f"{PROG}: 参数错误: {message}\n")
+
+
+EPILOG = """\
+这些安装动作不会被 Emacs 配置自动触发，只能由用户显式运行本脚本\
+（`init` 与任何 hook 都不下载、不安装）。
+
+四条命令的用途：
+  --check                只读体检：后端可用性、配置文件与安装位置现状，零写入
+  --reuse-pdf-toc-ocr    复用 pdf-toc-ocr 已装好 rapidocr 的 venv，只写配置文件
+  --rapidocr             新建 venv 并安装 rapidocr / onnxruntime / pillow / pymupdf
+  --tessdata             下载 tesseract 的 chi_sim + eng 语言数据到 tessdata 目录
+
+--dry-run 只打印将执行的命令与将下载的 URL（零写入零联网），与 --check 叠加时
+等同 --check。退出码: 0 成功 / 1 用户取消或安装失败 / 2 前置条件不满足 /
+5 参数错误。
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = SetupArgumentParser(
+        prog=PROG,
+        description=(
+            "eimg 的 OCR 后端安装与体检（只在用户显式运行时动手，配置不会自动触发）。"
+        ),
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # 体检与三类安装动作互斥：它们的目的各不相同，一次跑一条的语义最清楚；
+    # 互斥冲突由 argparse 拦下（→ 退出码 5），不必自己再写一遍判定。
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument(
+        "--check",
+        action="store_true",
+        help="只读体检后退出（不创建任何文件/目录）",
+    )
+    actions.add_argument(
+        "--reuse-pdf-toc-ocr",
+        action="store_true",
+        help="把 pdf-toc-ocr 的 venv 解释器写入配置的 python 键（写前校验存在且可执行）",
+    )
+    actions.add_argument(
+        "--rapidocr",
+        action="store_true",
+        help="新建 venv 并安装 rapidocr 依赖，成功后写入配置的 python 键",
+    )
+    actions.add_argument(
+        "--tessdata",
+        action="store_true",
+        help="下载 chi_sim / eng 语言数据到 tessdata 目录",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过交互确认（非交互环境必须给，否则按「已取消」退出 1）",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只打印将执行的命令 / 下载的 URL 与目标路径，零写入零联网",
+    )
+    parser.add_argument(
+        "--python",
+        default=None,
+        metavar="PATH",
+        help=(
+            "显式指定 rapidocr 解释器：--check 只探测它，--reuse-pdf-toc-ocr 改写它"
+            "（默认取 CLI 里的已知 pdf-toc-ocr venv）"
+        ),
+    )
+    parser.add_argument(
+        "--tessdata-dir",
+        default=None,
+        metavar="DIR",
+        help="语言数据目录（默认 <data>/tessdata；--check 探测与 --tessdata 下载都用它）",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not (args.check or args.reuse_pdf_toc_ocr or args.rapidocr or args.tessdata):
+        # 无动作不是错误：初次接触的人最可能就敲个名字看能做什么。
+        note("未指定动作。下面是要用它做的事（每条都需要显式运行）：")
+        parser.print_help()
+        return EXIT_OK
+
+    try:
+        if args.check:
+            return run_check(args)
+        if args.reuse_pdf_toc_ocr:
+            return run_reuse(args)
+        if args.rapidocr:
+            return run_rapidocr(args)
+        return run_tessdata(args)
+    except SetupError as exc:
+        warn(exc.message)
+        return exc.code
+    except KeyboardInterrupt:
+        warn("已中断（下载中可能有 .part 半成品，可手动删除）")
+        return EXIT_FAILED
+    except subprocess.SubprocessError as exc:  # 子进程层的意外异常
+        warn(f"安装失败: 子进程异常（{exc}）")
+        return EXIT_FAILED
+
+
+if __name__ == "__main__":
+    sys.exit(main())
