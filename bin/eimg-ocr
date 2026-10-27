@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""eimg-ocr —— eimg 统一 OCR CLI（rapidocr 识别已接入）。
+"""eimg-ocr —— eimg 统一 OCR CLI（rapidocr / tesseract 识别已接入）。
 
 当前能力：参数解析、退出码框架、后端探测、输入校验、输出序列化、
-**图片经 rapidocr 识别**。tesseract 后端与 PDF 栅格化属于后续任务，
-这两条路径仍然干净失败（退出码 4）。
+**图片经 rapidocr 或 tesseract 识别**。PDF 栅格化属于后续任务，
+那条路径仍然干净失败（退出码 4）。
 
 设计约束（不要在本文件里打破）：
 
@@ -30,6 +30,11 @@
 5. **识别结果走临时文件，不走 stdout**：rapidocr 会往 stdout 打一排 `[INFO]` 日志
    （模型路径、engine 名），解析 stdout 必然被日志污染。故内联脚本把 JSON 写进
    临时文件，父进程读文件再 `json.loads`。
+6. **tesseract 反过来：只解析 stdout 的 TSV、绝不解析 stderr**：tesseract 把识别
+   结果写 stdout、把 `Estimating resolution as ...` 之类日志写 stderr，两条流
+   必须用 `capture_output=True` 分开取。之所以统一走 TSV（而不是另跑一次纯文本
+   模式），是为了让 text / lines / json 三种格式都由**同一份 blocks** 派生——
+   跑两次会让两种格式的内容在版本或参数差异下静默不一致。
 """
 
 from __future__ import annotations
@@ -76,6 +81,11 @@ TESSERACT_PROBE_TIMEOUT = 30
 # 大图还有上限之外的波动；180 秒给这些留足余量，同时仍是「卡住」与「慢」的可靠
 # 分界（超时按退出码 4 处理，不无限挂起）。
 RAPIDOCR_TIMEOUT = 180
+
+# 单张图 tesseract 识别超时。本机实测单图（1200x400）约 0.3 秒；语言模型首次
+# 加载、大图（A4 300dpi）与慢盘会到数秒级。120 秒给这些留足余量，同时仍是
+# 「卡住」与「慢」的可靠分界（超时按退出码 4 处理，不无限挂起）。
+TESSERACT_TIMEOUT = 120
 
 
 class EimgError(Exception):
@@ -165,7 +175,8 @@ def build_parser() -> EimgArgumentParser:
     parser = EimgArgumentParser(
         prog=PROG,
         description=(
-            "eimg 统一 OCR CLI（图片识别已接入 rapidocr；tesseract 与 PDF 栅格化待接入）。"
+            "eimg 统一 OCR CLI（图片识别已接入 rapidocr 与 tesseract；"
+            "PDF 栅格化待接入）。"
         ),
         epilog=(
             "退出码: 0 成功 / 2 无可用后端 / 3 输入不可读 / 4 识别失败 / 5 参数错误。"
@@ -367,8 +378,13 @@ def _tesseract_langs(executable: str, tessdata_dir: str | None) -> tuple[list[st
     if tessdata_dir:
         command.extend(["--tessdata-dir", tessdata_dir])
     try:
+        # 同 run_tesseract：tesseract 的错误输出可能带非 UTF-8 原始字节。
         proc = subprocess.run(
-            command, capture_output=True, text=True, timeout=TESSERACT_PROBE_TIMEOUT
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=TESSERACT_PROBE_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
         return [], f"--list-langs 超时（>{TESSERACT_PROBE_TIMEOUT}s）"
@@ -412,6 +428,7 @@ def _probe_tesseract(lang: list[str] | str, tessdata_dir: str | None) -> dict:
             [executable, "--version"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=TESSERACT_PROBE_TIMEOUT,
         )
         for line in (proc.stdout or "").splitlines():
@@ -743,6 +760,16 @@ def _last_line(text: str) -> str:
     return ""
 
 
+def _stderr_tail(text: str, limit: int = 3) -> str:
+    """取 stderr 末 `limit` 行非空内容，用 ` | ` 拼成一行（失败时报错用）。
+
+    tesseract 的报错常在倒数几行（前面是进度日志），只取最后一行会把
+    `Error in pixReadMem...` 这类关键行切掉，故保留 3 行。
+    """
+    lines = [line.strip() for line in (text or "").strip().splitlines() if line.strip()]
+    return " | ".join(lines[-limit:]) if lines else ""
+
+
 def run_rapidocr(
     image_path: Path, python_exe: str, lang_timeout: int = RAPIDOCR_TIMEOUT
 ) -> list[dict]:
@@ -827,15 +854,172 @@ def run_rapidocr(
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+# ─── tesseract 后端（一次调用出 TSV，所有格式同源派生） ──────────────────────
+
+# 为什么是 `-c tessedit_create_tsv=1` 而不是把配置名 `tsv` 放在命令行最后：
+# 两种写法在**默认** tessdata 目录（/usr/share/tessdata，内含 configs/tsv 与
+# tessconfigs/tsv）下都work，但一旦传了 `--tessdata-dir`，tesseract 只在该目录
+# 里找配置文件——`tesseract img stdout -l afr --tessdata-dir /tmp/d tsv` 会打印
+# `read_params_file: Can't open tsv` 然后**静默退化成纯文本输出且退出码仍为 0**
+# （实测 tesseract 5.5.3）。这种「rc=0 但格式不对」的失败最难排查，故一律用
+# `-c` 直接设参数，它不经过配置文件查找，两种情形行为一致。
+#
+# 实测正确的参数顺序（选项可任意插在位置参数之间，位置参数顺序固定为
+# `<image> <outputbase> [configfile...]`）：
+#
+#     tesseract <image> stdout -l <langs> [--tessdata-dir <dir>] -c tessedit_create_tsv=1
+#
+# `stdout` 作为 outputbase 让结果走标准输出，不落任何临时文件（stderr 归日志）。
+
+# TSV 列序（tesseract 5.x）：
+#   level page_num block_num par_num line_num word_num left top width height conf text
+# level 取值：1 page / 2 block / 3 paragraph / 4 line / 5 word；只有 5 带真实文本。
+TSV_WORD_LEVEL = 5
+
+
+def _parse_tesseract_tsv(text: str) -> list[dict]:
+    """把 tesseract TSV 输出聚合成 blocks（一个文本行一个块）。
+
+    分组键是 `(page_num, block_num, par_num, line_num)`——直接按 level==4 的行
+    （line）取文本是不行的，level 4 行的 text 列恒为空。故取 level==5 的词行按
+    行号聚合：词之间用单空格连接，`box` 取该行词的并集，`conf` 取词 conf 均值。
+
+    `conf` 归一化到 0–1（除以 100）与 rapidocr 的语义对齐，下游不必按后端分支；
+    conf 为 -1 的词（tesseract 对拿不到置信度的词给 -1）不计入均值，整行都是
+    -1 时 conf 置 None（pages 约定允许 None）。
+    """
+    groups: dict[tuple[int, int, int, int], dict] = {}
+    # split("\t", 11) 让第 12 列（text）保留列内可能出现的制表符，不被切碎。
+    for row in (text or "").splitlines():
+        fields = row.split("\t", 11)
+        if len(fields) < 12:
+            continue
+        try:
+            if int(fields[0]) != TSV_WORD_LEVEL:
+                continue
+            page_num, block_num, par_num, line_num = (
+                int(fields[1]),
+                int(fields[2]),
+                int(fields[3]),
+                int(fields[4]),
+            )
+            left, top, width, height = (
+                int(fields[6]),
+                int(fields[7]),
+                int(fields[8]),
+                int(fields[9]),
+            )
+            conf = float(fields[10])
+        except ValueError:
+            # 表头行（level 是字面量 "level"）与任何畸形行都直接跳过：
+            # 坏一行不该让整张图识别失败。
+            continue
+
+        word = fields[11].strip()
+        if not word:
+            continue
+
+        key = (page_num, block_num, par_num, line_num)
+        group = groups.get(key)
+        if group is None:
+            group = {"words": [], "lefts": [], "tops": [], "rights": [], "bottoms": [], "confs": []}
+            groups[key] = group
+        group["words"].append(word)
+        group["lefts"].append(left)
+        group["tops"].append(top)
+        group["rights"].append(left + width)
+        group["bottoms"].append(top + height)
+        if conf >= 0:
+            group["confs"].append(conf)
+
+    blocks: list[dict] = []
+    for group in groups.values():
+        line_text = " ".join(group["words"]).strip()
+        if not line_text:
+            continue
+        box = [
+            min(group["lefts"]),
+            min(group["tops"]),
+            max(group["rights"]),
+            max(group["bottoms"]),
+        ]
+        confs = group["confs"]
+        line_conf = round(sum(confs) / len(confs) / 100.0, 4) if confs else None
+        blocks.append(make_block(line_text, line_conf, box))
+    return blocks
+
+
+def run_tesseract(
+    image_path: Path,
+    lang: list[str] | str,
+    tessdata_dir: str | None = None,
+    timeout: int = TESSERACT_TIMEOUT,
+) -> list[dict]:
+    """用 tesseract 识别一张图，返回 blocks 列表（每行一个块）。
+
+    `lang` 接受 `parse_lang` 的列表或 `chi_sim+eng` 形式的串，原样拼回 `+` 交给
+    `-l`（tesseract 自己的多语言语法）。`tessdata_dir` 非空时透传 `--tessdata-dir`，
+    供 `bin/eimg-ocr-setup` 装到自定义目录后使用。
+
+    失败一律退出码 4：超时文案含「tesseract 超时」，非零退出码文案含 stderr 末 3 行。
+    成功时 stderr（`Estimating resolution as ...` 等日志）直接丢弃——它只是噪声，
+    混进输出会把 text 格式弄脏。
+    """
+    executable = shutil.which("tesseract")
+    if not executable:
+        raise fail(
+            EXIT_OCR_FAILED, f"识别失败: {image_path}（未在 PATH 上找到 tesseract）"
+        )
+
+    wanted = parse_lang(lang) if isinstance(lang, str) else [str(item) for item in lang]
+    command = [executable, str(image_path), "stdout", "-l", "+".join(wanted)]
+    if tessdata_dir:
+        command.extend(["--tessdata-dir", str(tessdata_dir)])
+    command.extend(["-c", "tessedit_create_tsv=1"])
+
+    try:
+        # errors="replace"：leptonica 的报错会把图像里的原始字节直接写进 stderr
+        # （坏图 / 特殊 TIFF 元数据实测出现过 0xa1），默认严格 UTF-8 解码会在
+        # `subprocess.run` 内部抛 UnicodeDecodeError，让「识别失败」变成 traceback。
+        proc = subprocess.run(
+            command, capture_output=True, text=True, errors="replace", timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {image_path}（tesseract 超时: 超过 {timeout} 秒未完成）",
+        )
+    except OSError as exc:
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {image_path}（无法执行 tesseract {executable}: "
+            f"{exc.strerror or exc}）",
+        )
+
+    if proc.returncode != 0:
+        detail = _stderr_tail(proc.stderr, 3)
+        suffix = f": {detail}" if detail else ""
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {image_path}（tesseract 退出码 {proc.returncode}{suffix}）",
+        )
+
+    # 图片是一页，TSV 里 page_num 恒为 1，故块列表直接对应单页。
+    return _parse_tesseract_tsv(proc.stdout)
+
+
 # ─── 识别入口 ────────────────────────────────────────────────────────────────
 
 
 def recognize_file(path: Path, backend: dict, args) -> list[dict]:
     """识别单个文件，返回 pages 结构。
 
-    分流：图片走 rapidocr（本任务已接入）；tesseract 与 PDF 栅格化尚未接入，
-    两条路径都干净失败（退出码 4，不抛 traceback）。`--dpi` / `--pdf-pages`
+    分流：图片走 rapidocr 或 tesseract（两者均已接入）；PDF 栅格化尚未接入，
+    那条路径干净失败（退出码 4，不抛 traceback）。`--dpi` / `--pdf-pages`
     属于 PDF 路径，仍需等栅格化落地后才参与。
+
+    `--lang` 只对 tesseract 生效（原样拼成 `+` 串交给 `-l`）；rapidocr 的模型
+    固定中英文，忽略该参数但不报错——这一差异已在 `--help` 里注明。
     """
     suffix = path.suffix.lower().lstrip(".")
     kind = TYPE_DESCRIPTIONS.get(suffix, "文件")
@@ -853,9 +1037,12 @@ def recognize_file(path: Path, backend: dict, args) -> list[dict]:
         return [make_page(1, blocks)]
 
     if name == "tesseract":
-        raise fail(
-            EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；tesseract 后端待接入）"
+        blocks = run_tesseract(
+            path,
+            args.lang,
+            tessdata_dir=getattr(args, "tessdata_dir", None),
         )
+        return [make_page(1, blocks)]
 
     raise fail(EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；未知后端 {name}）")
 
