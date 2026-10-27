@@ -4,8 +4,24 @@
 截图采集、选择预览、插入、embark 集成仍在 thomas-emacs 的 `site-lisp/thomas-screenshot.el`；
 eimg 侧通过软依赖调用，计划迁移后删除原文件。
 
-## tesseract 语言数据需手工补齐
-系统 tesseract 5.5.3 默认只有 afr/osd；中英文需 `bin/eimg-ocr-setup --tessdata` 补 chi_sim+eng。
+## tesseract 语言数据需显式装一次（CLI 已默认使用 eimg 安装目录）
+系统 tesseract 5.5.3 默认只有 afr/osd；中英文需 `bin/eimg-ocr-setup --tessdata` 把 chi_sim+eng
+补到 `~/.local/share/eimg/tessdata/`。2026-10-27 起 CLI 在**未显式传** `--tessdata-dir` 时会
+自动使用该目录（判据：目录存在且含 `*.traineddata`；探测 `reason` 里注明，显式传入仍以显式
+为准），elisp 侧也有 `eimg-ocr-tessdata-dir` 可覆盖，因此「装了却不可用」不再需要手工配路径。
+
+剩下的债务只有「必须由用户显式跑一次安装」这一条事实本身：配置、`init` 与任何 hook 都不
+下载（不变量），`--check` 只能如实报告 `available=false` 并给指引。
+
+## 解释器自带的 CA 配置可能与系统不一致
+本机 `python3` 是 `/opt/miniforge/bin/python3`，其 openssl 编译期 cafile 路径不存在，于是
+`ssl.create_default_context()` 拿不到任何根证书——且因为 `SSL_CERT_FILE` 未被使用，表现成
+「系统信任库完好（`curl` 200）但 urlopen 报 `unable to get local issuer certificate`」。
+
+`bin/eimg-ocr-setup` 已按候选表自己加载系统 bundle 兜底（`/etc/ssl/cert.pem` →
+`/etc/ssl/certs/ca-certificates.crt` → `/etc/pki/tls/certs/ca-bundle.crt` → `certifi`，
+全不可用才回退解释器默认），但这是**客户端绕行**：同一台机器上不经本脚本的其它 Python 下载
+仍会撞上同一问题。根治方向是给解释器配好 `certifi` / `SSL_CERT_FILE`，或用系统 python3。
 
 ## rapidocr 依赖 Python 环境
 rapidocr 需 onnxruntime + numpy + pillow，首轮依赖用户已有 venv 或 `--rapidocr` 新建。

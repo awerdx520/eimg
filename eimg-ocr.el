@@ -84,6 +84,17 @@
   :type '(choice (const :tag "交给 CLI 探测" nil) file)
   :group 'eimg)
 
+(defcustom eimg-ocr-tessdata-dir nil
+  "tesseract 语言数据目录；nil 表示交给 `bin/eimg-ocr' 自己决定。
+落成 CLI 参数 `--tessdata-dir PATH'。nil 时 CLI 的默认顺序是「先系统默认位置，
+再看 eimg 安装目录 `<data>/eimg/tessdata`（`bin/eimg-ocr-setup --tessdata` 的
+落点，遵循 `XDG_DATA_HOME`）」——因此**装完语言数据不需要在此配置**。只有把语言
+数据放在别处（比如系统 tessdata 的私有副本）才需要显式指向。
+
+只在 `tesseract' 后端有意义；ARGS 显式给出 `:tessdata-dir' 时以 ARGS 为准。"
+  :type '(choice (const :tag "交给 CLI 探测" nil) directory)
+  :group 'eimg)
+
 (defcustom eimg-ocr-timeout 300
   "单次 OCR 的整体超时秒数（含 PDF 全部分页）。
 到点 `delete-process'，收尾状态取 `failed'、退出码取
@@ -733,12 +744,15 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
 `:format' 恒为 \"json\"：结果 buffer 必须先拿到结构化输出才能分页渲染，它与
 `eimg-ocr-report-style' 无关（后者只管渲染阶段走 org 还是纯文本）。
 `:pdf-pages' 没有对应的 defcustom——页范围是**每次调用**才决定的东西，
-默认「全部页」恰好就是「不写这个选项」，故不需要一个可持久化的默认值。"
+默认「全部页」恰好就是「不写这个选项」，故不需要一个可持久化的默认值。
+`:tessdata-dir' 为 nil 时同样不写进 argv：CLI 自己会先看系统默认位置、再看 eimg
+安装目录，本层只负责「用户显式要一个目录」时才接管。"
   (list :backend eimg-ocr-backend
         :lang eimg-ocr-lang
         :format "json"
         :dpi eimg-ocr-pdf-dpi
-        :python eimg-ocr-python))
+        :python eimg-ocr-python
+        :tessdata-dir eimg-ocr-tessdata-dir))
 
 (defun eimg-ocr--config-source (config)
   "从配置 CONFIG 里取第一个输入文件路径；没有时返回 nil。

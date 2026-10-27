@@ -64,6 +64,29 @@
 - **测试 TMPDIR 钉死**：`make test` 把 `TMPDIR` 显式指向 `$(CURDIR)/.tmp-test`，避免 ERT
   的 `make-temp-file` 产物随调用者环境漂到别的仓库（跨仓污染且测试自己看不见）。
 
+以下两条是**真实安装后**（2026-10-27，`--rapidocr` + `--tessdata`）暴露的缺口，属 0.1.0
+代码既有缺陷，故并入本节而非另起版本号（`eimg.el` 的 `Version: 0.1.0` 尚未打 tag）：
+
+- **`--tessdata` 下载兜底 CA bundle**：解释器（本机 `/opt/miniforge/bin/python3`）编译期的
+  openssl cafile 路径可能不存在，此时它既不读系统信任库、也不看 `SSL_CERT_FILE`，表现为
+  `SSL: CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate`——而系统信任
+  库本身是好的（`curl` 能通）。现在 `download()` 先按
+  `/etc/ssl/cert.pem` → `/etc/ssl/certs/ca-certificates.crt` →
+  `/etc/pki/tls/certs/ca-bundle.crt` → `certifi.where()`（已安装才用，**不新增依赖**）逐项
+  `load_verify_locations`，用第一个成功的，全不可用才回退 `ssl.create_default_context()`；
+  证书类失败的错误文案带可执行指引（`SSL_CERT_FILE=/etc/ssl/cert.pem … --tessdata`）与
+  本次实际用的 CA。实测：不设 `SSL_CERT_FILE` 时基线 `urlopen` 必失败，改后同一环境
+  真实下载 chi_sim + eng 成功。
+- **tesseract 默认使用 eimg 安装的语言数据**：`--tessdata` 把语言数据装到
+  `~/.local/share/eimg/tessdata/`，但 CLI 只探 tesseract 的默认目录
+  `/usr/share/tessdata`（本机只有 `afr`/`osd`）→ 装好却 `available=false`，且 elisp 侧没有
+  任何途径传 `--tessdata-dir`。现在 CLI 在**未显式传入** `--tessdata-dir` 时自动使用该目录
+  （前提：目录存在且含 `*.traineddata`），探测 `reason` 注明「默认使用 eimg 安装目录: …」，
+  显式传入仍以显式为准；elisp 侧新增 defcustom `eimg-ocr-tessdata-dir`（默认 `nil` = 交给
+  CLI），接入 `eimg-ocr--config-defaults` 的参数链。实测同一台机器上
+  `--list-backends` 的 tesseract 由 `available=false` 变为 `available=true`，
+  `bin/eimg-ocr --backend tesseract test/fixtures/hello.png` 输出 `Hello 世界`。
+
 ### 技术细节
 
 - **elisp 侧零第三方依赖**：`eimg-core.el` / `eimg-ocr.el` 只 require 内置库（`cl-lib` /

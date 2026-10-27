@@ -17,9 +17,10 @@
 
 设计约束（不要在本文件里打破）：
 
-1. **只依赖 Python 标准库**（argparse / importlib / json / os / shutil /
+1. **只依赖 Python 标准库**（argparse / importlib / json / os / shutil / ssl /
    subprocess / sys / urllib / pathlib）。本脚本的职责是「在依赖都没装的环境里把
-   依赖装好」，它自己先要依赖就自相矛盾了。
+   依赖装好」，它自己先要依赖就自相矛盾了。`certifi` 是唯一例外，且是**可选**的：
+   存在就用它的 bundle，不存在直接跳过（见 `ssl_context`）。
 2. **探测逻辑不复制，直接复用 `bin/eimg-ocr` 的 `probe_backends`**：两处各写一份
    「怎么判断后端可用」必然漂移（改了 CLI 忘了改安装脚本 → 体检说可用、识别说
    不可用）。代价是那个文件没有 `.py` 后缀，加载方式见 `load_cli`。
@@ -43,6 +44,7 @@ import importlib.util
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import urllib.error
@@ -87,6 +89,20 @@ MIN_TESSDATA_BYTES = 1024 * 1024
 DOWNLOAD_TIMEOUT = 60      # 单次 urlopen 的连接/读取超时（秒）
 DOWNLOAD_CHUNK = 64 * 1024  # 分块读写，避免把整个模型读进内存
 COMMAND_TIMEOUT = 1800     # uv pip install 装 onnxruntime 这类大轮子的上限（秒）
+
+# CA bundle 候选（按顺序试，用第一个能加载成功的）。为什么需要这张表：
+# `ssl.create_default_context()` 用的是**解释器编译期**的 openssl cafile（本机
+# python3 是 /opt/miniforge/bin/python3，其编译期路径可能压根不存在），此时它不读
+# 系统信任库、也不看 `SSL_CERT_FILE`，表现为下载时报
+# `SSL: CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate`——而
+# 系统信任库本身是完好的（`curl` 能通）。让用户自己猜环境变量不该是默认体验，故
+# 这里先自己找一遍系统 bundle；`certifi` 只在已安装时作为最后一位候选（**不新增
+# 依赖**，import 失败就跳过）。
+CA_BUNDLE_CANDIDATES = (
+    "/etc/ssl/cert.pem",                    # Arch / Alpine / macOS（系统根证书合集）
+    "/etc/ssl/certs/ca-certificates.crt",   # Debian / Ubuntu / Gentoo
+    "/etc/pki/tls/certs/ca-bundle.crt",     # RHEL / CentOS / Fedora
+)
 
 
 class SetupError(Exception):
@@ -368,16 +384,122 @@ def run_rapidocr(args) -> int:
 # ─── 动作四：补 tesseract 语言数据 ───────────────────────────────────────────
 
 
+_SSL_CONTEXT: tuple[ssl.SSLContext, str] | None = None
+
+
+def _certifi_bundle() -> str | None:
+    """`certifi` 已安装时返回它的 bundle 路径，否则 None（不新增依赖）。"""
+    try:
+        import certifi  # noqa: PLC0415  （可选依赖，只在下载路径上用一次）
+    except Exception:  # noqa: BLE001  import 失败的原因很多，一律当「没有」
+        return None
+    try:
+        path = certifi.where()
+    except Exception:  # noqa: BLE001
+        return None
+    return path if isinstance(path, str) and path else None
+
+
+def ssl_context() -> tuple[ssl.SSLContext, str]:
+    """构造用于下载的 SSLContext，返回 (context, 说明)。
+
+    **不读 `SSL_CERT_FILE`**：`load_verify_locations` 是显式加载，环境变量只在
+    `create_default_context()` 内部生效；本函数的职责正是「用户没配环境变量时也能
+    下成功」，故按候选表自己找 bundle。顺序：三个常见系统路径 → `certifi`（若装了）
+    → `ssl.create_default_context()` 兜底（等价于旧行为）。
+
+    结果进程内缓存：候选表与 bundle 内容在一次运行里不会变，每个文件重算一遍只会
+    多读几次磁盘。
+    """
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
+
+    tried: list[str] = []
+    candidates = list(CA_BUNDLE_CANDIDATES)
+    certifi_path = _certifi_bundle()
+    if certifi_path:
+        candidates.append(certifi_path)
+
+    for candidate in candidates:
+        try:
+            if not Path(candidate).is_file():
+                tried.append(f"{candidate}（不存在）")
+                continue
+        except OSError as exc:
+            tried.append(f"{candidate}（不可读: {exc}）")
+            continue
+        context = ssl.create_default_context()
+        try:
+            context.load_verify_locations(cafile=candidate)
+        except (ssl.SSLError, OSError, ValueError) as exc:
+            tried.append(f"{candidate}（加载失败: {exc}）")
+            continue
+        _SSL_CONTEXT = (context, candidate)
+        return _SSL_CONTEXT
+
+    # 全部候选都不可用：回退解释器默认（旧行为）。此时若解释器编译期的 cafile
+    # 也不存在，下载会失败，而错误文案会带上这份 tried 清单供排查。
+    detail = "、".join(tried) if tried else "候选表为空"
+    _SSL_CONTEXT = (
+        ssl.create_default_context(),
+        f"解释器默认（候选 CA bundle 均不可用: {detail}）",
+    )
+    return _SSL_CONTEXT
+
+
+def _is_certificate_error(exc: BaseException) -> bool:
+    """EXC 是否由证书校验失败引起（沿 `reason` / `__cause__` 链判断）。
+
+    为什么要链式判断：`urllib` 把 SSL 失败包成 `URLError`，真正的原因在
+    `.reason` 里（可能是 `SSLCertVerificationError`，也可能只是文案）；只按异常
+    类型判会漏掉包装层，只按文案判又会在不同 Python 版本上失效。两者都看。
+    """
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        item = stack.pop()
+        if item is None or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, ssl.SSLCertVerificationError):
+            return True
+        text = str(item)
+        if "CERTIFICATE_VERIFY_FAILED" in text or "certificate verify failed" in text:
+            return True
+        stack.append(getattr(item, "reason", None))
+        stack.append(item.__cause__)
+        stack.append(item.__context__)
+    return False
+
+
 def download(url: str, destination: Path) -> None:
-    """下载单个文件；任何失败或体积异常都删掉半成品再抛错，不留垃圾。"""
+    """下载单个文件；任何失败或体积异常都删掉半成品再抛错，不留垃圾。
+
+    证书类失败额外给**可执行指引**：报错原文之外再说清「怎么绕过」，否则用户看到
+    的只有 openssl 的 `unable to get local issuer certificate`，得自己去查
+    `SSL_CERT_FILE` 这个变量名。本脚本默认已经替用户找过系统 bundle（见
+    `ssl_context`），所以文案里同时列出试过的候选，便于判断是「都没有」还是
+    「有但加载失败」。
+    """
     partial = destination.with_name(destination.name + ".part")
     note(f"下载 {url} → {destination}")
+    context, source = ssl_context()
     try:
-        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response:
+        with urllib.request.urlopen(
+            url, timeout=DOWNLOAD_TIMEOUT, context=context
+        ) as response:
             with partial.open("wb") as handle:
                 shutil.copyfileobj(response, handle, DOWNLOAD_CHUNK)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         partial.unlink(missing_ok=True)
+        if _is_certificate_error(exc):
+            raise fail(
+                EXIT_FAILED,
+                f"下载失败（CA 证书校验）：{exc}；"
+                f"可尝试 SSL_CERT_FILE=/etc/ssl/cert.pem {PROG} --tessdata"
+                f"（本次用的 CA: {source}）",
+            )
         raise fail(EXIT_FAILED, f"下载失败: {url}（{exc}）")
 
     size = partial.stat().st_size
@@ -416,7 +538,10 @@ def run_tessdata(args) -> int:
         download(url, destination)
 
     note(f"语言数据已就绪: {target_dir}")
-    note(f"用 ./bin/eimg-ocr --tessdata-dir {target_dir} 即可让 tesseract 用上")
+    if target_dir == data_dir() / TESSDATA_DIR_NAME:
+        note("bin/eimg-ocr 默认就用这个目录，无需再传 --tessdata-dir")
+    else:
+        note(f"自定义目录需显式指定: ./bin/eimg-ocr --tessdata-dir {target_dir}")
     return EXIT_OK
 
 

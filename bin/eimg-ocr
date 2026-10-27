@@ -81,6 +81,10 @@ SUPPORTED_SUFFIXES = (
 # 计划 D4 定的已知 venv：pdf-toc-ocr 里已经装好 rapidocr，首轮复用它避免重复下载。
 KNOWN_VENV_PYTHON = "/home/thomas/Workspace/pdf-toc-ocr/.venv/bin/python"
 
+# eimg 自己的安装目录名（与 `bin/eimg-ocr-setup` 的 `TESSDATA_DIR_NAME` 一致）：
+# `--tessdata` 把语言数据下到 `<data>/eimg/tessdata/`，这里默认就去那儿找。
+TESSDATA_DIR_NAME = "tessdata"
+
 # rapidocr 导入探测的超时：onnxruntime 首次 import 会加载共享库，冷启动可达数秒，
 # 60 秒是「慢但正常」与「卡死」的分界。
 RAPIDOCR_PROBE_TIMEOUT = 60
@@ -269,7 +273,10 @@ def build_parser() -> EimgArgumentParser:
         "--tessdata-dir",
         default=None,
         metavar="PATH",
-        help="tesseract 语言数据目录（透传给 --list-langs 与识别命令）",
+        help=(
+            "tesseract 语言数据目录（透传给 --list-langs 与识别命令）；不给时先用"
+            "系统默认，若 eimg 安装目录（<data>/eimg/tessdata）里已有语言数据则用它"
+        ),
     )
     parser.add_argument(
         "--list-backends",
@@ -282,12 +289,54 @@ def build_parser() -> EimgArgumentParser:
 # ─── 后端探测 ────────────────────────────────────────────────────────────────
 
 
-def _config_path() -> Path:
-    """按 XDG 约定算配置路径；延迟到调用时展开，保证 import 期零 I/O。"""
+def _data_dir() -> Path:
+    """按 XDG 约定算数据目录；延迟到调用时展开，保证 import 期零 I/O。"""
     base = os.environ.get("XDG_DATA_HOME") or os.path.join(
         os.path.expanduser("~"), ".local", "share"
     )
-    return Path(base) / "eimg" / "config.json"
+    return Path(base) / "eimg"
+
+
+def _config_path() -> Path:
+    """按 XDG 约定算配置路径；延迟到调用时展开，保证 import 期零 I/O。"""
+    return _data_dir() / "config.json"
+
+
+def _installed_tessdata_dir() -> Path | None:
+    """eimg 安装目录里的语言数据（`bin/eimg-ocr-setup --tessdata` 的落点）。
+
+    判据是「目录存在 **且** 至少有一个 `*.traineddata`」：只有空目录时把
+    `--tessdata-dir` 传下去反而更糟——tesseract 会只在该目录里找语言数据，连系统
+    自带的 `osd` 都看不到，报错比不传更费解。
+    """
+    candidate = _data_dir() / TESSDATA_DIR_NAME
+    try:
+        if not candidate.is_dir():
+            return None
+        if next(candidate.glob("*.traineddata"), None) is None:
+            return None
+    except OSError:
+        return None
+    return candidate
+
+
+def resolve_tessdata_dir(explicit: str | None) -> tuple[str | None, str]:
+    """返回 `(实际用的语言数据目录, 说明)`，供探测与识别两处共用。
+
+    显式给出（`--tessdata-dir` / elisp 的 `eimg-ocr-tessdata-dir`）时**以显式为准**，
+    说明为空串——用户已经指明位置，不该再用「默认使用 eimg 安装目录」误导他。未给
+    时自动探测 eimg 安装目录，命中则连同说明返回，让调用方写进 reason。
+
+    为什么要这个默认值：`--tessdata` 把语言数据装到 `<data>/eimg/tessdata/`，而
+    tesseract 默认只探 `/usr/share/tessdata`。缺这一步时「装好的语言数据 Emacs 侧
+    用不上」，表现为探测 `available=false`——装与用之间差一条隐式约定，很难查。
+    """
+    if explicit:
+        return explicit, ""
+    installed = _installed_tessdata_dir()
+    if installed is None:
+        return None, ""
+    return str(installed), f"默认使用 eimg 安装目录: {installed}"
 
 
 def _config_python() -> str | None:
@@ -444,8 +493,12 @@ def _probe_tesseract(lang: list[str] | str, tessdata_dir: str | None) -> dict:
 
     语言缺失算「不可用」而不是「能用但会报错」——否则 `auto` 会选中一个注定
     识别失败的 tesseract，用户看到的错误会变成含糊的识别失败。
+
+    `tessdata_dir` 未给时按 `resolve_tessdata_dir` 自动落到 eimg 安装目录，并在
+    reason 末尾注明（探测结论要能解释「为什么这条可用 / 不可用」）。
     """
     wanted = parse_lang(lang) if isinstance(lang, str) else list(lang)
+    effective_dir, dir_note = resolve_tessdata_dir(tessdata_dir)
     executable = shutil.which("tesseract")
     if not executable:
         return {
@@ -472,14 +525,17 @@ def _probe_tesseract(lang: list[str] | str, tessdata_dir: str | None) -> dict:
         # 但要在 reason 里体现拿不到版本号。
         version = "版本未知"
 
-    langs, lang_error = _tesseract_langs(executable, tessdata_dir)
+    langs, lang_error = _tesseract_langs(executable, effective_dir)
+    # 失败分支也带上「查的是哪个目录」：缺语言数据时最需要的正是这个信息——
+    # 用户得知道探测看的是 eimg 安装目录还是 tesseract 的系统默认目录。
+    suffix = f"；{dir_note}" if dir_note else ""
     if lang_error:
         return {
             "name": "tesseract",
             "available": False,
             "reason": (
                 f"tesseract 存在但缺 {'/'.join(wanted)} 语言数据"
-                f"（语言列表取不到: {lang_error}）"
+                f"（语言列表取不到: {lang_error}）{suffix}"
             ),
         }
 
@@ -490,13 +546,16 @@ def _probe_tesseract(lang: list[str] | str, tessdata_dir: str | None) -> dict:
             "name": "tesseract",
             "available": False,
             "reason": (
-                f"tesseract 存在但缺 {'/'.join(missing)} 语言数据（现有: {present}）"
+                f"tesseract 存在但缺 {'/'.join(missing)} 语言数据（现有: {present}）{suffix}"
             ),
         }
+    detail = f"{version or 'tesseract'}；语言齐全: {'/'.join(wanted)}"
+    if dir_note:
+        detail = f"{detail}；{dir_note}"
     return {
         "name": "tesseract",
         "available": True,
-        "reason": f"{version or 'tesseract'}；语言齐全: {'/'.join(wanted)}",
+        "reason": detail,
     }
 
 
@@ -1109,7 +1168,9 @@ def run_tesseract(
 
     `lang` 接受 `parse_lang` 的列表或 `chi_sim+eng` 形式的串，原样拼回 `+` 交给
     `-l`（tesseract 自己的多语言语法）。`tessdata_dir` 非空时透传 `--tessdata-dir`，
-    供 `bin/eimg-ocr-setup` 装到自定义目录后使用。
+    供 `bin/eimg-ocr-setup` 装到自定义目录后使用；为空时自动落到 eimg 安装目录
+    （`resolve_tessdata_dir`），与探测阶段用的是同一条规则——否则会出现「探测说
+    可用、识别时又找不到语言数据」。
 
     失败一律退出码 4：超时文案含「tesseract 超时」，非零退出码文案含 stderr 末 3 行。
     成功时 stderr（`Estimating resolution as ...` 等日志）直接丢弃——它只是噪声，
@@ -1121,10 +1182,11 @@ def run_tesseract(
             EXIT_OCR_FAILED, f"识别失败: {image_path}（未在 PATH 上找到 tesseract）"
         )
 
+    effective_dir, _ = resolve_tessdata_dir(tessdata_dir)
     wanted = parse_lang(lang) if isinstance(lang, str) else [str(item) for item in lang]
     command = [executable, str(image_path), "stdout", "-l", "+".join(wanted)]
-    if tessdata_dir:
-        command.extend(["--tessdata-dir", str(tessdata_dir)])
+    if effective_dir:
+        command.extend(["--tessdata-dir", str(effective_dir)])
     command.extend(["-c", "tessedit_create_tsv=1"])
 
     try:

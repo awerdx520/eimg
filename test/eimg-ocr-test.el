@@ -983,6 +983,8 @@ batch 环境本身就是「无图形」的真实场景，这里再显式绑一�
   (should (equal 200 (default-value 'eimg-ocr-pdf-dpi)))
   (should (boundp 'eimg-ocr-python))
   (should (null (default-value 'eimg-ocr-python)))
+  (should (boundp 'eimg-ocr-tessdata-dir))
+  (should (null (default-value 'eimg-ocr-tessdata-dir)))
   (should (boundp 'eimg-ocr-report-style))
   (should (eq 'org (default-value 'eimg-ocr-report-style)))
   ;; 类型也要是计划的形态：report-style 是 choice，否则「用户能不能改」
@@ -1030,6 +1032,35 @@ batch 环境本身就是「无图形」的真实场景，这里再显式绑一�
          (argv (eimg-ocr-test--capture-argv '(:file "/tmp/eimg-a.png"))))
     (should (equal "/usr/bin/python3"
                    (eimg-ocr-test--arg-value argv "--python")))))
+
+(ert-deftest eimg-ocr-test-tessdata-dir-defcustom-and-default-argv ()
+  "`eimg-ocr-tessdata-dir' 存在、默认为 nil，且 nil 时 argv **不含** `--tessdata-dir'。
+nil 的语义是「交给 CLI 自己决定」（先系统默认位置、再 eimg 安装目录），因此绝不能
+把 `--tessdata-dir nil' 这类占位写进 argv——那会让 CLI 收到一个叫 \"nil\" 的目录。"
+  (should (boundp 'eimg-ocr-tessdata-dir))
+  (should (null (default-value 'eimg-ocr-tessdata-dir)))
+  (should (eq 'choice (car (get 'eimg-ocr-tessdata-dir 'custom-type))))
+  (eimg-ocr-test--reset)
+  (let ((argv (eimg-ocr-test--capture-argv '(:file "/tmp/eimg-a.png"))))
+    (should-not (member "--tessdata-dir" argv))
+    (should-not (member "nil" argv))))
+
+(ert-deftest eimg-ocr-test-run-tessdata-dir-from-defcustom-and-args ()
+  "`eimg-ocr-tessdata-dir' 非 nil 时 argv 含 `--tessdata-dir <值>'；ARGS 给值则覆盖它。
+两向都钉：只测「不出现」会把「压根没接线」判成通过，只测「出现」又看不出优先级。"
+  (eimg-ocr-test--reset)
+  (let* ((eimg-ocr-tessdata-dir "/x/tessdata")
+         (argv (eimg-ocr-test--capture-argv '(:file "/tmp/eimg-a.png"))))
+    (should (equal "/x/tessdata"
+                   (eimg-ocr-test--arg-value argv "--tessdata-dir"))))
+  (eimg-ocr-test--reset)
+  (let* ((eimg-ocr-tessdata-dir "/x/tessdata")
+         (argv (eimg-ocr-test--capture-argv
+                '(:tessdata-dir "/y/tessdata" :file "/tmp/eimg-a.png"))))
+    (should (equal "/y/tessdata"
+                   (eimg-ocr-test--arg-value argv "--tessdata-dir")))
+    (should-not (member "/x/tessdata" argv))
+    (should (= 1 (cl-count "--tessdata-dir" argv :test #'equal)))))
 
 (ert-deftest eimg-ocr-test-run-forces-json-format ()
   "ARGS 里的 `:format' 被忽略，argv 恒为 `--format json'。
@@ -1137,14 +1168,14 @@ batch 环境本身就是「无图形」的真实场景，这里再显式绑一�
       targets))))
 
 (ert-deftest eimg-ocr-test-config-defcustoms-have-no-global-setq ()
-  "源码里不存在对这五个 defcustom 的全局 `setq' / `setq-default'。
+  "源码里不存在对这六个 defcustom 的全局 `setq' / `setq-default'。
 一旦有人用 `setq' 把它们钉死，用户的 Customize 设置会被静默覆盖（且谁赢取决于
 加载时机），而代码里看不出任何异常——这类回归只能在文本层锁住。
 注释里出现这些名字是允许的（`read' 会跳过注释），故不受影响。"
   (let* ((root (file-name-directory (file-truename (locate-library "eimg"))))
          (files (directory-files root t "\\`eimg.*\\.el\\'"))
          (names '(eimg-ocr-backend eimg-ocr-lang eimg-ocr-pdf-dpi
-                  eimg-ocr-python eimg-ocr-report-style)))
+                  eimg-ocr-python eimg-ocr-tessdata-dir eimg-ocr-report-style)))
     (should files)
     (dolist (file files)
       (with-temp-buffer
