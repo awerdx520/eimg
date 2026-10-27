@@ -248,7 +248,8 @@ thomas-emacs 侧当前把它接到截图目录与默认后端上（ =eimg-ocr-im
 
 * 仓库状态
 
-- 远端 =git@github.com:awerdx520/eimg.git= *尚未创建* ，当前仅本地 =git init= 。
+- 远端 =https://github.com/awerdx520/eimg.git= （ =main= 分支，已推送并跟踪
+  =origin/main= ；仓库家族惯例用 HTTPS，SSH 22/443 在本机被重置）。
 - thomas-emacs 通过 straight =:local-repo "/home/thomas/Workspace/eimg"= + =:branch "main"=
   接入，不登记 =versions.lock.el= （ =:local-repo= 下 lock 无效）。
 - 版本号在 =eimg.el= 的 =eimg-version= 常量里，当前 =0.1.0= 。

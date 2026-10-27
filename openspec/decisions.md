@@ -5,7 +5,7 @@
 ## D1 仓库形态与接入方式（2026-10-27）
 
 - **决策**：eimg 是独立 git 仓库（本地 `~/Workspace/eimg`，远端 `git@github.com:awerdx520/eimg.git`
-  尚未创建），thomas-emacs 通过 straight `:local-repo` 直连接入，
+  尚未创建〔该状态已过时，见 D9：远端已创建并推送〕），thomas-emacs 通过 straight `:local-repo` 直连接入，
   `:files ("eimg*.el" (:exclude "eimg-autoloads.el"))`、`:build (:not compile native-compile)`。
 - **附则一：不登记 `versions.lock.el`**。`:local-repo` 下 straight 用的是开发仓 live HEAD，
   lock 条目无效；`M-x straight-freeze-versions` 一旦误跑，会把本地 HEAD 写回 lock，制造
@@ -105,3 +105,14 @@
   `cl-lib` / `jka-compr` 报 `Recursive load`）。失败后 loaddefs 会把**宏调用原样**抄进
   autoloads 文件，那份文件一被加载就要有 `transient-define-prefix`，等于每台机器启动即加载
   transient——正好否掉「不按菜单的人不为它付启动成本」。纯数据声明能被逐字复制、零依赖。
+
+## D9 远端仓库创建与传输方式（2026-10-27）
+
+- **决策**：远端 `https://github.com/awerdx520/eimg.git` 已创建，`main` 分支已推送并建立
+  跟踪（`origin/main`）。传输方式取 **HTTPS**，而非 D1 预设的 SSH。
+- **理由**：本机到 `github.com:22` 与 `ssh.github.com:443` 均被重置
+  （`kex_exchange_identification: read: Connection reset by peer`），SSH 路径不可用；同时
+  `el-chronos` / `cn-word-boundary` / `seshat` 三个自研仓的 `origin` 全部是 HTTPS，跟随家族
+  惯例可减少一次凭据体系分支。代价是推送依赖 credential store（`credential.helper = store`）。
+- **不变**：D1 的附则一（不登记 `versions.lock.el`）与附则二（`:files` 排除 autoloads）继续
+  有效，不受传输方式影响。
