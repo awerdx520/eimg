@@ -63,3 +63,19 @@ eimg 侧只会得到「截图函数没有返回文件路径」——功能静默
 
 迁移到 `eimg-capture` 之后，截图实现与 OCR 同仓，应把这条契约改成同仓 ERT 锁定
 （命令返回绝对路径 + 文件确实存在 + 走 `call-interactively` 路径），届时本条债务关闭。
+
+## 交互入口在 daemon / 批处理下会阻塞（异步只覆盖「识别」这一段）
+
+OCR 本身全异步（`eimg-ocr--start` 立即返回，收尾由 sentinel 完成），但**取输入**与
+**取确认**这两段仍是同步的：
+
+| 位置 | 同步点 | 无 attached frame / `noninteractive` 时的表现 |
+|---|---|---|
+| `eimg-ocr-region` / `eimg-ocr-capture-command` | `call-interactively` 调截图命令（外部工具选区域） | 等外部进程；无图形环境时 `eimg-ocr-region` 已先 `user-error`，但 `display-graphic-p` 为真却无可用 frame 时仍会卡在这里 |
+| `eimg-ocr-file` | `read-file-name` | 无 minibuffer 可交互 → 阻塞或直接失败 |
+| `eimg-ocr-history` | `completing-read` | 同上 |
+| `eimg-ocr-write-file` | 覆盖前 `y-or-n-p` | 同上（ERT 用例里靠 `cl-letf` 打桩绕过，未覆盖真实 daemon 路径） |
+
+这不是可以「顺手修」的缺陷：截图选区域本质上要人操作。留作后续决定——可选方向是给三个
+入口命令加一个「非交互参数入口」（直接吃文件路径，不弹选择器），让 daemon / 脚本能复用同一条
+OCR 编排路径；在那之前，从 daemon（`emacsclient -e`、定时任务）调这些命令不要指望能返回。
