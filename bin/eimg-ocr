@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""eimg-ocr —— eimg 统一 OCR CLI（rapidocr / tesseract 识别已接入）。
+"""eimg-ocr —— eimg 统一 OCR CLI（rapidocr / tesseract 识别 + PDF 分页已接入）。
 
 当前能力：参数解析、退出码框架、后端探测、输入校验、输出序列化、
-**图片经 rapidocr 或 tesseract 识别**。PDF 栅格化属于后续任务，
-那条路径仍然干净失败（退出码 4）。
+**图片经 rapidocr 或 tesseract 识别**、**PDF 经 pdftoppm 栅格化后按页识别**
+（`--pdf-pages` 选中单页或区间，`--dpi` 控制栅格化精度）。
 
 设计约束（不要在本文件里打破）：
 
@@ -35,6 +35,11 @@
    必须用 `capture_output=True` 分开取。之所以统一走 TSV（而不是另跑一次纯文本
    模式），是为了让 text / lines / json 三种格式都由**同一份 blocks** 派生——
    跑两次会让两种格式的内容在版本或参数差异下静默不一致。
+7. **PDF 每页单独识别、页码取真实页码**：`pages[i]["page"]` 是 PDF 里的页号，
+   不是数组下标（`--pdf-pages 2` → `pages[0]["page"] == 2`）。下游 elisp 侧要
+   按页号回填文件名（`report.pdf` 第 3 页），用下标会让选区页码整体偏移。
+8. **栅格化临时目录必须 finally 清理**：一份 200 dpi 的 10 页 PDF 拆出的 PNG 有
+   十几 MB，失败路径（超时 / Ctrl-C / 后端报错）漏删会持续堆积在 /tmp。
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -59,6 +65,10 @@ EXIT_BAD_ARGS = 5      # 参数错误（含「参数错误」）
 
 DEFAULT_LANG = "chi_sim+eng"
 DEFAULT_DPI = 200
+
+# 所有临时目录统一用这个前缀（栅格化产物 / rapidocr 脚本与结果文件），
+# 便于 `ls -d /tmp/eimg-ocr-*` 做泄漏排查，也便于测试断言清理干净。
+TEMP_PREFIX = "eimg-ocr-"
 
 # 顺序即 `auto` 后端的优先级顺序（rapidocr 对中文截图质量更好，故排在前）。
 BACKEND_ORDER = ("rapidocr", "tesseract")
@@ -86,6 +96,21 @@ RAPIDOCR_TIMEOUT = 180
 # 加载、大图（A4 300dpi）与慢盘会到数秒级。120 秒给这些留足余量，同时仍是
 # 「卡住」与「慢」的可靠分界（超时按退出码 4 处理，不无限挂起）。
 TESSERACT_TIMEOUT = 120
+
+# `pdfinfo` 取页数超时。它只读 xref 表，本机实测毫秒级；5 秒已是「异常」的判据。
+# 超时按「拿不到页数」处理（返回 None，走 pdftoppm 兜底判据），不算识别失败——
+# 页数只用于把越界报错说清楚，拿不到不该阻断整条识别路径。
+PDFINFO_TIMEOUT = 5
+
+# 整本 PDF 栅格化超时。单页 200 dpi 实测 0.2 秒量级，10 页约 2 秒；但扫描版
+# 大页（A3 600dpi）、慢盘与超大页数会显著变长。600 秒给「一本书」留余量，
+# 同时仍是「卡住」与「慢」的可靠分界（超时按退出码 4 处理）。
+PDF_RASTER_TIMEOUT = 600
+
+# pdftoppm 对「起始页 > 文档末页」的区间返回这个退出码（实测 26.10.0），
+# stderr 形如 `Wrong page range given: the first page (9) can not be after the
+# last page (3).`。它是「页码越界」的可靠信号，与真正的渲染失败区分开。
+PDFTOPPPM_PAGE_RANGE_ERROR = 99
 
 
 class EimgError(Exception):
@@ -145,8 +170,9 @@ def parse_positive_int(value: str) -> int:
 def parse_pdf_pages(value: str) -> list[int]:
     """解析 `1-5` 或 `3` 形式的页码范围（1-based，闭区间）。
 
-    只校验语法与「页码 ≥ 1」；页码是否超过实际页数需要先渲染 PDF 才知道，
-    那属于后续 PDF 任务（届时用实际渲染页数判「页码越界」→ 退出码 3）。
+    这里只管语法与「页码 ≥ 1」「区间不倒序」。「页码是否超过文档实际页数」需要
+    先知道真实页数，由 `pdf_page_count`（pdfinfo）或 pdftoppm 的越界信号在
+    `recognize_pdf` 里判定 → 退出码 3。
     """
     text = value.strip()
     if not text:
@@ -175,11 +201,11 @@ def build_parser() -> EimgArgumentParser:
     parser = EimgArgumentParser(
         prog=PROG,
         description=(
-            "eimg 统一 OCR CLI（图片识别已接入 rapidocr 与 tesseract；"
-            "PDF 栅格化待接入）。"
+            "eimg 统一 OCR CLI（图片与 PDF 均可识别；PDF 经 pdftoppm 栅格化后逐页识别）。"
         ),
         epilog=(
-            "退出码: 0 成功 / 2 无可用后端 / 3 输入不可读 / 4 识别失败 / 5 参数错误。"
+            "退出码: 0 成功 / 2 无可用后端 / 3 输入不可读（含页码越界） / "
+            "4 识别失败 / 5 参数错误。"
         ),
     )
     parser.add_argument(
@@ -218,7 +244,10 @@ def build_parser() -> EimgArgumentParser:
         type=parse_pdf_pages,
         default=None,
         metavar="PAGES",
-        help="PDF 只识别指定页，如 1-5 或 3（默认全部页）",
+        help=(
+            "PDF 只识别指定页，如 1-5 或 3（默认全部页）；页码越界退出码 3。"
+            "对图片输入无意义，会被忽略"
+        ),
     )
     parser.add_argument(
         "--dpi",
@@ -548,13 +577,16 @@ def validate_inputs(paths: list[str]) -> list[Path]:
 #
 #     [
 #       {"page": 1,
+#        "source": "report.pdf",
 #        "blocks": [{"text": "Hello", "conf": 0.98, "box": [x0, y0, x1, y1]},
 #                   ...]},
 #       ...
 #     ]
 #
-# `page` 是从 1 开始的页码（图片恒为 1）；`conf` 为 0–1 的置信度，无法给出时
-# 用 None；`box` 是像素坐标，无法给出时用 None。
+# `page` 是从 1 开始的**真实页码**：图片恒为 1，PDF 取文档里的页号（`--pdf-pages 2`
+# → `page == 2`，不是数组下标）；`source` 是输入文件的 basename（多文件输入时用于
+# 把页归回文件）；`conf` 为 0–1 的置信度，任何后端拿不到时一律 0.0（不吃 None，
+# 让下游不必写 `if conf is None` 分支）；`box` 是像素坐标，无法给出时用 None。
 
 
 def make_block(text, conf=None, box=None) -> dict:
@@ -562,8 +594,12 @@ def make_block(text, conf=None, box=None) -> dict:
     return {"text": "" if text is None else str(text), "conf": conf, "box": box}
 
 
-def make_page(number: int, blocks=None) -> dict:
-    return {"page": int(number), "blocks": list(blocks or [])}
+def make_page(number: int, blocks=None, source: str | None = None) -> dict:
+    """构造一页；`number` 是**真实页码**（PDF 页号 / 图片恒为 1）。"""
+    page = {"page": int(number), "blocks": list(blocks or [])}
+    if source is not None:
+        page["source"] = str(source)
+    return page
 
 
 def page_text(page: dict) -> str:
@@ -574,8 +610,14 @@ def page_text(page: dict) -> str:
 
 
 def serialize_text(pages: list[dict]) -> str:
-    """text 格式：按页输出，页与页之间以 `\\f`（换页符）分隔。"""
-    return "\f".join(page_text(page) for page in pages)
+    """text 格式：按页输出，页与页之间以 `\\f`（换页符）分隔。
+
+    每页文本以换行收尾、`\\f` 落在**下一行行首**（与 `pdftotext` 的习惯一致）。
+    不能直接把 `\\f` 夹在行中间：那样两个换页符可能落在同一行里，按行处理的下游
+    （`grep -c`、`while read`、`awk`）会把两页当成一页。
+    """
+    body = "\f".join(page_text(page) + "\n" for page in pages)
+    return body.rstrip("\n")
 
 
 def serialize_lines(pages: list[dict]) -> str:
@@ -588,10 +630,15 @@ def serialize_lines(pages: list[dict]) -> str:
 
 
 def serialize_json(pages: list[dict], backend: str | None = None) -> str:
-    """json 格式：`{"backend": ..., "pages": [...]}`，UTF-8 不转义。"""
+    """json 格式：`{"backend": ..., "pages": [...]}`，UTF-8 不转义。
+
+    每页恒带 `source`（输入文件 basename）——多文件输入时下游靠它把页归回文件，
+    单文件时保留同一形状，避免下游写「有时有有时没有」的分支。
+    """
     normalized = [
         {
             "page": int(page.get("page", index + 1)),
+            "source": page.get("source"),
             "blocks": [
                 {
                     "text": block.get("text", ""),
@@ -785,7 +832,7 @@ def run_rapidocr(
     if not python_exe:
         raise fail(EXIT_OCR_FAILED, f"识别失败: {image_path}（rapidocr 解释器未知）")
 
-    workdir = tempfile.mkdtemp(prefix="eimg-ocr-")
+    workdir = tempfile.mkdtemp(prefix=TEMP_PREFIX)
     try:
         script_path = Path(workdir) / "rapidocr_recognize.py"
         script_path.write_text(RAPIDOCR_INLINE_SCRIPT, encoding="utf-8")
@@ -886,7 +933,8 @@ def _parse_tesseract_tsv(text: str) -> list[dict]:
 
     `conf` 归一化到 0–1（除以 100）与 rapidocr 的语义对齐，下游不必按后端分支；
     conf 为 -1 的词（tesseract 对拿不到置信度的词给 -1）不计入均值，整行都是
-    -1 时 conf 置 None（pages 约定允许 None）。
+    -1 时 conf 取 0.0——与 rapidocr 侧「拿不到就给 0.0」保持一致，不吃 None，
+    免得下游每处都得先判 `conf is None`。
     """
     groups: dict[tuple[int, int, int, int], dict] = {}
     # split("\t", 11) 让第 12 列（text）保留列内可能出现的制表符，不被切碎。
@@ -944,7 +992,9 @@ def _parse_tesseract_tsv(text: str) -> list[dict]:
             max(group["bottoms"]),
         ]
         confs = group["confs"]
-        line_conf = round(sum(confs) / len(confs) / 100.0, 4) if confs else None
+        # 整行词 conf 全为 -1（tesseract 拿不到置信度）时给 0.0 而不是 None：
+        # rapidocr 侧同样以 0.0 兜底，两侧一致下游才不必分支。
+        line_conf = round(sum(confs) / len(confs) / 100.0, 4) if confs else 0.0
         blocks.append(make_block(line_text, line_conf, box))
     return blocks
 
@@ -1008,43 +1058,251 @@ def run_tesseract(
     return _parse_tesseract_tsv(proc.stdout)
 
 
+# ─── PDF 栅格化（pdftoppm） ──────────────────────────────────────────────────
+
+
+def natural_sort_key(name: str) -> list:
+    """自然排序键：把数字段按数值比较。
+
+    必须用自然排序而不是字典序——pdftoppm 的输出名把页号**零填充**到与总页数
+    相同的位数（12 页文档 → `page-01.png` … `page-12.png`），字典序会把
+    `page-10.png` 排在 `page-2.png` 前面，识别结果的页序直接错乱。
+    """
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", name)
+    ]
+
+
+def image_page_number(path: Path) -> int | None:
+    """从 pdftoppm 输出文件名取页号（`page-07.png` → 7），取不到返回 None。
+
+    输出名固定是 `<prefix>-<页号>.png`，但**零填充位数随总页数变化**（3 页 →
+    `page-1.png`；12 页 → `page-01.png`），所以不能硬编码位数。也不能用
+    「首个文件 = 起始页 + 下标」推算：请求 `-f 2 -l 5` 打在 3 页文档上时，
+    pdftoppm 只输出 2、3 两页（rc 仍为 0），下标推算会给出 2、3 之外的错页号。
+    取文件名里最后一个数字段，两种情况都准确。
+    """
+    numbers = re.findall(r"\d+", path.name)
+    return int(numbers[-1]) if numbers else None
+
+
+def pdf_page_count(path: Path) -> int | None:
+    """用 `pdfinfo` 取 PDF 真实页数；pdfinfo 缺失 / 失败 / 输出不可解析时返回 None。
+
+    页数只用于把「页码越界」的报错说清楚（「页码 9 超出范围（共 3 页）」），
+    拿不到就不该阻断识别——返回 None，由 pdftoppm 的越界信号兜底判定。
+    """
+    executable = shutil.which("pdfinfo")
+    if not executable:
+        return None
+    try:
+        proc = subprocess.run(
+            [executable, str(path)],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=PDFINFO_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        # 损坏 / 加密的 PDF 在这里就走不通，让 pdftoppm 去给出更具体的报错。
+        return None
+    for line in (proc.stdout or "").splitlines():
+        key, _, value = line.partition(":")
+        if key.strip().lower() == "pages":
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _pdf_overflow_message(
+    path: Path,
+    requested: list[int],
+    total: int | None,
+    first_overflow: int | None = None,
+) -> str:
+    """页码越界的统一文案（退出码 3，含「无法读取输入」与「超出范围」）。
+
+    `first_overflow` 是**最小的越界页号**（3 页文档请求 `2-9` → 4）。不能用
+    `min(requested)`：那会报成「页码 2 超出范围」，而 2 明明是有效页，
+    用户按提示改参数会越改越糊涂。pdftoppm 报越界（rc 99）时手头没有具体
+    越界页，才退回 `min(requested)`——那种情形下它确实已经越界。
+    """
+    span = (
+        f"{requested[0]}-{requested[-1]}" if len(requested) > 1 else str(requested[0])
+    )
+    first = first_overflow if first_overflow is not None else min(requested)
+    if total is not None:
+        return (
+            f"无法读取输入: {path}（页码 {first} 超出范围（共 {total} 页），"
+            f"请求 {span}）"
+        )
+    return (
+        f"无法读取输入: {path}（页码 {span} 超出范围，"
+        f"PDF 无对应页；可用 pdfinfo 查看总页数）"
+    )
+
+
+def rasterize_pdf(
+    path: Path,
+    dpi: int,
+    pages: list[int] | None,
+    workdir: str,
+    total: int | None = None,
+) -> list[tuple[int, Path]]:
+    """把 PDF 选中页栅格化成 PNG，返回 `[(真实页码, 图片路径), ...]`（页码升序）。
+
+    `pages` 为 None 表示整本。多页一次调用 `-f/-l` 渲完：每页起一次 pdftoppm
+    会把整本的 xref 重复解析 N 遍，10 页文档实测慢 5 倍以上。
+
+    三类失败分开报：
+    - 起始页超过文档末页（pdftoppm 退出码 99）→ 退出码 3，页码越界文案；
+    - 渲染零输出（无 pdfinfo 时唯一的越界判据）→ 同上；
+    - 其它非零退出码（文件损坏 / 加密）→ 退出码 3，带 stderr 末两行。
+    """
+    executable = shutil.which("pdftoppm")
+    if not executable:
+        raise fail(
+            EXIT_BAD_INPUT,
+            f"无法读取输入: {path}（未在 PATH 上找到 pdftoppm，无法栅格化 PDF）",
+        )
+
+    prefix = Path(workdir) / "page"
+    command = [executable, "-r", str(dpi), "-png"]
+    if pages:
+        command.extend(["-f", str(pages[0]), "-l", str(pages[-1])])
+    command.extend([str(path), str(prefix)])
+
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=PDF_RASTER_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {path}（pdftoppm 超时: 超过 {PDF_RASTER_TIMEOUT} 秒未完成）",
+        )
+    except OSError as exc:
+        raise fail(
+            EXIT_BAD_INPUT,
+            f"无法读取输入: {path}（无法执行 pdftoppm {executable}: "
+            f"{exc.strerror or exc}）",
+        )
+
+    if proc.returncode == PDFTOPPPM_PAGE_RANGE_ERROR and pages:
+        raise fail(EXIT_BAD_INPUT, _pdf_overflow_message(path, pages, total))
+    if proc.returncode != 0:
+        detail = _stderr_tail(proc.stderr, 2)
+        suffix = f": {detail}" if detail else ""
+        raise fail(
+            EXIT_BAD_INPUT,
+            f"无法读取输入: {path}（pdftoppm 退出码 {proc.returncode}{suffix}）",
+        )
+
+    produced = sorted(
+        Path(workdir).glob("page*.png"), key=lambda item: natural_sort_key(item.name)
+    )
+    if not produced:
+        if pages:
+            raise fail(EXIT_BAD_INPUT, _pdf_overflow_message(path, pages, total))
+        raise fail(EXIT_BAD_INPUT, f"无法读取输入: {path}（PDF 未渲染出任何页面）")
+
+    rasterized: list[tuple[int, Path]] = []
+    for index, image in enumerate(produced):
+        number = image_page_number(image)
+        if number is None:  # pdftoppm 命名固定，理论不会走到；兜底按起始页 + 下标
+            number = (pages[0] if pages else 1) + index
+        rasterized.append((number, image))
+    return rasterized
+
+
 # ─── 识别入口 ────────────────────────────────────────────────────────────────
 
 
-def recognize_file(path: Path, backend: dict, args) -> list[dict]:
-    """识别单个文件，返回 pages 结构。
-
-    分流：图片走 rapidocr 或 tesseract（两者均已接入）；PDF 栅格化尚未接入，
-    那条路径干净失败（退出码 4，不抛 traceback）。`--dpi` / `--pdf-pages`
-    属于 PDF 路径，仍需等栅格化落地后才参与。
-
-    `--lang` 只对 tesseract 生效（原样拼成 `+` 串交给 `-l`）；rapidocr 的模型
-    固定中英文，忽略该参数但不报错——这一差异已在 `--help` 里注明。
-    """
-    suffix = path.suffix.lower().lstrip(".")
-    kind = TYPE_DESCRIPTIONS.get(suffix, "文件")
+def recognize_image(path: Path, backend: dict, args) -> list[dict]:
+    """识别单张图片，返回 blocks 列表（不含页码包装）。"""
+    kind = TYPE_DESCRIPTIONS.get(path.suffix.lower().lstrip("."), "文件")
     name = backend.get("name")
-
-    if suffix == "pdf":
-        raise fail(
-            EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；PDF 栅格化待接入）"
-        )
 
     if name == "rapidocr":
         # rapidocr 可用时 reason 就是「能 import rapidocr 的解释器路径」：探测阶段
         # 已确认它存在且可执行，这里直接拿来起子进程。
-        blocks = run_rapidocr(path, backend.get("reason") or "")
-        return [make_page(1, blocks)]
+        return run_rapidocr(path, backend.get("reason") or "")
 
     if name == "tesseract":
-        blocks = run_tesseract(
+        return run_tesseract(
             path,
             args.lang,
             tessdata_dir=getattr(args, "tessdata_dir", None),
         )
-        return [make_page(1, blocks)]
 
     raise fail(EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；未知后端 {name}）")
+
+
+def recognize_pdf(path: Path, backend: dict, args) -> list[dict]:
+    """PDF：栅格化后**逐页**识别，返回 pages（`page` 是 PDF 里的真实页码）。
+
+    逐页而不是整本一次：tesseract / rapidocr 都是单图接口，整本传不进去；也正因为
+    每页单独调用，多页 TSV 天然按页分组（一次传整本时 TSV 的 page_num 会混在
+    同一份输出里，还得再拆）。
+
+    临时目录在 `finally` 里删：成功、后端报错、超时、Ctrl-C 四条路径都要清。
+
+    已知边界：拿不到 pdfinfo（未安装）时无法判断「请求区间部分越界」，此时
+    pdftoppm 自身会把区间截断到最后一页（`-f 2 -l 9` 打在 3 页文档上只输出
+    2、3 两页且 rc=0），我们照实返回识别到的页，不报错——没有总页数就没有
+    判据，「少了几页」这件事只能靠下游对页数自检。
+    """
+    requested = getattr(args, "pdf_pages", None)
+    dpi = getattr(args, "dpi", DEFAULT_DPI)
+
+    total = pdf_page_count(path)
+    if total is not None:
+        if total <= 0:
+            raise fail(EXIT_BAD_INPUT, f"无法读取输入: {path}（PDF 页数为 0）")
+        if requested:
+            overflow = [page for page in requested if page > total]
+            if overflow:
+                raise fail(
+                    EXIT_BAD_INPUT,
+                    _pdf_overflow_message(path, requested, total, min(overflow)),
+                )
+
+    workdir = tempfile.mkdtemp(prefix=TEMP_PREFIX)
+    try:
+        rasterized = rasterize_pdf(path, dpi, requested, workdir, total)
+        pages = [
+            make_page(number, recognize_image(image, backend, args))
+            for number, image in rasterized
+        ]
+    finally:
+        # 一份 200 dpi 的 A4 页解出来是几百 KB，失败路径漏删会在 /tmp 长期堆积。
+        shutil.rmtree(workdir, ignore_errors=True)
+    return pages
+
+
+def recognize_file(path: Path, backend: dict, args) -> list[dict]:
+    """识别单个文件，返回 pages 结构（`source` 由调用方回填）。
+
+    分流：PDF 走 pdftoppm 栅格化 + 逐页识别；图片按扩展名之外一视同仁，作为
+    1 页（`page` 恒为 1）交给后端。
+
+    `--lang` 只对 tesseract 生效（原样拼成 `+` 串交给 `-l`）；rapidocr 的模型
+    固定中英文，忽略该参数但不报错——这一差异已在 `--help` 里注明。
+    `--dpi` / `--pdf-pages` 只影响 PDF 路径，对图片输入无意义（忽略而不报错，
+    免得「同一批混排文件」因其中一个参数而整批失败）。
+    """
+    if path.suffix.lower() == ".pdf":
+        return recognize_pdf(path, backend, args)
+    return [make_page(1, recognize_image(path, backend, args))]
 
 
 # ─── 主流程 ──────────────────────────────────────────────────────────────────
@@ -1085,6 +1343,10 @@ def main(argv: list[str] | None = None) -> int:
             if not file_pages:
                 # 后端返回空也属识别失败，不产出「成功但空输出」的假成功。
                 raise fail(EXIT_OCR_FAILED, f"识别失败: {path}（未产出任何文本页）")
+            # source 在入口统一回填（而非各识别函数自己拼）：多文件输入时下游靠它
+            # 把页归回文件；单文件也带，保证 json 形状恒定。
+            for page in file_pages:
+                page["source"] = path.name
             pages.extend(file_pages)
 
         sys.stdout.write(serialize_pages(pages, args.format, backend.get("name")))
