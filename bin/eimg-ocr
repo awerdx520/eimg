@@ -602,29 +602,38 @@ def make_page(number: int, blocks=None, source: str | None = None) -> dict:
     return page
 
 
-def sort_reading_order(blocks: list[dict]) -> list[dict]:
+def sort_blocks_reading_order(blocks: list[dict]) -> list[dict]:
     """把 blocks 排成阅读顺序：先行聚类（按 y 中心 + 行高容差），行内按 x0 升序。
 
     为什么不能只按 `box[1]`（上沿）排：同一视觉行里的两块高度往往不同——实测
-    `test/fixtures/hello.png` 的「世界」y0=136、「Hello」y0=148（左块上沿更低），
-    只按上沿排会把同一行拆成两行、并把左右顺序排反。只有先按 **y 中心**把块
-    聚成行、行内再按 x0 排，才与人的阅读顺序一致。
+    `test/fixtures/hello.png` 的「世界」y0=136（高 134）、「Hello」y0=148（高 118），
+    左块上沿反而更低。只按上沿排会把同一行拆成两行、并把左右顺序排反；只有先按
+    **y 中心**聚成行、行内再按 x0 排，才与人的阅读顺序一致。
 
-    容差取「所有块高度的中位数」的一半：中位数对个别超大块（整段贴图 / 竖排
-    标题）不敏感，比均值稳；而固定像素容差一换 dpi 就失效。
+    容差 `tol = 0.5 * median(所有块高度)`：中位数对个别超大块（整段贴图 / 竖排
+    标题）不敏感，比均值稳；固定像素容差则一换 dpi 就失效。
 
-    全部比较都是**稳定**排序（`sorted` 稳定 + 键只含一个维度），同键保持原序。
-    无坐标的块（`box` 缺失 / 长度不足 4 / 全为 0）不参与聚类：它们排在**最后**
-    且保持原序；若一页里没有任何带坐标的块（某些后端的 `recognize_region` 会给
-    `[0, 0, 0, 0]`），整页原样返回——没有坐标时任何排序都只是瞎猜。
+    行的「代表 cy」取该行**首个**块（按 cy 升序扫描时先遇到的那个）的 `cy`，聚类
+    期间不再变化：并入后续块不改行代表，避免一串逐渐偏移的块被雪球式并进同一行
+    （行代表若随并集漂移，容差窗口会一路跟着走）。
+
+    所有比较都带显式原始下标兜底（`(cy, index)` / `(x0, index)`），任何比较相等
+    的元素都保持后端原序。无坐标的块（`box` 缺失 / 长度不足 4 / 无法转 float /
+    全为 0）不参与聚类：它们排在**最后**且保持原序、不丢弃；若一页里没有任何带
+    坐标的块（某些后端的 `recognize_region` 会给 `[0, 0, 0, 0]`），整页原样返回
+    ——没有坐标时任何排序都只是瞎猜。
+
+    与后端无关：rapidocr 与 tesseract 的 blocks 都走这里。排序本身的已知边界
+    （多栏排版、竖排文字）见 `openspec/tech-debt.md`。
     """
     items = list(blocks or [])
     if len(items) < 2:
         return items
 
-    positioned: list[tuple[dict, list[float]]] = []
+    # positioned 元素：(原始下标, block, x0, cy, height)
+    positioned: list[tuple[int, dict, float, float, float]] = []
     unpositioned: list[dict] = []
-    for block in items:
+    for index, block in enumerate(items):
         box = block.get("box") if isinstance(block, dict) else None
         coords: list[float] | None = None
         if isinstance(box, (list, tuple)) and len(box) >= 4:
@@ -636,12 +645,13 @@ def sort_reading_order(blocks: list[dict]) -> list[dict]:
         if coords is None or not any(coords):
             unpositioned.append(block)
             continue
-        positioned.append((block, coords))
+        x0, y0, _x1, y1 = coords
+        positioned.append((index, block, x0, (y0 + y1) / 2.0, y1 - y0))
 
     if not positioned:
         return items
 
-    heights = sorted(coords[3] - coords[1] for _, coords in positioned)
+    heights = sorted(entry[4] for entry in positioned)
     middle = len(heights) // 2
     if len(heights) % 2:
         median_height = heights[middle]
@@ -649,31 +659,23 @@ def sort_reading_order(blocks: list[dict]) -> list[dict]:
         median_height = (heights[middle - 1] + heights[middle]) / 2.0
     tolerance = 0.5 * median_height
 
-    # 按 y 中心升序扫描；y 中心相同时靠稳定排序保持后端原序。
-    ordered = sorted(positioned, key=lambda entry: (entry[1][1] + entry[1][3]) / 2.0)
+    # 按 y 中心升序扫描；cy 相同时按原始下标，保持后端原序。
+    ordered = sorted(positioned, key=lambda entry: (entry[3], entry[0]))
 
-    # 贪心聚类：与「当前行的 y 区间中心」相差不超过半个中位行高即归入当前行，
-    # 并把这行的 y 区间扩到已并入块的并集（行高参考随内容自适应）。
-    rows: list[dict] = []
-    for block, coords in ordered:
-        y_center = (coords[1] + coords[3]) / 2.0
-        if rows:
-            row = rows[-1]
-            row_center = (row["top"] + row["bottom"]) / 2.0
-            if abs(y_center - row_center) <= tolerance:
-                row["top"] = min(row["top"], coords[1])
-                row["bottom"] = max(row["bottom"], coords[3])
-                row["items"].append((coords[0], block))
-                continue
-        rows.append(
-            {"top": coords[1], "bottom": coords[3], "items": [(coords[0], block)]}
-        )
+    # 贪心聚类：与「当前行的代表 cy = 该行首个块的 cy」相差不超过 tolerance 即
+    # 归入当前行，否则开新行。行代表不随并入块更新（见 docstring）。
+    rows: list[list[tuple[int, dict, float, float, float]]] = []
+    for entry in ordered:
+        if rows and abs(entry[3] - rows[-1][0][3]) <= tolerance:
+            rows[-1].append(entry)
+        else:
+            rows.append([entry])
 
-    rows.sort(key=lambda row: row["top"])
     result: list[dict] = []
+    # 行间顺序即聚类产生的顺序（代表 cy 升序）；行内按 x0，等 x0 按原始下标。
     for row in rows:
-        for _, block in sorted(row["items"], key=lambda item: item[0]):
-            result.append(block)
+        for entry in sorted(row, key=lambda item: (item[2], item[0])):
+            result.append(entry[1])
     result.extend(unpositioned)
     return result
 
@@ -1323,7 +1325,7 @@ def recognize_image(path: Path, backend: dict, args) -> list[dict]:
 
     # 后端的输出顺序是模型自己的顺序、不是阅读顺序（实测 rapidocr 对 hello.png
     # 把右边的「世界」排在了「Hello」前面），统一在这里归一。
-    return sort_reading_order(blocks)
+    return sort_blocks_reading_order(blocks)
 
 
 def recognize_pdf(path: Path, backend: dict, args) -> list[dict]:
@@ -1362,7 +1364,10 @@ def recognize_pdf(path: Path, backend: dict, args) -> list[dict]:
             # 图片路径已在 `recognize_image` 内排过序；这里再对每页显式排一次是
             # 幂等兜底（同一份 block 集合必然收敛到同一顺序），让 PDF 路径的顺序
             # 不依赖「recognize_image 内部做了什么」这一实现细节。
-            make_page(number, sort_reading_order(recognize_image(image, backend, args)))
+            make_page(
+                number,
+                sort_blocks_reading_order(recognize_image(image, backend, args)),
+            )
             for number, image in rasterized
         ]
     finally:
