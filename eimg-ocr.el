@@ -1027,6 +1027,113 @@ ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先，缺的键落 defcustom
         (message "eimg-ocr：已取消")))))
   (eimg-ocr--set-progress "查询后端中"))
 
+;;;; ── 9. 结果与安装指引 ────────────────────────────────────────────────
+
+;; 本节三条命令（查看结果 / 打开截图目录 / 安装指引）为什么放在本文件而不是
+;; `eimg-transient.el'：
+;;
+;;   autoload 记录的是**命令实际定义在哪个文件**。它们原本定义在菜单文件里，
+;;   于是 `;;;###autoload' 让 straight 生成 `(autoload 'eimg-ocr-show-result-buffer
+;;   "eimg-transient" ...)'——用户只想 `SPC i m r' 看一眼上次的识别结果，却要先加载
+;;   整个 `eimg-transient.el'，连带把 `transient' 拽进启动过程，正好否掉「不按菜单
+;;   的人不为 transient 付成本」这条约束。
+;;
+;;   放置判据不是前缀（它们恰好都叫 `eimg-ocr-*'），而是**依赖**：三条命令只用
+;;   `eimg-ocr-buffer-name' / `eimg-ocr-images-dir' 与本文件的静态文本，与 transient
+;;   没有任何关系。菜单文件对本文件的 require 是单向的，迁走后菜单里的符号引用照旧
+;;   可用（`eimg-transient.el' 已 `(require 'eimg-ocr)'）。
+
+(defconst eimg-ocr-setup-buffer-name "*eimg-ocr-setup*"
+  "安装指引 buffer 的名字。
+与结果 buffer（`eimg-ocr-buffer-name'）、后端列表（`eimg-ocr-backends-buffer-name'）
+分开：指引是**静态文本**，混进结果 buffer 会被 `y' / `w' 这类针对识别正文的键位
+当成正文复制出去。")
+
+(defconst eimg-ocr--setup-help-text
+  (concat
+   "eimg OCR 安装指引（本 buffer 只展示，任何命令都不会被执行）\n"
+   "\n"
+   "前置：以下命令都在 eimg 仓库根目录下运行（bin/ 就在仓库根）。\n"
+   "\n"
+   "* 1. 先看缺什么\n"
+   "\n"
+   "    bin/eimg-ocr-setup --check\n"
+   "\n"
+   "  只做只读探测：列出 rapidocr（Python）与 tesseract 各自的可用状态。\n"
+   "  首次安装前先跑它，能省掉「装完了发现本来就不缺」这类来回。\n"
+   "\n"
+   "* 2. 安装 rapidocr 后端（Python）\n"
+   "\n"
+   "    bin/eimg-ocr-setup --rapidocr\n"
+   "\n"
+   "  会创建 / 复用 Python 虚拟环境并安装依赖（数百 MB，数分钟）。\n"
+   "\n"
+   "* 3. 补齐 tesseract 语言数据\n"
+   "\n"
+   "    bin/eimg-ocr-setup --tessdata\n"
+   "\n"
+   "  下载 chi_sim / eng 等训练数据到本地 tessdata 目录。\n"
+   "\n"
+   "* 4. 复用 PDF 内嵌目录（可选）\n"
+   "\n"
+   "    bin/eimg-ocr-setup --reuse-pdf-toc-ocr\n"
+   "\n"
+   "  PDF 自带文本层时优先复用，避免把已经可提取的文字再 OCR 一遍。\n"
+   "\n"
+   "* 为什么菜单不替你跑这些\n"
+   "\n"
+   "  安装要联网、要下载几百 MB、要写 ~/.local/share，属于**首次安装**动作。\n"
+   "  首次安装需显式运行（在终端里，看着输出跑）：菜单里隐式触发会让「打开了\n"
+   "  一个菜单」变成「机器上多了个虚拟环境」，而且失败时连日志都找不到。\n")
+  "安装指引的正文。
+四类命令（`--check' / `--rapidocr' / `--tessdata' / `--reuse-pdf-toc-ocr'）与
+「首次安装需显式运行」这句是**硬要求**：用户看完这段必须知道下一步该敲什么、
+以及为什么菜单不代劳。")
+
+;;;###autoload
+(defun eimg-ocr-show-result-buffer ()
+  "切到最近一次 OCR 的结果 buffer。
+还没有任何结果时 `user-error'：静默新建一个空的结果 buffer 会让用户以为「识别
+成功了但没内容」，比直接说「先跑一次识别」糟得多。"
+  (interactive)
+  (let ((buffer (get-buffer eimg-ocr-buffer-name)))
+    (unless (buffer-live-p buffer)
+      (user-error "还没有 OCR 结果：先跑一次识别再查看"))
+    (unless noninteractive
+      (pop-to-buffer buffer))
+    buffer))
+
+;;;###autoload
+(defun eimg-ocr-open-directory ()
+  "用 Dired 打开 `eimg-ocr-images-dir'（截图目录）。
+未配置或目录不存在时 `user-error'：本命令只做「打开已知目录」，不去猜
+`default-directory'——猜出来的目录打开后用户看到一堆无关文件，比报错更迷惑。"
+  (interactive)
+  (let ((directory eimg-ocr-images-dir))
+    (unless (and (stringp directory) (file-directory-p directory))
+      (user-error "截图目录未配置或不存在：%s（自定义 `eimg-ocr-images-dir'）"
+                  (if directory directory "nil")))
+    (dired directory)))
+
+;;;###autoload
+(defun eimg-ocr-setup-help ()
+  "在 `eimg-ocr-setup-buffer-name' 里展示 OCR 后端安装指引（**只展示，不执行**）。
+为什么单独一条命令而不是把文本塞进菜单描述：指引有二十多行，菜单里放不下，而
+贴进 `*Messages*' 会被后续消息冲掉。"
+  (interactive)
+  (let ((buffer (get-buffer-create eimg-ocr-setup-buffer-name)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert eimg-ocr--setup-help-text)
+        ;; 先写完文本再开 mode：`special-mode' 会把 buffer 置只读，反序会 write error。
+        (special-mode)
+        (goto-char (point-min))
+        (set-buffer-modified-p nil)))
+    (unless noninteractive
+      (pop-to-buffer buffer))
+    buffer))
+
 (provide 'eimg-ocr)
 
 ;;; eimg-ocr.el ends here

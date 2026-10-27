@@ -20,6 +20,7 @@ eimg 把「采集图像 → 识别文字 → 产出可用文本或链接」收�
 | 异步进程层与四态收尾                          | 已有 | =eimg-ocr.el=        |
 | 结果 buffer（复制 / 回插 / 存盘 / 重跑）      | 已有 | =eimg-ocr.el=        |
 | 三个入口命令（region / file / history）       | 已有 | =eimg-ocr.el=        |
+| 结果查看 / 打开截图目录 / 安装指引            | 已有 | =eimg-ocr.el=        |
 | transient 菜单 =eimg-menu=                    | 已有 | =eimg-transient.el=  |
 | 截图采集（ =eimg-capture= ，写历史）          | 已有 | =eimg-capture.el=    |
 | 选择预览（consult + posframe）                | 已有 | =eimg-select.el=     |

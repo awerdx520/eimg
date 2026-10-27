@@ -336,6 +336,11 @@ ARGS 包装——少一层包装就少一处「文案分叉」的机会。"
 
 ;;;; ── 5. 系统组命令 ──────────────────────────────────────────────────────
 
+;; 三条命令的定义位置已迁到 `eimg-ocr.el'（本文件经 `(require 'eimg-transient)' →
+;; `eimg-ocr' 的依赖链拿到它们）：迁移是为了让 autoload 指向 `"eimg-ocr"'，避免
+;; `SPC i m r' 这种「只想看一眼结果」的操作先把菜单文件与 `transient' 拽进来。
+;; 用例留在这里是因为判据是**命令语义**（有没有结果、目录在不在），不随定义文件漂移。
+
 (ert-deftest eimg-transient-test-show-result-buffer ()
   "没有 `*eimg-ocr*' 时 `user-error'；有时返回该 buffer。"
   (unwind-protect

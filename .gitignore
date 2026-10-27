@@ -7,7 +7,10 @@ eln-cache/
 .local/
 
 # autoloads 生成物：按需重建，且必然与源文件漂移（不入库）。
+# 第二行是 ERT autoload 用例写到仓库根的输出（`eimg-autoloads-test-<pid>.el'）：
+# 正常跑完即删，Ctrl-C 打断会残留，且名字与上一条规则不匹配。
 *-autoloads.el
+*-autoloads-test*.el
 
 # Python 相关：OCR 后端脚本的缓存与虚拟环境。
 __pycache__/

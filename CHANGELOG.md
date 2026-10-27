@@ -10,14 +10,34 @@
 - **交互命令的 autoload cookie**：13 个用户入口（截图 2 / 插入 2 / OCR 4 / 结果与安装
   相关 3 / 菜单 1 / embark 注册 1）带 `;;;###autoload`，宿主可用 `use-package :defer t`
   延迟加载本包而不丢按键——`make` 之外的文件名映射由 `loaddefs-generate` 按实际定义
-  位置填写（`eimg-ocr-show-result-buffer` / `-open-directory` / `-setup-help` 定义在
-  `eimg-transient.el`，故指向该文件；不用 `use-package :commands`，它假设文件名等于符号名）。
+  位置填写（不用 `use-package :commands`，它假设文件名等于符号名）。
 - **embark 注册的延迟加载补偿**：`eimg-embark.el` 把注册抽成 `eimg-embark-register`
   并带 autoloads 补偿 form，`:defer t` 下 `C-.` 菜单仍在 embark 加载时注册。补偿**不能**
   写成 `(with-eval-after-load 'embark (require 'eimg-embark))`——那会 `Recursive require`。
-- **`test/eimg-autoload-test.el`**：6 条用例锁定 cookie 覆盖、反向断言（buffer-only 命令
+- **`test/eimg-autoload-test.el`**：7 条用例锁定 cookie 覆盖、反向断言（buffer-only 命令
   不加 cookie）、embark 补偿形态、真跑 `loaddefs-generate` 的映射表、仅加载 autoloads 时
-  的 `fboundp` / `autoloadp` 语义、以及 embark 加载后的注册结果。
+  的 `fboundp` / `autoloadp` 语义、「看结果 / 开目录 / 看指引不加载 transient」、以及
+  embark 加载后的注册结果。
+
+### 变更
+
+- **`eimg-ocr-show-result-buffer` / `eimg-ocr-open-directory` / `eimg-ocr-setup-help`
+  从 `eimg-transient.el` 移入 `eimg-ocr.el`**（连同 `eimg-ocr-setup-buffer-name` 与安装
+  指引文本，后者改名 `eimg-ocr--setup-help-text`）。原因：autoload 记录的是命令的实际
+  定义位置，三条命令留在菜单文件里就会生成 `(autoload … "eimg-transient")`，于是
+  `SPC i m r`（只想看一眼上次的识别结果）先要把整份菜单文件与 `transient` 加载进来，
+  正好否掉「不按菜单的人不为 transient 付成本」。放置判据是**依赖**而不是前缀：三条
+  命令只用到 `eimg-ocr.el` 自己的常量。行为零变化，菜单里的符号引用照旧可用
+  （`eimg-transient.el` 已 `(require 'eimg-ocr)`）。
+- **autoload 映射表相应调整**：`eimg-ocr-test-generated-file-mapping` 里这三条从
+  `eimg-transient` 改为 `eimg-ocr`，并新增 `eimg-autoload-test-ocr-utilities-load-no-transient`
+  用例——仅加载 autoloads 时 `(featurep 'transient)` 为 nil 且三条命令的 autoload 文件名
+  为 `"eimg-ocr"`。
+- **测试产物排除规则**：`Makefile` 的 `EL_FILES` 排除模式从 `*-autoloads.el` 放宽到
+  `*-autoloads*.el`（一次覆盖 `eimg-autoloads.el` / `-probe` / `-test-<pid>`），`.gitignore`
+  与 `make clean` 同步覆盖 `*-autoloads-test*.el`——ERT 的 autoload 用例把生成物写到仓库根
+  （`loaddefs-generate` 记的是相对输出目录的路径，写 `/tmp` 会得到解析不到的 `../eimg-*`），
+  正常跑完即删，Ctrl-C 打断时会残留。
 
 ## [0.1.0] - 2026-10-27
 

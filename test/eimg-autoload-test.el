@@ -17,10 +17,10 @@
 ;;   5. embark 加载后补偿真的把 keymap 注册进去（stub embark，无第三方依赖）。
 ;;
 ;; 三条硬约束：
-;;   - **不用 `use-package :commands'**（它假设「文件名 = 符号名」，`eimg-ocr-region'
-;;     定义在 `eimg-ocr.el' 里是对的，但 `eimg-ocr-show-result-buffer' 在
-;;     `eimg-transient.el' 里就会指向不存在的文件）—— 文件名只能由
-;;     `loaddefs-generate' 按实际定义位置填。
+;;   - **不用 `use-package :commands'**（它假设「文件名 = 符号名」）：`eimg-ocr-* 前缀
+;;     的命令既有定义在 `eimg-ocr.el' 的，也有曾落在 `eimg-transient.el' 的（已按
+;;     依赖迁回 `eimg-ocr.el'，见第 3 节的映射表），按符号名猜文件名必然指错文件；
+;;     文件名只能由 `loaddefs-generate' 按实际定义位置填。
 ;;   - **生成 autoloads 的输出文件必须落在仓库根**：`loaddefs-generate' 记录的是
 ;;     相对输出目录的路径，输出到 `/tmp' 会得到 `../eimg-capture' 这种从
 ;;     `default-directory' 解析不到的路径（`file-missing'）。
@@ -94,12 +94,13 @@ Emacs 复位为 nil，`buffer-file-name' 在 batch 下同样为 nil（实测
     ("eimg-ocr.el" . "eimg-ocr-file")
     ("eimg-ocr.el" . "eimg-ocr-history")
     ("eimg-ocr.el" . "eimg-ocr-list-backends")
-    ;; 这三条与「按功能分文件」的直觉相反：`eimg-ocr-*' 前缀但定义在
-    ;; `eimg-transient.el'（它们只服务菜单的「系统」组，且都用 transient 侧的
-    ;; buffer 名常量）。宿主键位不受影响——autoload 记录的是**实际定义位置**。
-    ("eimg-transient.el" . "eimg-ocr-show-result-buffer")
-    ("eimg-transient.el" . "eimg-ocr-open-directory")
-    ("eimg-transient.el" . "eimg-ocr-setup-help"))
+    ;; 这三条曾定义在 `eimg-transient.el'（它们只服务菜单的「系统」组）。留在菜单
+    ;; 文件里会让 autoload 指向 `"eimg-transient"'：用户按 `SPC i m r' 只想看一眼
+    ;; 上次的识别结果，却要先加载整份菜单文件与 `transient'。判据是**依赖**而不是
+    ;; 前缀——三条命令只用到 `eimg-ocr.el' 自己的常量，故归属 `eimg-ocr.el'。
+    ("eimg-ocr.el" . "eimg-ocr-show-result-buffer")
+    ("eimg-ocr.el" . "eimg-ocr-open-directory")
+    ("eimg-ocr.el" . "eimg-ocr-setup-help"))
   "带 `;;;###autoload' cookie 的 defun 清单（文件 . 命令）。")
 
 (defconst eimg-autoload-test--declared-commands
@@ -187,9 +188,9 @@ loaded）→ 再 require 正在加载的 feature → 报错，keymap 与注册�
                             ("eimg-ocr-file" . "eimg-ocr")
                             ("eimg-ocr-history" . "eimg-ocr")
                             ("eimg-ocr-list-backends" . "eimg-ocr")
-                            ("eimg-ocr-show-result-buffer" . "eimg-transient")
-                            ("eimg-ocr-open-directory" . "eimg-transient")
-                            ("eimg-ocr-setup-help" . "eimg-transient")
+                            ("eimg-ocr-show-result-buffer" . "eimg-ocr")
+                            ("eimg-ocr-open-directory" . "eimg-ocr")
+                            ("eimg-ocr-setup-help" . "eimg-ocr")
                             ("eimg-menu" . "eimg-transient")
                             ("eimg-embark-register" . "eimg-embark")))
             (should (equal (cdr expect)
@@ -245,6 +246,45 @@ loaded）→ 再 require 正在加载的 feature → 报错，keymap 与注册�
             (should (string-match-p "eimg-ocr-file autoloadp=t file=\"eimg-ocr\"" output))
             (should (string-match-p "eimg-menu autoloadp=t file=\"eimg-transient\"" output))
             (should (string-match-p "fboundp-capture=t commandp-capture=t" output))))
+      (ignore-errors (delete-file file)))))
+
+(ert-deftest eimg-autoload-test-ocr-utilities-load-no-transient ()
+  "只看结果 / 开目录 / 看安装指引不该把 `transient' 拽进来。
+这三条命令原本定义在 `eimg-transient.el'，autoload 跟着定义位置指向
+`\"eimg-transient\"'，于是 `SPC i m r'（只想看一眼上次的识别结果）要先加载整份
+菜单文件与 `transient'。判据两层，缺一不可：只加载 autoloads 时
+`(featurep 'transient)' 为 nil —— 这一层单独看会因「autoloads 本就不加载任何包」
+而恒真；真正钉住「定义搬对地方」的是三条命令的 autoload 文件名为 `\"eimg-ocr\"'。"
+  (let* ((root (eimg-autoload-test--root))
+         (name (format "eimg-autoloads-test-%d.el" (emacs-pid)))
+         (file (expand-file-name name root)))
+    (unwind-protect
+        (progn
+          (eimg-autoload-test--generate root name)
+          (let* ((result
+                  (eimg-autoload-test--run
+                   root
+                   (list "-l" name "--eval"
+                         (concat
+                          "(progn"
+                          " (princ (format \"featurep-transient=%S\\n\""
+                          "                (featurep 'transient)))"
+                          " (dolist (c '(eimg-ocr-show-result-buffer"
+                          "                eimg-ocr-open-directory"
+                          "                eimg-ocr-setup-help))"
+                          "   (princ (format \"%s autoloadp=%S file=%S\\n\" c"
+                          "                  (autoloadp (symbol-function c))"
+                          "                  (and (autoloadp (symbol-function c))"
+                          "                       (nth 1 (symbol-function c)))))))"))))
+                 (output (cdr result)))
+            (should (zerop (car result)))
+            (should (string-match-p "featurep-transient=nil" output))
+            (dolist (command '("eimg-ocr-show-result-buffer"
+                               "eimg-ocr-open-directory"
+                               "eimg-ocr-setup-help"))
+              (should (string-match-p
+                       (format "%s autoloadp=t file=\"eimg-ocr\"" command)
+                       output)))))
       (ignore-errors (delete-file file)))))
 
 ;;;; ── 5. embark 加载后补偿真的生效 ────────────────────────────────────────

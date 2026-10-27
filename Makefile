@@ -8,8 +8,14 @@
 EMACS ?= emacs
 
 # 收集待检查的 elisp 文件：排除 .git（版本库）、.local（straight 本地克隆，第三方源码
-# 不该由本项目把关）、*-autoloads.el（生成物，会和源文件漂移）。
-EL_FILES := $(shell find . -name '*.el' -not -path './.git/*' -not -path './.local/*' -not -name '*-autoloads.el' 2>/dev/null)
+# 不该由本项目把关）、*-autoloads*.el（生成物，会和源文件漂移）。
+#
+# 通配收紧到 `*-autoloads*.el` 而不是只排 `*-autoloads.el`：ERT 的 autoload 用例会把
+# `loaddefs-generate' 的输出写到仓库根（`eimg-autoloads-test-<pid>.el'，落在仓库根
+# 是因为 loaddefs 记的是相对输出目录的路径，写 /tmp 会得到解析不到的 `../eimg-*'）。
+# 那些文件正常跑完即删，Ctrl-C 打断时却会留下，且名字不匹配 `*-autoloads.el'——
+# check-parens 会去检查一个生成物，报的错与源码无关。
+EL_FILES := $(shell find . -name '*.el' -not -path './.git/*' -not -path './.local/*' -not -name '*-autoloads*.el' 2>/dev/null)
 
 # 测试文件约定为 test/*-test.el；用 sort 保证加载顺序稳定（ERT 按加载顺序注册用例）。
 TEST_FILES := $(sort $(wildcard test/*-test.el))
@@ -94,3 +100,6 @@ clean:
 	rm -rf eln-cache .eln-cache .tmp-test
 	find . -name '*.elc' -not -path './.git/*' -delete
 	find . -name '__pycache__' -type d -not -path './.git/*' -prune -exec rm -rf {} +
+	# autoload 用例的生成物（`eimg-autoloads-test-<pid>.el'）：`unwind-protect' 会删，
+	# 但 Ctrl-C 打断时残留；名字与 `*-autoloads.el' 不匹配，故单独清一次。
+	find . -name '*-autoloads-test*.el' -not -path './.git/*' -delete

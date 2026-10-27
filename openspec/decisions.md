@@ -170,3 +170,12 @@
 - **机械检查**：`test/eimg-autoload-test.el` 6 条用例（cookie 覆盖 + 反向断言 + embark
   补偿形态 + 真跑 `loaddefs-generate` 的 13 条映射 + 仅加载 autoloads 时
   `featurep-eimg=nil` / `fboundp` 为 t + embark 加载后注册成功）。
+- **同日修正（2026-10-27，不推翻本决策）**：理由一里「三条命令定义在 `eimg-transient.el`」
+  已不再成立——`eimg-ocr-show-result-buffer` / `-open-directory` / `-setup-help` 连同
+  `eimg-ocr-setup-buffer-name` 与指引文本移入了 `eimg-ocr.el`。触发点是理由一本身：
+  `loaddefs-generate` 「实测这三条正确指向 `eimg-transient`」既是 `:commands` 不可用的
+  证据，也意味着按 `SPC i m r` 看结果要先加载整份菜单文件与 `transient`。放置判据因此
+  明确为**依赖**而非前缀（三条命令只用 `eimg-ocr.el` 自己的常量），映射表三条改为
+  `eimg-ocr`，并新增 `eimg-autoload-test-ocr-utilities-load-no-transient` 锁住
+  「仅加载 autoloads 时 `(featurep 'transient)` 为 nil 且三条命令 autoload 文件名为
+  `"eimg-ocr"`」。`eimg-menu` 仍指向 `eimg-transient`（D8 的结论不变）。
