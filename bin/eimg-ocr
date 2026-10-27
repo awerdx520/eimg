@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""eimg-ocr —— eimg 统一 OCR CLI（参数骨架 + 后端探测）。
+"""eimg-ocr —— eimg 统一 OCR CLI（rapidocr 识别已接入）。
 
-本次交付只包含「外壳」：参数解析、退出码框架、后端探测、输出序列化骨架、
-输入校验。真正的识别引擎（rapidocr / tesseract）与 PDF 栅格化属于后续任务。
+当前能力：参数解析、退出码框架、后端探测、输入校验、输出序列化、
+**图片经 rapidocr 识别**。tesseract 后端与 PDF 栅格化属于后续任务，
+这两条路径仍然干净失败（退出码 4）。
 
 设计约束（不要在本文件里打破）：
 
 1. 只依赖 Python 标准库（argparse / subprocess / json / os / sys / shutil /
-   pathlib / dataclasses）。这样 `bin/eimg-ocr-setup` 可以在任何系统 python 下
+   pathlib / tempfile）。这样 `bin/eimg-ocr-setup` 可以在任何系统 python 下
    复用探测逻辑，不必先装依赖。
 2. **模块顶层零 I/O、零副作用**：`bin/eimg-ocr-setup`（后续任务）会从本文件里
    取 `probe_backends` 复用，`import` 那一刻不能跑任何探测、不能读配置文件、
@@ -23,6 +24,12 @@
        loader.exec_module(mod)          # 此后 mod.probe_backends(...) 可用
 3. 未接入识别引擎的后端路径必须**干净失败**（退出码 4），不允许抛 traceback，
    也不允许假装成功。
+4. **本进程永不 `import rapidocr`**（同理也不 import numpy / PIL）：CLI 跑在系统
+   python 上，那些库只装在某个 venv 里，硬 import 只会让 CLI 在缺少依赖时直接崩。
+   识别一律 `subprocess` 起「探测到的目标解释器」去跑内联脚本，见 `run_rapidocr`。
+5. **识别结果走临时文件，不走 stdout**：rapidocr 会往 stdout 打一排 `[INFO]` 日志
+   （模型路径、engine 名），解析 stdout 必然被日志污染。故内联脚本把 JSON 写进
+   临时文件，父进程读文件再 `json.loads`。
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 PROG = "eimg-ocr"
@@ -62,6 +70,12 @@ KNOWN_VENV_PYTHON = "/home/thomas/Workspace/pdf-toc-ocr/.venv/bin/python"
 # 60 秒是「慢但正常」与「卡死」的分界。
 RAPIDOCR_PROBE_TIMEOUT = 60
 TESSERACT_PROBE_TIMEOUT = 30
+
+# 单张图识别超时。rapidocr 初始化要加载 det / cls / rec 三个 onnx 模型，本机实测
+# 端到端 1.5–2.0 秒（模型已就绪、页缓存热），但首次下载 / 冷缓存 / 慢盘可到十余秒，
+# 大图还有上限之外的波动；180 秒给这些留足余量，同时仍是「卡住」与「慢」的可靠
+# 分界（超时按退出码 4 处理，不无限挂起）。
+RAPIDOCR_TIMEOUT = 180
 
 
 class EimgError(Exception):
@@ -150,7 +164,9 @@ def parse_pdf_pages(value: str) -> list[int]:
 def build_parser() -> EimgArgumentParser:
     parser = EimgArgumentParser(
         prog=PROG,
-        description="eimg 统一 OCR CLI（当前版本只有参数骨架与后端探测，尚未接入识别引擎）。",
+        description=(
+            "eimg 统一 OCR CLI（图片识别已接入 rapidocr；tesseract 与 PDF 栅格化待接入）。"
+        ),
         epilog=(
             "退出码: 0 成功 / 2 无可用后端 / 3 输入不可读 / 4 识别失败 / 5 参数错误。"
         ),
@@ -172,13 +188,19 @@ def build_parser() -> EimgArgumentParser:
         type=parse_lang,
         default=parse_lang(DEFAULT_LANG),
         metavar="LANGS",
-        help=f"识别语言，tesseract 语法（默认 {DEFAULT_LANG}）",
+        help=(
+            f"识别语言，tesseract 语法（默认 {DEFAULT_LANG}）；"
+            "rapidocr 忽略此参数（其模型固定中英文），传了也不会报错"
+        ),
     )
     parser.add_argument(
         "--format",
         choices=("text", "json", "lines"),
         default="text",
-        help="输出形态（默认 text：按页输出、页间以 \\f 分隔）",
+        help=(
+            "输出形态（默认 text：按页输出、页间以 \\f 分隔；"
+            "lines：每行一条文本；json：结构化）"
+        ),
     )
     parser.add_argument(
         "--pdf-pages",
@@ -198,7 +220,10 @@ def build_parser() -> EimgArgumentParser:
         "--python",
         default=None,
         metavar="PATH",
-        help="探测 rapidocr 时优先使用的 Python 解释器（优先级高于环境变量与配置文件）",
+        help=(
+            "rapidocr 解释器路径；给了就只用它（不再探测环境变量 / 配置文件 / "
+            "PATH / 已知 venv），路径无效即视为 rapidocr 不可用"
+        ),
     )
     parser.add_argument(
         "--tessdata-dir",
@@ -316,8 +341,13 @@ def _probe_rapidocr(python: str | None) -> dict:
 
     注意本进程自身**绝不** import rapidocr——CLI 跑在系统 python 上，rapidocr
     只可能装在别的环境里，硬 import 只会污染依赖并制造误判。
+
+    `--python` 给定时**只探测它本身**，不再回落到环境变量 / 配置文件 / PATH /
+    已知 venv：显式路径是「就用这个解释器」而不是「优先试这个」。否则
+    `--python /nonexistent/python` 会被静默替换成已知 venv 并报「可用」，
+    用户拼错路径永远暴露不出来，`auto` 也会在错误解释器上悄悄跑起来。
     """
-    candidates = _python_candidates(python)
+    candidates = [("--python", python)] if python else _python_candidates(None)
     notes: list[str] = []
     for label, value in candidates:
         if not value or value in ("未提供", "未设置", "未找到", "无 python 键或文件不存在"):
@@ -591,23 +621,243 @@ def serialize_pages(pages: list[dict], output_format: str, backend: str | None =
     return serializer(pages)
 
 
-# ─── 识别入口（本任务只有「未实现」分支） ────────────────────────────────────
+# ─── rapidocr 后端（子进程 + 临时文件传结果） ────────────────────────────────
+
+# 为什么是一段内联脚本而不是在本进程里 import：本 CLI 用系统 python3 跑（可能
+# 完全没有 rapidocr / numpy / PIL），rapidocr 只装在某个 venv 里。识别必须由
+# 「探测到的目标解释器」去执行，故把识别逻辑独立成脚本，用 subprocess 跑它。
+#
+# 为什么不解析 stdout：rapidocr 会往 stdout 打一排 `[INFO] ... Using engine_name`
+# 日志，识别结果与日志混在同一流里，任何「按行找 JSON」的做法都会在换版本 /
+# 换日志级别时静默失效。结果改走 argv[2] 指定的文件，父进程读文件再解析。
+
+RAPIDOCR_INLINE_SCRIPT = '''\
+"""由 eimg-ocr 生成、在目标解释器里执行的 rapidocr 包装脚本。
+
+用法: python <本脚本> <图片路径> <结果 JSON 路径>
+
+只做三件事：读图 → 识别 → 归一化成 [{"text", "conf", "box"}] 写文件。
+不打印识别结果（stdout 留给 rapidocr 自己的日志）。
+"""
+
+import json
+import sys
+
+
+def _to_box(points):
+    """四点（或多点）包围盒 → [x0, y0, x1, y1]；拿不到有效坐标返回 None。"""
+    if points is None:
+        return None
+    try:
+        pairs = [(float(point[0]), float(point[1])) for point in points]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not pairs:
+        return None
+    xs = [pair[0] for pair in pairs]
+    ys = [pair[1] for pair in pairs]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _to_block(points, text, score):
+    """归一化单个文本块；空文本返回 None（由调用方丢弃）。"""
+    if text is None:
+        return None
+    # 首尾空白统一去掉：OCR 常在块尾留一个空格（实测 rapidocr 对 "Hello" 返回
+    # "Hello "），保留会在按行拼接 / 插入 Emacs 时产出难看的尾随空格。
+    text = str(text).strip()
+    if not text:
+        return None
+    try:
+        conf = float(score) if score is not None else 0.0
+    except (TypeError, ValueError):
+        conf = 0.0
+    return {"text": text, "conf": conf, "box": _to_box(points)}
+
+
+def _normalize(out):
+    """把 rapidocr 的输出统一成块列表。
+
+    两种形态都要吃：
+    1. v3.x：`RapidOCROutput`，带 .boxes / .txts / .scores 三个属性；
+    2. 老式：`out` 本身是 list/tuple，每行形如 [points, text, score]。
+    判据是「out 是序列且首元素也是序列」——dataclass 不满足这个条件，
+    所以两种形态不会互相误判。
+    """
+    if isinstance(out, (list, tuple)) and out and isinstance(out[0], (list, tuple)):
+        rows = []
+        for row in out:
+            if not isinstance(row, (list, tuple)):
+                continue
+            rows.append((
+                row[0] if len(row) > 0 else None,
+                row[1] if len(row) > 1 else None,
+                row[2] if len(row) > 2 else None,
+            ))
+    else:
+        boxes = getattr(out, "boxes", None)
+        txts = getattr(out, "txts", None)
+        scores = getattr(out, "scores", None)
+        boxes = list(boxes) if boxes is not None else []
+        txts = list(txts) if txts is not None else []
+        scores = list(scores) if scores is not None else []
+        rows = [
+            (
+                boxes[index] if index < len(boxes) else None,
+                txts[index] if index < len(txts) else None,
+                scores[index] if index < len(scores) else None,
+            )
+            for index in range(max(len(boxes), len(txts)))
+        ]
+    return [block for block in (_to_block(*row) for row in rows) if block]
+
+
+def main():
+    image_path, result_path = sys.argv[1], sys.argv[2]
+
+    import numpy as np
+    from PIL import Image
+    from rapidocr import RapidOCR
+
+    engine = RapidOCR()
+    # 统一转 RGB 再交给引擎：灰度 / RGBA / 调色板图在各后端行为不一致；
+    # ascontiguousarray 保证 onnxruntime 拿到连续内存（否则可能报 stride 错）。
+    pixels = np.ascontiguousarray(np.asarray(Image.open(image_path).convert("RGB")))
+    out = engine(pixels, use_det=True, use_cls=True, use_rec=True)
+    with open(result_path, "w", encoding="utf-8") as handle:
+        json.dump(_normalize(out), handle, ensure_ascii=False)
+        handle.write("\\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def _last_line(text: str) -> str:
+    """取文本最后一个非空行，用于把子进程报错压缩成一行。"""
+    for line in reversed((text or "").strip().splitlines()):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def run_rapidocr(
+    image_path: Path, python_exe: str, lang_timeout: int = RAPIDOCR_TIMEOUT
+) -> list[dict]:
+    """用目标解释器跑 rapidocr 识别一张图，返回 blocks 列表。
+
+    临时脚本与结果文件都放在同一个 `mkdtemp` 目录里，`finally` 统一删除——
+    成功与失败两条路径都不留半成品。超时按退出码 4 处理（stderr 含「识别失败」
+    与「rapidocr 超时」），不无限挂起。
+
+    `lang_timeout` 是子进程超时秒数（参数名沿用 openspec 计划，与 `--lang`
+    无关，rapidocr 也没有语言超时这个概念）。
+    """
+    if not python_exe:
+        raise fail(EXIT_OCR_FAILED, f"识别失败: {image_path}（rapidocr 解释器未知）")
+
+    workdir = tempfile.mkdtemp(prefix="eimg-ocr-")
+    try:
+        script_path = Path(workdir) / "rapidocr_recognize.py"
+        script_path.write_text(RAPIDOCR_INLINE_SCRIPT, encoding="utf-8")
+        handle, result_name = tempfile.mkstemp(
+            prefix="result-", suffix=".json", dir=workdir
+        )
+        os.close(handle)
+        result_path = Path(result_name)
+
+        try:
+            proc = subprocess.run(
+                [python_exe, str(script_path), str(image_path), str(result_path)],
+                capture_output=True,
+                text=True,
+                timeout=lang_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise fail(
+                EXIT_OCR_FAILED,
+                f"识别失败: {image_path}（rapidocr 超时: 超过 {lang_timeout} 秒未完成）",
+            )
+        except OSError as exc:
+            raise fail(
+                EXIT_OCR_FAILED,
+                f"识别失败: {image_path}（无法执行 rapidocr 解释器 {python_exe}: "
+                f"{exc.strerror or exc}）",
+            )
+
+        if proc.returncode != 0:
+            detail = _last_line(proc.stderr)
+            suffix = f": {detail}" if detail else ""
+            raise fail(
+                EXIT_OCR_FAILED,
+                f"识别失败: {image_path}（rapidocr 退出码 {proc.returncode}{suffix}）",
+            )
+
+        try:
+            raw = result_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise fail(
+                EXIT_OCR_FAILED,
+                f"识别失败: {image_path}（读不到 rapidocr 结果文件: "
+                f"{exc.strerror or exc}）",
+            )
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            raise fail(
+                EXIT_OCR_FAILED,
+                f"识别失败: {image_path}（rapidocr 结果不是合法 JSON: {exc}）",
+            )
+        if not isinstance(data, list):
+            raise fail(
+                EXIT_OCR_FAILED, f"识别失败: {image_path}（rapidocr 结果不是块列表）"
+            )
+
+        blocks: list[dict] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            blocks.append(
+                make_block(item.get("text"), item.get("conf"), item.get("box"))
+            )
+        return blocks
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ─── 识别入口 ────────────────────────────────────────────────────────────────
 
 
 def recognize_file(path: Path, backend: dict, args) -> list[dict]:
     """识别单个文件，返回 pages 结构。
 
-    当前版本不接引擎：无论图片还是 PDF 都干净失败（退出码 4）。后续任务按
-    文件类型分流——图片走 rapidocr/tesseract（T2b/T2c），PDF 先栅格化再识别
-    （T2d，届时 `--pdf-pages` / `--dpi` 才会真正参与）。
+    分流：图片走 rapidocr（本任务已接入）；tesseract 与 PDF 栅格化尚未接入，
+    两条路径都干净失败（退出码 4，不抛 traceback）。`--dpi` / `--pdf-pages`
+    属于 PDF 路径，仍需等栅格化落地后才参与。
     """
     suffix = path.suffix.lower().lstrip(".")
     kind = TYPE_DESCRIPTIONS.get(suffix, "文件")
+    name = backend.get("name")
+
     if suffix == "pdf":
-        detail = "当前版本尚未接入 PDF 栅格化与识别引擎"
-    else:
-        detail = f"当前版本尚未接入识别引擎（{backend.get('name')} 后端已探测到，但识别逻辑待接入）"
-    raise fail(EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；{detail}）")
+        raise fail(
+            EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；PDF 栅格化待接入）"
+        )
+
+    if name == "rapidocr":
+        # rapidocr 可用时 reason 就是「能 import rapidocr 的解释器路径」：探测阶段
+        # 已确认它存在且可执行，这里直接拿来起子进程。
+        blocks = run_rapidocr(path, backend.get("reason") or "")
+        return [make_page(1, blocks)]
+
+    if name == "tesseract":
+        raise fail(
+            EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；tesseract 后端待接入）"
+        )
+
+    raise fail(EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；未知后端 {name}）")
 
 
 # ─── 主流程 ──────────────────────────────────────────────────────────────────
