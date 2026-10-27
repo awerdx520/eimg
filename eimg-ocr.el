@@ -253,19 +253,18 @@ ARGS 由 `eimg-core-build-args' 产出，本层不解释它的语义。
 
 ;;;; ── 4. sentinel：四态收尾 ────────────────────────────────────────────
 
-(defun eimg-ocr--sentinel (proc event callback)
+(defun eimg-ocr--sentinel (proc _event callback)
   "处理 PROC 的状态变化：按四态分支收尾，并让 CALLBACK 恰好执行一次。
-归属判据是 `process-status' / `process-exit-status'，**不是** EVENT 的文案：
-EVENT 对「因信号死亡」的描述取自 `strsignal'，会经 gettext 翻译——本机 zh_CN
-下实测 `delete-process' 给出的是 \"已杀死\\n\"、SIGINT 给出 \"中断\\n\"，按
-\"killed\" 字面匹配永远不命中，取消与超时两条路径会整个哑掉（`make test' 里
-对应用例只能等到超时才报错）。`process-status' 与文案无关，稳定可取：
+归属判据是 `process-status' / `process-exit-status'，**不是** 事件串：
   `exit' + 退出码 0          → `finished'
   `exit' + 非零退出码        → `failed'（EXIT-CODE = 退出码）
   `signal'（SIGKILL / SIGINT）→ `cancelled'；带 `eimg-timeout' 标记时是 `failed' + 124
 其余状态（`run' / `stop' / `open' / `closed' 等）不调回调。
-保留 \"finished\" / \"exited\" 的文案兜底：这两条文案不翻译（实测），万一
-`process-status' 取不到（nil）时仍能收尾，不至于让回调永久悬空。
+**_EVENT 只用于满足 sentinel 的调用约定，判定链一个字都不读它**：事件串对「因
+信号死亡」的描述取自 `strsignal'，会经 gettext 翻译——本机 zh_CN 下实测
+`delete-process' 给出的是「已杀死」、SIGINT 给出「中断」，按 \"killed\" 字面匹配
+永远不命中，取消与超时两条路径会整个哑掉（`make test' 里对应用例只能等到超时
+才报错）。这类分支在英文 locale 下全绿、只在中文环境暴露，属假绿，故一条都不留。
 超时走的也是 `signal'：`eimg-ocr--on-timeout' 先打 `eimg-timeout' 标记再
 `delete-process'，本函数据标记把它归到 `failed' + 124，而不是「用户取消」。"
   (unless (process-get proc 'eimg-done)
@@ -281,12 +280,13 @@ EVENT 对「因信号死亡」的描述取自 `strsignal'，会经 gettext 翻�
             (eimg-ocr--finish proc 'failed callback eimg-ocr--timeout-exit-code
                               (format "OCR 超时（超过 %s 秒）\n" eimg-ocr-timeout))
           (eimg-ocr--finish proc 'cancelled callback nil)))
-       ((string-prefix-p "finished" event)
-        (eimg-ocr--finish proc 'finished callback 0))
-       ((string-match-p "exited" event)
-        (if (and (integerp code) (zerop code))
-            (eimg-ocr--finish proc 'finished callback 0)
-          (eimg-ocr--finish proc 'failed callback code)))
+       ;; 走到这里说明 `process-status' 既不是 `exit' 也不是 `signal'。
+       ;; 进程仍存活（`run' / `stop' / `open' / `listen' / `connect'）时只是状态
+       ;; 变化，不能收尾；进程已不存活时按失败收尾——宁可报错也不要让回调永久
+       ;; 悬空（这条是防御性兜底，正常路径由上面两条覆盖）。判据同样只用
+       ;; `process-status' / `process-live-p'，不碰事件串文案。
+       ((not (process-live-p proc))
+        (eimg-ocr--finish proc 'failed callback code))
        (t nil)))))
 
 (defun eimg-ocr--drain-stderr (proc)
@@ -333,7 +333,7 @@ EVENT 对「因信号死亡」的描述取自 `strsignal'，会经 gettext 翻�
   "收尾 PROC 并按 STATUS 调用 CALLBACK 一次。
 NOTE 非 nil 时追加到 STDERR 末尾，用于「不是 CLI 给出的错误」（目前只有超时）。
 回调参数：`finished' → (STATUS STDOUT STDERR)；`failed' →
-(STATUS STDOUT STDERR EXIT-CODE)；`cancelled' → (STATUS \"\" \")'——取消不交
+(STATUS STDOUT STDERR EXIT-CODE)；`cancelled' → (STATUS \"\" \"\")'——取消不交
 付半成品输出，也不留任何错误文案。
 先在函数入口置 `eimg-done'：`delete-process' 与自然退出都可能各触发一次
 sentinel，标记保证回调只跑一次、清理只做一遍。"
@@ -354,7 +354,7 @@ sentinel，标记保证回调只跑一次、清理只做一遍。"
 
 (defun eimg-ocr-cancel ()
   "取消正在进行的 OCR 任务；没有任务时只提示，不报错。
-取消的收尾仍然由 sentinel 完成（`delete-process' → \"killed\" → `cancelled'），
+取消的收尾仍然由 sentinel 完成（`delete-process' → `signal' 状态 → `cancelled'），
 所以状态清理与「不留错误文案」两条与自然完成一致。"
   (interactive)
   (if (eimg-ocr-busy-p)
@@ -366,7 +366,8 @@ sentinel，标记保证回调只跑一次、清理只做一遍。"
 (defun eimg-ocr--on-timeout (proc)
   "PROC 超过 `eimg-ocr-timeout' 秒仍未退出时的定时器回调。
 先打 `eimg-timeout' 标记再 `delete-process'：sentinel 只能靠这个标记区分
-「用户取消」与「超时」，两者在事件层面都是 \"killed\"。"
+「用户取消」与「超时」，两者在 `process-status' 层面都是 `signal'（事件串文案
+不可用——它经 gettext 翻译，见 `eimg-ocr--sentinel'）。"
   (when (process-live-p proc)
     (process-put proc 'eimg-timeout t)
     (delete-process proc)))

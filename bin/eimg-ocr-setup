@@ -500,7 +500,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help=(
             "显式指定 rapidocr 解释器：--check 只探测它，--reuse-pdf-toc-ocr 改写它"
-            "（默认取 CLI 里的已知 pdf-toc-ocr venv）"
+            "（默认取 CLI 里的已知 pdf-toc-ocr venv）；"
+            "对 --rapidocr 无效——该动作总是新建 venv"
         ),
     )
     parser.add_argument(

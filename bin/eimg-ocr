@@ -354,10 +354,13 @@ def _check_rapidocr(python_path: str) -> tuple[bool, str]:
     if not os.access(python_path, os.X_OK):
         return False, "解释器不可执行"
     try:
+        # errors="replace"：rapidocr 导入失败时的报错可能夹带非 UTF-8 字节，
+        # 不加的话 `text=True' 的解码会抛 UnicodeDecodeError、穿透成 traceback。
         proc = subprocess.run(
             [python_path, "-c", "import rapidocr"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=RAPIDOCR_PROBE_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
@@ -501,17 +504,33 @@ def probe_backends(
     lang: list[str] | str = DEFAULT_LANG,
     python: str | None = None,
     tessdata_dir: str | None = None,
+    only: str | None = None,
 ) -> list[dict]:
     """探测可用 OCR 后端，返回 `[{"name", "available", "reason"}, ...]`。
 
     顺序固定为 rapidocr → tesseract（`auto` 按此优先级取第一个可用者）。
     模块级纯函数、无全局副作用：`bin/eimg-ocr-setup` 通过
     `importlib.util.spec_from_file_location` 复用它做 `--check` 体检。
+
+    `only` 非 None 时只探测该后端。显式 `--backend tesseract` 用得上：全量探测
+    会为 rapidocr 起一个解释器跑 `import rapidocr`（连带导入 onnxruntime，慢磁盘上
+    可达数百毫秒），而那份结果注定不会被 `resolve_backend` 选中。`only=None`
+    （默认）保持全量语义——`--list-backends` 与 `--check` 体检依赖它。
     """
-    return [
-        _probe_rapidocr(python),
-        _probe_tesseract(lang, tessdata_dir),
-    ]
+
+    def probe_rapidocr() -> list[dict]:
+        return [_probe_rapidocr(python)]
+
+    def probe_tesseract() -> list[dict]:
+        return [_probe_tesseract(lang, tessdata_dir)]
+
+    if only is None:
+        return [*probe_rapidocr(), *probe_tesseract()]
+    known = {"rapidocr": probe_rapidocr, "tesseract": probe_tesseract}
+    if only not in known:
+        # 显式后端名由 argparse 的 choices 先拦一遍，这里兜住程序内调用者。
+        raise fail(EXIT_NO_BACKEND, f"未知后端: {only}")
+    return known[only]()
 
 
 def format_backend_line(entry: dict) -> str:
@@ -921,10 +940,13 @@ def run_rapidocr(
         result_path = Path(result_name)
 
         try:
+            # errors="replace"：同 `run_tesseract`——后端报错会把图像里的原始
+            # 字节带进 stderr，纯 `text=True' 解码失败会穿透成 traceback。
             proc = subprocess.run(
                 [python_exe, str(script_path), str(image_path), str(result_path)],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=lang_timeout,
             )
         except subprocess.TimeoutExpired:
@@ -1419,8 +1441,13 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_OK
 
         inputs = validate_inputs(args.files)
+        # 显式指定后端时只探测它（理由见 `probe_backends' 的 `only' 参数）；
+        # `auto` 仍全量探测，上面 `--list-backends' 那条分支同样保持全量。
         backends = probe_backends(
-            lang=args.lang, python=args.python, tessdata_dir=args.tessdata_dir
+            lang=args.lang,
+            python=args.python,
+            tessdata_dir=args.tessdata_dir,
+            only=None if args.backend == "auto" else args.backend,
         )
         backend = resolve_backend(args.backend, backends)
 

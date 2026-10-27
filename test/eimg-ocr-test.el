@@ -305,7 +305,12 @@ Emacs 会为同一进程在不同时机多次调用 sentinel：若没有守卫�
                   (buffer-string))))
     (dolist (package '("consult" "posframe" "embark" "transient"))
       (should-not (string-match-p (format "(require '%s" package) source)))
-    (should-not (string-match-p (concat "accept-process" "-output") source))))
+    ;; 为什么断言它不存在：`accept-process-output' 会把 Emacs 主线程阻塞到进程
+    ;; 真有输出为止，等于把「异步识别」退回同步等待——daemon 下会连带卡住用户
+    ;; 输入，取消与超时定时器也都跑不动（定时器要等主线程回到命令循环）。
+    ;; 直接写字符串而不是拼 `concat'：拼接只让人以为要绕开某个搜索检查，实则
+    ;; 什么都没绕开（断言的对象是 eimg-ocr.el 的源码文本，不是本文件）。
+    (should-not (string-match-p "accept-process-output" source))))
 
 ;;;; ── 6. 结果 buffer 与键位 ────────────────────────────────────────────
 

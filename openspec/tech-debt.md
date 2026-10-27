@@ -79,3 +79,46 @@ OCR 本身全异步（`eimg-ocr--start` 立即返回，收尾由 sentinel 完成
 这不是可以「顺手修」的缺陷：截图选区域本质上要人操作。留作后续决定——可选方向是给三个
 入口命令加一个「非交互参数入口」（直接吃文件路径，不弹选择器），让 daemon / 脚本能复用同一条
 OCR 编排路径；在那之前，从 daemon（`emacsclient -e`、定时任务）调这些命令不要指望能返回。
+
+## 多页 PDF 每页独立起进程，rapidocr 模型每页重新加载
+`recognize_pdf` 先 `pdftoppm` 栅格化，再**逐页**走 `recognize_image` → `run_rapidocr` /
+`run_tesseract`：每页一个子进程，rapidocr 那份内联脚本每页都要重新导入 onnxruntime 并
+加载检测/识别模型（实测冷启动 8–10 秒）。10 页文档≈10 次冷启动，真正的 OCR 时间被模型
+加载淹没。
+
+超时也只在**单页**粒度上：`RAPIDOCR_TIMEOUT = 180` / `TESSERACT_TIMEOUT = 120` 落在每次
+`subprocess.run` 上，CLI 层**没有整体超时**（也没有 `--timeout` 选项）。页数一多，总耗时
+可以远超用户对「一次识别」的预期；elisp 侧靠 `eimg-ocr-timeout`（整体定时器 →
+`delete-process`）兜住，于是表现为「到点被取消」而不是「慢慢跑完」，且已识别出的页一并
+丢弃。
+
+改进方向：**单进程识别多页**——一次 `subprocess.run` 传入多张图，Python 侧循环识别并把
+每页 block 合并进同一个结果 JSON，模型只加载一次。代价有两条，需先定取舍：① 错误粒度变粗
+（一页失败是丢整份还是跳过该页？）；② 超时语义要从「每页上限」改成「总量上限 + 每页软
+上限」，CLI 与 elisp 两侧的退出码 4 / 超时文案都要跟着重做。
+
+## tessdata 下载只校验体积下限，没有 SHA256
+`bin/eimg-ocr-setup --tessdata` 从 GitHub 取 `chi_sim.traineddata` / `eng.traineddata`，
+校验只有「文件大于 1 MB」一条，没有内容哈希比对：HTTPS 被降级、或环境配了不校验的代理、
+或上游同名文件被替换时都会静默通过。后果是 OCR 质量退化而不是报错——只要文件大于 1 MB，
+`tesseract --list-langs` 就认为语言可用，`probe_backends` 也判 tesseract 可用。
+
+当前「HTTPS + 体积下限」可接受（公开大文件，篡改动机与收益都低），严格起来应固定每个文件
+的 SHA256 并在下载后比对，顺带补一条「已存在且哈希匹配则跳过下载」的路径（现在重复执行
+`--tessdata` 会重下）。
+
+## 交互命令没有 `;;;###autoload`，可用性隐式依赖宿主不延迟加载
+`eimg-ocr-region` / `eimg-ocr-file` / `eimg-ocr-history` / `eimg-ocr-write-file` 等
+交互命令只定义在 `eimg-ocr.el` 里，**没有 `;;;###autoload` cookie**。宿主
+（thomas-emacs 的 `lisp/init-tools.el`）在 `use-package-always-defer` 为 nil 的默认值下
+于启动期 require 本包，于是这些键位「恰好」可用——这是一条隐式契约，本仓库自己的 ERT
+也锁不住（`make test` 用 `-L . -L test -l` 显式加载，永远看不到延迟加载的形态）。
+
+风险：若将来 eimg 改成 `:defer t`（延迟加载省启动时间，是很可能的下一步），`SPC` 系列
+键位会静默变成 `void-function`，而 `eimg-menu`（transient 菜单，上游带 autoload）仍能
+打开并调用同一批命令——属「部分可用」的隐蔽退化：菜单能跑、直接按键报错，错误信息只说
+函数未定义，排查时很难联想到「autoload 没生成」。
+
+修法二选一：① 给全部 `(interactive)` 命令补 `;;;###autoload` cookie（straight 的
+autoloads 步骤会收集，宿主即可安全 `:defer`）；② 明确把「本包不做延迟加载」写成契约
+（`:demand t` + README 说明），让后来改 `:defer` 的人先看到这句话。
