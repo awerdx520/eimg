@@ -7,7 +7,8 @@
 ;;; Commentary:
 
 ;; 覆盖进程层的四态收尾（finished / failed / cancelled / 超时）、状态清理、
-;; CLI 路径推导（`-L .' 与 build 目录软链两种加载方式）与进度文本。
+;; CLI 路径推导（`-L .' 与 build 目录软链两种加载方式）、进度文本，以及结果
+;; buffer 的渲染 / 正文提取 / 六条键位。
 ;;
 ;; 三条硬约束：
 ;;   1. **绝不调用真实 `bin/eimg-ocr'**：它依赖 rapidocr / tesseract 与 Python
@@ -16,7 +17,7 @@
 ;;   2. **绝不死等**：纯异步收尾靠 `eimg-ocr-test--wait' 轮询（上限 10 秒），
 ;;      到点返回 nil，让 `should' 打出可读的失败信息。
 ;;   3. 每个用例先 `eimg-ocr-test--reset'：模块状态是全局单槽，上一个用例残留
-;;      的活动进程 / 定时器会让下一个用例假绿。
+;;      的活动进程 / 定时器 / 结果状态会让下一个用例假绿。
 
 ;;; Code:
 
@@ -43,15 +44,23 @@ BODY 可含多行；用 `make-temp-file' 保证多次调用互不覆盖。"
     (funcall pred)))
 
 (defun eimg-ocr-test--reset ()
-  "清掉上一个用例可能残留的进程、定时器与进度。"
+  "清掉上一个用例可能残留的进程、定时器、进度与结果状态。
+结果 buffer 也一并关掉：它是固定名字的单例，留着会让「本次渲染到底写了什么」
+变得不可区分（上一个用例的内容可能被误当成这次的结果）。"
   (when (eimg-ocr-busy-p)
     (ignore-errors (delete-process eimg-ocr--process)))
   (when (timerp eimg-ocr--timeout-timer)
     (ignore-errors (cancel-timer eimg-ocr--timeout-timer)))
+  (when (get-buffer eimg-ocr-buffer-name)
+    (ignore-errors (kill-buffer (get-buffer eimg-ocr-buffer-name))))
   (setq eimg-ocr--process nil
         eimg-ocr--started-at nil
         eimg-ocr--timeout-timer nil
-        eimg-ocr--progress nil))
+        eimg-ocr--progress nil
+        eimg-ocr--last-args nil
+        eimg-ocr--last-origin nil
+        eimg-ocr--last-meta nil
+        eimg-ocr--last-summary nil))
 
 (defmacro eimg-ocr-test--with-stub (file body &rest forms)
   "在 FORMS 执行期间把 BODY 写成 stub 脚本并绑定到 FILE；结束后删脚本。"
@@ -291,6 +300,249 @@ Emacs 会为同一进程在不同时机多次调用 sentinel：若没有守卫�
     (dolist (package '("consult" "posframe" "embark" "transient"))
       (should-not (string-match-p (format "(require '%s" package) source)))
     (should-not (string-match-p (concat "accept-process" "-output") source))))
+
+;;;; ── 6. 结果 buffer 与键位 ────────────────────────────────────────────
+
+(defun eimg-ocr-test--pages ()
+  "固定 fixture：2 页，每页 2 块。
+刻意走真实的 `eimg-core-parse-json' 而不是手搓 alist：渲染入口的输入本来就来自
+解析层，从 JSON 出发才能连带锁住「解析 → 渲染」这一段契约。"
+  (eimg-core-parse-json
+   (concat "{\"pages\":["
+           "{\"page\":1,\"source\":\"a.pdf\",\"blocks\":"
+           "[{\"text\":\"第一页第一块\"},{\"text\":\"第一页第二块\"}]},"
+           "{\"page\":2,\"source\":\"a.pdf\",\"blocks\":"
+           "[{\"text\":\"第二页第一块\"},{\"text\":\"第二页第二块\"}]}"
+           "]}")))
+
+(defun eimg-ocr-test--expected-body ()
+  "`eimg-ocr-test--pages' 渲染后的正文，**逐字**基准（刻意手写死值）。
+不用 `eimg-core-render-org' 现算：那样渲染层一改，这里跟着变，断言就失去意义。"
+  (concat "** 第 1 页\n"
+          "第一页第一块\n"
+          "第一页第二块\n"
+          "** 第 2 页\n"
+          "第二页第一块\n"
+          "第二页第二块"))
+
+(defun eimg-ocr-test--render (&optional args meta)
+  "在当前 buffer（作为来源 buffer）里渲染固定 fixture，返回结果 buffer。"
+  (eimg-ocr--show-result (eimg-ocr-test--pages)
+                         (or args '("--format" "json" "a.pdf"))
+                         (or meta (list :backend "rapidocr"
+                                        :elapsed 1.3
+                                        :source "a.pdf"))))
+
+(defun eimg-ocr-test--mode-line-references-p (form symbol)
+  "FORM 这棵模式行结构里是否出现 SYMBOL。"
+  (cond ((eq form symbol) t)
+        ((consp form)
+         (or (eimg-ocr-test--mode-line-references-p (car form) symbol)
+             (eimg-ocr-test--mode-line-references-p (cdr form) symbol)))
+        (t nil)))
+
+(ert-deftest eimg-ocr-test-mode-derives-from-special-mode ()
+  "`eimg-ocr-mode' 派生自 `special-mode'：只读、`q' 可关、无自插内容。"
+  (eimg-ocr-test--reset)
+  (with-temp-buffer
+    (eimg-ocr-mode)
+    (should (derived-mode-p 'special-mode))
+    (should (eq 'special-mode (get 'eimg-ocr-mode 'derived-mode-parent)))))
+
+(ert-deftest eimg-ocr-test-mode-sets-truncate-lines ()
+  "`truncate-lines' 必须是 buffer 局部的 t（OCR 段落常是超长单行）。"
+  (eimg-ocr-test--reset)
+  (with-temp-buffer
+    (eimg-ocr-mode)
+    (should (eq t truncate-lines))
+    (should (local-variable-p 'truncate-lines))))
+
+(ert-deftest eimg-ocr-test-keymap-bindings ()
+  "六个键位逐一解析到对应命令。"
+  (dolist (pair '(("y" . eimg-ocr-copy)
+                  ("i" . eimg-ocr-insert)
+                  ("w" . eimg-ocr-write-file)
+                  ("g" . eimg-ocr-rerun)
+                  ("q" . quit-window)
+                  ("k" . eimg-ocr-cancel)))
+    (should (eq (cdr pair) (keymap-lookup eimg-ocr-mode-map (car pair)))))
+  ;; 六个命令都必须是交互命令，否则绑了也用不了（`M-x' 与按键走同一条判定）。
+  (dolist (cmd '(eimg-ocr-copy eimg-ocr-insert eimg-ocr-write-file
+                 eimg-ocr-rerun))
+    (should (commandp cmd))))
+
+(ert-deftest eimg-ocr-test-keymap-has-no-control-c-prefix ()
+  "`eimg-ocr-mode-map' 不得占用 `C-c' 前缀：`C-c + 单字母' 是用户保留键位。
+判据用单键 `C-c'（前缀是否绑了 keymap）而不是 `C-c y' 这类整串：
+`keymap-lookup' 对「前缀未绑定」的多键序列会返回 `1'（实测 Emacs 31.1），
+拿它断言会把正确实现判成失败。"
+  (should-not (keymap-lookup eimg-ocr-mode-map "C-c"))
+  (should-not (lookup-key eimg-ocr-mode-map (kbd "C-c"))))
+
+(ert-deftest eimg-ocr-test-show-result-exact-text ()
+  "渲染结果**逐字**等于「说明头行 + org 正文 + 末尾换行」。"
+  (eimg-ocr-test--reset)
+  (let ((buf (eimg-ocr-test--render)))
+    (should (equal (concat "# eimg-ocr: a.pdf（backend=rapidocr，2 页，1.30s）\n"
+                           (eimg-ocr-test--expected-body)
+                           "\n")
+                   (with-current-buffer buf
+                     (buffer-substring-no-properties (point-min) (point-max)))))
+    ;; 渲染完的三条副作用：point 在开头、buffer 未修改、mode 已就位。
+    (with-current-buffer buf
+      (should (= (point-min) (point)))
+      (should-not (buffer-modified-p))
+      (should (eq major-mode 'eimg-ocr-mode)))
+    ;; 可重跑状态被记下来
+    (should (equal '("--format" "json" "a.pdf") eimg-ocr--last-args))
+    (should (equal "a.pdf" (plist-get eimg-ocr--last-meta :source)))))
+
+(ert-deftest eimg-ocr-test-collect-body-strips-header ()
+  "正文提取去掉头行、保留 `** 第 N 页'；无头行时原样返回。"
+  (eimg-ocr-test--reset)
+  (let ((buf (eimg-ocr-test--render)))
+    (with-current-buffer buf
+      (should (equal (eimg-ocr-test--expected-body) (eimg-ocr--collect-body)))
+      (should (string-match-p "\\`\\*\\* 第 1 页" (eimg-ocr--collect-body)))
+      (should-not (string-match-p "eimg-ocr: " (eimg-ocr--collect-body)))))
+  (with-temp-buffer
+    (insert "无头行正文\n第二行\n")
+    (should (equal "无头行正文\n第二行" (eimg-ocr--collect-body))))
+  (with-temp-buffer
+    (insert "# eimg-ocr: 只有头行\n")
+    (should (equal "" (eimg-ocr--collect-body)))))
+
+(ert-deftest eimg-ocr-test-copy-puts-body-in-kill-ring ()
+  "`y' 把正文放进 kill-ring，且**不含**头行。
+`kill-ring' 动态绑定为 nil：`kill-new' 改的是全局变量，不隔离会污染后续用例
+（也会被并行跑测试的其他 buffer 影响）。"
+  (eimg-ocr-test--reset)
+  (let ((buf (eimg-ocr-test--render))
+        (messages nil))
+    (let ((kill-ring nil))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (push (apply #'format format-string args) messages))))
+        (with-current-buffer buf (call-interactively #'eimg-ocr-copy)))
+      (should (equal (eimg-ocr-test--expected-body) (car kill-ring)))
+      (should-not (string-match-p "eimg-ocr: " (car kill-ring))))
+    (should (string-match-p "6 行" (car messages)))
+    (should (string-match-p (number-to-string (length (eimg-ocr-test--expected-body)))
+                            (car messages)))))
+
+(ert-deftest eimg-ocr-test-insert-into-origin-at-point ()
+  "`i' 把正文插入来源 buffer 的光标处（不是 buffer 末尾、不是别处）。"
+  (eimg-ocr-test--reset)
+  (let ((origin (generate-new-buffer " *eimg-ocr-origin*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer origin
+            (insert "前缀：")
+            (eimg-ocr-test--render))
+          (should (eq origin eimg-ocr--last-origin))
+          (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+            (eimg-ocr-insert))
+          (should (equal (concat "前缀：" (eimg-ocr-test--expected-body) "\n")
+                         (with-current-buffer origin (buffer-string)))))
+      (kill-buffer origin))))
+
+(ert-deftest eimg-ocr-test-insert-does-not-double-newline ()
+  "正文自身已带末尾换行时不再补一个。
+这条用例防的是 `(insert body (unless …))' 写法：条件不成立时第二个实参是 nil，
+`(insert \"x\" nil)' 会 signal `wrong-type-argument'——只有当 buffer 正文末尾有
+两个换行（用户手工编辑过结果 buffer）时才踩得到，手测极易漏掉。"
+  (eimg-ocr-test--reset)
+  (let ((origin (generate-new-buffer " *eimg-ocr-origin*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer origin (eimg-ocr-test--render))
+          (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+            (let ((inhibit-read-only t))
+              (goto-char (point-max))
+              (insert "\n")))
+          (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+            (eimg-ocr-insert))
+          (should (equal (concat (eimg-ocr-test--expected-body) "\n")
+                         (with-current-buffer origin (buffer-string)))))
+      (kill-buffer origin))))
+
+(ert-deftest eimg-ocr-test-insert-dead-origin-errors ()
+  "来源 buffer 已 kill 时 `i' 必须 `user-error'，不能静默插到别处。"
+  (eimg-ocr-test--reset)
+  (let ((origin (generate-new-buffer " *eimg-ocr-origin*")))
+    (with-current-buffer origin (eimg-ocr-test--render))
+    (kill-buffer origin)
+    (should-not (buffer-live-p origin))
+    (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+      (should-error (eimg-ocr-insert) :type 'user-error))))
+
+(ert-deftest eimg-ocr-test-rerun-without-args-errors ()
+  "没有历史参数时 `g' 必须 `user-error'（不猜参数、也不起进程）。"
+  (eimg-ocr-test--reset)
+  (should-not eimg-ocr--last-args)
+  (with-temp-buffer
+    (should-error (eimg-ocr-rerun) :type 'user-error))
+  (should-not (eimg-ocr-busy-p)))
+
+(ert-deftest eimg-ocr-test-write-file-writes-body-and-confirms-overwrite ()
+  "`w' 写入的是去头行正文 + 末尾换行；文件已存在且拒绝覆盖时 `user-error'。
+（batch 下 `read-file-name' 不可用，所以直接测试带参函数体。）"
+  (eimg-ocr-test--reset)
+  (let* ((dir (make-temp-file "eimg-ocr-write-" t))
+         (file (expand-file-name "out.org" dir))
+         (buf (eimg-ocr-test--render)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (eimg-ocr-write-file file))
+          (should (equal (concat (eimg-ocr-test--expected-body) "\n")
+                         (with-temp-buffer
+                           (insert-file-contents file)
+                           (buffer-string))))
+          ;; 已存在 + 用户拒绝覆盖 → user-error，且文件内容不变
+          (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil)))
+            (with-current-buffer buf
+              (should-error (eimg-ocr-write-file file) :type 'user-error))))
+      (delete-directory dir t))))
+
+(ert-deftest eimg-ocr-test-mode-line-format-is-buffer-local ()
+  "模式行是 buffer 局部值，且结构里含 `eimg-ocr-mode-line-string'。
+为什么用结构断言而不是 `format-mode-line'：batch 环境（`make test'）没有窗口，
+`format-mode-line' 对任何格式都返回空串，按文本断言会把「没生效」判成通过。"
+  (eimg-ocr-test--reset)
+  (let ((buf (eimg-ocr-test--render)))
+    (with-current-buffer buf
+      (should (local-variable-p 'mode-line-format))
+      (let ((format (buffer-local-value 'mode-line-format buf)))
+        (should format)
+        (should (eimg-ocr-test--mode-line-references-p
+                 format 'eimg-ocr-mode-line-string))
+        ;; `:eval' 包裹形态也要在：裸符号 `eimg-ocr-mode-line-string' 会被当成
+        ;; 字面量插进模式行，什么都不会显示。
+        (should (member '(:eval (eimg-ocr-mode-line-string)) format))))))
+
+(ert-deftest eimg-ocr-test-mode-line-shows-summary-and-progress ()
+  "模式行文本的三种形态：完成摘要 → 进度（清掉摘要）→ 清空后空串。"
+  (eimg-ocr-test--reset)
+  (let ((buf (eimg-ocr-test--render)))
+    (with-current-buffer buf
+      (should (equal " 完成（2 页，1.30s） " (eimg-ocr-mode-line-string)))
+      ;; 新一轮开始：进度顶掉摘要
+      (eimg-ocr--set-progress "识别中" 3 2)
+      (should (equal " 识别中 2/3 " (eimg-ocr-mode-line-string)))
+      (eimg-ocr--clear-progress)
+      (should (equal "" (eimg-ocr-mode-line-string))))))
+
+(ert-deftest eimg-ocr-test-global-mode-line-format-unchanged ()
+  "加载与渲染都不得改全局 `mode-line-format'（否则所有 buffer 的模式行都被污染）。"
+  (eimg-ocr-test--reset)
+  (let ((before (default-value 'mode-line-format)))
+    (eimg-ocr-test--render)
+    (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+      (should (local-variable-p 'mode-line-format)))
+    (should (equal before (default-value 'mode-line-format)))
+    ;; 结果 buffer 之外的 buffer 连 buffer 局部值都不该有
+    (with-temp-buffer
+      (should-not (local-variable-p 'mode-line-format)))))
 
 (provide 'eimg-ocr-test)
 

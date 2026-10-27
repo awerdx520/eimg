@@ -8,10 +8,12 @@
 
 ;;; Commentary:
 
-;; 本文件是 eimg 的**进程层**：把 `eimg-core-build-args' 拼出来的参数交给
-;; `bin/eimg-ocr'，异步收尾，并把「进行中 / 已完成 / 失败 / 被取消 / 超时」这些
-;; 状态交给调用方。它**不做任何呈现**：结果 buffer、buffer 局部模式行、交互命令
-;; 都属于上层（`eimg-ocr-mode'）。
+;; 本文件分两层：
+;;   - 第 1–6 节是**进程层**：把 `eimg-core-build-args' 拼出来的参数交给
+;;     `bin/eimg-ocr'，异步收尾，并把「进行中 / 已完成 / 失败 / 被取消 / 超时」
+;;     这些状态交给调用方。
+;;   - 第 7 节是**呈现层**：`eimg-ocr-mode' 结果 buffer、buffer 局部模式行与六条
+;;     键位。它只消费进程层与 `eimg-core' 的输出，自己不启动进程。
 ;;
 ;; 三条设计约束，改动时不要打破：
 ;;   1. **纯异步**：`eimg-ocr--start' 立即返回进程对象，主线程从不为子进程让路；
@@ -30,6 +32,9 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+;; 同仓库的纯逻辑层：渲染结果 buffer 要用它的 `eimg-core-render-org' 与 JSON 解析。
+;; 它零第三方依赖，加载代价可忽略（`eimg.el' 本来也会加载它）。
+(require 'eimg-core)
 
 ;;;; ── 1. 可配置项与模块状态 ────────────────────────────────────────────
 
@@ -69,6 +74,24 @@
 (defvar eimg-ocr--progress nil
   "当前进度：nil 或 plist `(:stage 阶段 :pages 总页数 :current 当前页)'。
 单图（非 PDF）时只有 `:stage' 一项有值。")
+
+(defvar eimg-ocr--last-args nil
+  "最近一次渲染结果所用的 CLI 参数列表；nil 表示本会话还没出过结果。
+`eimg-ocr-rerun' 只重跑，不猜参数——参数从哪来属于上层交互命令的职责。")
+
+(defvar eimg-ocr--last-origin nil
+  "最近一次结果对应的来源 buffer；`eimg-ocr-insert' 的插入目标。
+用 buffer 对象而不是 buffer 名：同名 buffer 可以被重新创建，旧对象一眼就能用
+`buffer-live-p' 判定「来源已消失」，不必猜。")
+
+(defvar eimg-ocr--last-meta nil
+  "最近一次结果的元信息 plist：`:backend' `:elapsed' `:source'。
+供 `eimg-ocr-write-file' 推默认文件名、`eimg-ocr-rerun' 沿用后端。")
+
+(defvar eimg-ocr--last-summary nil
+  "最近一次完成的摘要文本（如 \" 完成（2 页，1.30s） \"）；空闲时 nil。
+它由 `eimg-ocr--set-progress' 清空、由渲染入口写入，供模式行在任务结束后
+继续显示结果概要（进度清空后模式行不该变成一片空白）。")
 
 ;;;; ── 2. CLI 路径定位 ──────────────────────────────────────────────────
 
@@ -157,29 +180,38 @@ ARGS 由 `eimg-core-build-args' 产出，本层不解释它的语义。
 
 (defun eimg-ocr--sentinel (proc event callback)
   "处理 PROC 的状态变化：按四态分支收尾，并让 CALLBACK 恰好执行一次。
-EVENT 是 Emacs 给出的原文案，实测（Emacs 31.1）只有这几种形态：
-  \"finished\\n\"                        退出码 0        → `finished'
-  \"exited abnormally with code N\\n\"    非零退出        → `failed'（EXIT-CODE = N）
-  \"killed\\n\"                          `delete-process' / SIGKILL → `cancelled'
-  \"interrupt\\n\"                       SIGINT          → `cancelled'
-其余事件（\"open\\n\" / \"run\" / \"stop\" / \"closed\" 等）不调回调。
-超时走的是 `killed'：`eimg-ocr--on-timeout' 先打 `eimg-timeout' 标记再
+归属判据是 `process-status' / `process-exit-status'，**不是** EVENT 的文案：
+EVENT 对「因信号死亡」的描述取自 `strsignal'，会经 gettext 翻译——本机 zh_CN
+下实测 `delete-process' 给出的是 \"已杀死\\n\"、SIGINT 给出 \"中断\\n\"，按
+\"killed\" 字面匹配永远不命中，取消与超时两条路径会整个哑掉（`make test' 里
+对应用例只能等到超时才报错）。`process-status' 与文案无关，稳定可取：
+  `exit' + 退出码 0          → `finished'
+  `exit' + 非零退出码        → `failed'（EXIT-CODE = 退出码）
+  `signal'（SIGKILL / SIGINT）→ `cancelled'；带 `eimg-timeout' 标记时是 `failed' + 124
+其余状态（`run' / `stop' / `open' / `closed' 等）不调回调。
+保留 \"finished\" / \"exited\" 的文案兜底：这两条文案不翻译（实测），万一
+`process-status' 取不到（nil）时仍能收尾，不至于让回调永久悬空。
+超时走的也是 `signal'：`eimg-ocr--on-timeout' 先打 `eimg-timeout' 标记再
 `delete-process'，本函数据标记把它归到 `failed' + 124，而不是「用户取消」。"
   (unless (process-get proc 'eimg-done)
-    (let ((code (process-exit-status proc)))
+    (let ((code (process-exit-status proc))
+          (status (process-status proc)))
       (cond
+       ((eq status 'exit)
+        (if (and (integerp code) (zerop code))
+            (eimg-ocr--finish proc 'finished callback 0)
+          (eimg-ocr--finish proc 'failed callback code)))
+       ((eq status 'signal)
+        (if (process-get proc 'eimg-timeout)
+            (eimg-ocr--finish proc 'failed callback eimg-ocr--timeout-exit-code
+                              (format "OCR 超时（超过 %s 秒）\n" eimg-ocr-timeout))
+          (eimg-ocr--finish proc 'cancelled callback nil)))
        ((string-prefix-p "finished" event)
         (eimg-ocr--finish proc 'finished callback 0))
        ((string-match-p "exited" event)
         (if (and (integerp code) (zerop code))
             (eimg-ocr--finish proc 'finished callback 0)
           (eimg-ocr--finish proc 'failed callback code)))
-       ((or (string-prefix-p "killed" event)
-            (string-prefix-p "interrupt" event))
-        (if (process-get proc 'eimg-timeout)
-            (eimg-ocr--finish proc 'failed callback eimg-ocr--timeout-exit-code
-                              (format "OCR 超时（超过 %s 秒）\n" eimg-ocr-timeout))
-          (eimg-ocr--finish proc 'cancelled callback nil)))
        (t nil)))))
 
 (defun eimg-ocr--drain-stderr (proc)
@@ -269,8 +301,11 @@ sentinel，标记保证回调只跑一次、清理只做一遍。"
 (defun eimg-ocr--set-progress (stage &optional pages current)
   "设置进度并刷新模式行，返回新的进度 plist。
 STAGE 是阶段名（如 \"识别中\"）；PAGES 为总页数、CURRENT 为当前页（1-based），
-两者只对多页输入有意义，单图传 nil。"
-  (setq eimg-ocr--progress (list :stage stage :pages pages :current current))
+两者只对多页输入有意义，单图传 nil。
+同时清空上一次的完成摘要：新一轮已经开始，模式行上留着旧摘要会让人以为
+旧结果就是新结果。"
+  (setq eimg-ocr--progress (list :stage stage :pages pages :current current)
+        eimg-ocr--last-summary nil)
   (force-mode-line-update t)
   eimg-ocr--progress)
 
@@ -281,20 +316,220 @@ STAGE 是阶段名（如 \"识别中\"）；PAGES 为总页数、CURRENT 为当�
   nil)
 
 (defun eimg-ocr-mode-line-string ()
-  "返回当前进度字符串，供调用方放进 buffer 局部的模式行；空闲时返回空串。
+  "返回当前应显示在模式行上的文本，供调用方放进 buffer 局部的模式行。
+三种形态：进行中 → 进度（如 \" 识别中 2/3 页 \"）；刚完成 → 摘要
+（如 \" 完成（2 页，1.30s） \"）；两者都没有 → 空串。
 为什么不把 `:eval' 片段塞进全局 `mode-line-format'：那会让 \"识别中 2/3\" 出现
 在**所有** buffer（包括完全无关的编程 buffer），而只有结果 buffer 该显示它。
-故本层只导出文本，安装留给上层决定。"
+故本层只导出文本，安装留给 `eimg-ocr-mode' 决定。"
   (let ((stage (plist-get eimg-ocr--progress :stage))
         (pages (plist-get eimg-ocr--progress :pages))
         (current (plist-get eimg-ocr--progress :current)))
     (cond
-     ((null eimg-ocr--progress) "")
+     ((null eimg-ocr--progress) (or eimg-ocr--last-summary ""))
      ((and (numberp pages) (numberp current))
       (format " %s %d/%d " stage current pages))
      ((numberp pages)
       (format " %s 共 %d 页 " stage pages))
      (t (format " %s " stage)))))
+
+;;;; ── 7. 结果 buffer 与键位 ────────────────────────────────────────────
+
+;; 职责：把 `eimg-core-render-org' 的正文装进一个专用 buffer，配上**只属于这个
+;; buffer** 的模式行，并用六个键位覆盖「复制 / 回插 / 存盘 / 重跑 / 关闭 / 取消」。
+;; 这一节不启动进程（`g' 例外：它只是把已有参数再交给进程层），也不决定「识别
+;; 什么」——那是上层交互命令的职责。
+
+(defconst eimg-ocr-buffer-name "*eimg-ocr*"
+  "OCR 结果 buffer 的名字。
+用固定名字而不是 `generate-new-buffer'：`g' 重跑与后续多次识别都要求写回同一个
+buffer，否则每跑一次就漏一个 buffer，而且 `q' 关掉之后还能重开。")
+
+(defconst eimg-ocr--header-prefix "# eimg-ocr: "
+  "结果 buffer 首行的前缀。
+用 `#' 开头而不是 org 标题：它是给人（以及 `eimg-ocr--collect-body'）看的元信息，
+不该进 org 大纲，复制 / 导出 / 折叠时都会被当成注释行跳过。")
+
+(defun eimg-ocr--summary-string (pages elapsed)
+  "返回完成摘要的模式行文本。PAGES 是页数，ELAPSED 是耗时秒数（可为 nil）。"
+  (format " 完成（%d 页，%.2fs） " (or pages 0) (or elapsed 0)))
+
+(defun eimg-ocr--header-line (source backend pages elapsed)
+  "拼出结果 buffer 的说明头行：`# eimg-ocr: 来源（backend=…，N 页，X.XXs）'。
+四个参数都容忍 nil：来源 / 后端未知时显示「未知来源」「未知后端」，宁可在头行上
+暴露「不知道」也不要让渲染整个失败——识别结果本身仍然是有用的。"
+  (format "%s%s（backend=%s，%d 页，%.2fs）"
+          eimg-ocr--header-prefix
+          (or source "未知来源")
+          (or backend "未知后端")
+          (or pages 0)
+          (or elapsed 0)))
+
+(defun eimg-ocr--collect-body (&optional buffer)
+  "返回 BUFFER（默认当前 buffer）中**去掉说明头行**的正文。
+`y' / `w' / `i' 三个命令共用：头行是元信息，复制、存盘、回插都不该带上它。
+首行不以 `eimg-ocr--header-prefix' 开头时原样返回，这样手工编辑过的 buffer
+（或用户自己把结果 buffer 改了）也不会被吞掉第一行。
+返回值不含末尾换行：写进其他 buffer 与 kill-ring 时由调用方按需补。"
+  (with-current-buffer (or buffer (current-buffer))
+    (let* ((text (buffer-substring-no-properties (point-min) (point-max)))
+           (body (if (string-prefix-p eimg-ocr--header-prefix text)
+                     (let ((newline (string-search "\n" text)))
+                       (if newline (substring text (1+ newline)) ""))
+                   text)))
+      (string-remove-suffix "\n" body))))
+
+(defun eimg-ocr--show-result (pages args meta)
+  "把 PAGES 渲染进 `eimg-ocr-buffer-name' 并返回该 buffer。
+ARGS 是产出这批结果的 CLI 参数（供 `eimg-ocr-rerun' 原样重跑），META 是 plist
+`:backend' / `:elapsed' / `:source'。调用时的**当前 buffer 即来源 buffer**，
+它被记进 `eimg-ocr--last-origin'，供 `eimg-ocr-insert' 回插。
+batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' 走的就是这条路，
+而 `display-buffer' 在没有窗口系统的批处理里没有意义、也不该成为失败点。"
+  (let* ((source (plist-get meta :source))
+         (backend (plist-get meta :backend))
+         (elapsed (plist-get meta :elapsed))
+         (origin (current-buffer))
+         (page-count (length pages))
+         (body (eimg-core-render-org pages))
+         (buffer (get-buffer-create eimg-ocr-buffer-name)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (eimg-ocr--header-line source backend page-count elapsed) "\n")
+        (insert body)
+        (insert "\n")
+        ;; 先写完文本再开 mode：`special-mode' 会把 buffer 置为只读，反序会 write error。
+        (eimg-ocr-mode)
+        (goto-char (point-min))
+        (set-buffer-modified-p nil)))
+    (setq eimg-ocr--last-args args
+          eimg-ocr--last-origin origin
+          eimg-ocr--last-meta meta
+          eimg-ocr--last-summary (eimg-ocr--summary-string page-count elapsed))
+    ;; 进度已由进程层收尾时清空，这里只补上摘要，让模式行在任务结束后仍有信息。
+    (force-mode-line-update t)
+    (unless noninteractive
+      (display-buffer buffer '(display-buffer-pop-up-window)))
+    buffer))
+
+(define-derived-mode eimg-ocr-mode special-mode "eimg-OCR"
+  "OCR 结果 buffer 的主模式。
+只设**两份** buffer 局部值：`truncate-lines'（OCR 段落常是超长单行，折行会把
+一页的文字搅成视觉上无法对照的碎片）与 `mode-line-format'（进度与摘要只该出现
+在这个 buffer，绝不能改全局值——否则所有无关 buffer 的模式行都会被塞进
+\"识别中 2/3\"）。"
+  (setq-local truncate-lines t)
+  (setq-local mode-line-format
+              '("%e" mode-line-buffer-identification " " mode-line-modified
+                (:eval (eimg-ocr-mode-line-string)))))
+
+;; 键位一律绑在 `eimg-ocr-mode-map'（`define-derived-mode' 已经建好、父表是
+;; `special-mode-map'），不用 evil / general——本文件必须保持顶层零第三方依赖。
+;; 不复用 `C-c xxx' 前缀：`C-c' 后跟单个字母是**用户保留**的键位空间。
+(keymap-set eimg-ocr-mode-map "y" #'eimg-ocr-copy)
+(keymap-set eimg-ocr-mode-map "i" #'eimg-ocr-insert)
+(keymap-set eimg-ocr-mode-map "w" #'eimg-ocr-write-file)
+(keymap-set eimg-ocr-mode-map "g" #'eimg-ocr-rerun)
+(keymap-set eimg-ocr-mode-map "q" #'quit-window)
+(keymap-set eimg-ocr-mode-map "k" #'eimg-ocr-cancel)
+
+(defun eimg-ocr-copy ()
+  "把结果正文（不含说明头行）放入 `kill-ring'。
+行数按换行切分统计：OCR 结果的「多少行」就是「多少段文本」，比字符数更有用。"
+  (interactive)
+  (let ((body (eimg-ocr--collect-body)))
+    (when (string-empty-p body)
+      (user-error "没有可复制的 OCR 正文"))
+    (kill-new body)
+    (message "eimg：已复制 %d 行 / %d 字符"
+             (length (split-string body "\n"))
+             (length body))))
+
+(defun eimg-ocr-insert ()
+  "把结果正文插入到 `eimg-ocr--last-origin' 的光标处。
+来源 buffer 已被 kill 时 `user-error' 而不是随便挑个 buffer 插入：静默落到别处
+的结果比报错更难发现。"
+  (interactive)
+  (let ((origin eimg-ocr--last-origin)
+        (body (eimg-ocr--collect-body)))
+    (unless (buffer-live-p origin)
+      (user-error "来源 buffer 已不存在，无法插入"))
+    (when (string-empty-p body)
+      (user-error "没有可插入的 OCR 正文"))
+    (with-current-buffer origin
+      (insert body)
+      ;; 正文自身没有末尾换行；补一个，避免插进正文中间时把后文粘上来。
+      (unless (string-suffix-p "\n" body)
+        (insert "\n")))
+    (message "eimg：已插入 %d 字符到 %s" (length body) (buffer-name origin))))
+
+(defun eimg-ocr--default-file-name ()
+  "由 `eimg-ocr--last-meta' 的 `:source' 推出默认文件名（`<source 主干名>.org'）。
+取不到来源时退回 `ocr.org'：默认值的价值是「回车就能用」，不是精确。"
+  (let* ((source (plist-get eimg-ocr--last-meta :source))
+         (stem (if (and (stringp source) (not (string-empty-p source)))
+                   (file-name-base source)
+                 "ocr")))
+    (expand-file-name (concat stem ".org"))))
+
+(defun eimg-ocr-write-file (file)
+  "把结果正文写入 FILE；已存在时先 `y-or-n-p' 确认。交互式默认 `.org' 后缀。
+`read-file-name' 的 MUSTMATCH 刻意传 nil：传 t 会把「还不存在的文件名」判为
+不匹配，而写文件恰恰最需要新名字——覆盖确认交给 `y-or-n-p' 单独做。"
+  (interactive
+   (list (read-file-name "写入 org 文件：" nil nil nil
+                         (eimg-ocr--default-file-name))))
+  (let ((body (eimg-ocr--collect-body)))
+    (when (string-empty-p body)
+      (user-error "没有可写入的 OCR 正文"))
+    (when (and (file-exists-p file)
+               (not (y-or-n-p (format "文件已存在，覆盖 %s？" file))))
+      (user-error "已取消写入"))
+    (let ((coding-system-for-write 'utf-8-unix))
+      (write-region (concat body "\n") nil file nil 'silent))
+    (message "eimg：已写入 %s" file)))
+
+(defun eimg-ocr-rerun ()
+  "用最近一次的 CLI 参数重跑 OCR，结果仍写回本 buffer。
+没有历史参数时 `user-error'：本命令只负责「重跑」，不负责猜参数（画哪块、用哪个
+后端都属于上层交互命令）。收尾沿用四态语义——失败只提示、不覆盖已有结果，
+免得一次误重跑把上一份识别结果冲掉。"
+  (interactive)
+  (unless eimg-ocr--last-args
+    (user-error "本 buffer 还没有 OCR 结果：先跑一次识别再重跑"))
+  (let ((args eimg-ocr--last-args)
+        (meta eimg-ocr--last-meta)
+        (origin eimg-ocr--last-origin)
+        (started (current-time)))
+    (eimg-ocr--start
+     args
+     (lambda (status stdout stderr &optional code)
+       (pcase status
+         ('finished
+          (condition-case err
+              (let ((pages (eimg-core-parse-json stdout)))
+                ;; 回到来源 buffer 里调渲染：`eimg-ocr--show-result' 把
+                ;; 「当前 buffer」当成回插目标，重跑时当前 buffer 是结果 buffer
+                ;; 自己，直接调用会让 `i' 指向错误的目标。
+                (with-current-buffer (if (buffer-live-p origin)
+                                         origin
+                                       (current-buffer))
+                  (eimg-ocr--show-result
+                   pages args
+                   (list :backend (plist-get meta :backend)
+                         :elapsed (float-time (time-subtract (current-time) started))
+                         :source (plist-get meta :source)))))
+            (eimg-core-parse-error
+             (eimg-ocr--clear-progress)
+             (message "eimg：OCR 结果解析失败：%s" (error-message-string err)))))
+         ('failed
+          (eimg-ocr--clear-progress)
+          (message "eimg：OCR 失败：%s" (eimg-core-exit-message code stderr)))
+         ('cancelled
+          (eimg-ocr--clear-progress)
+          (message "eimg：OCR 已取消")))))
+    (eimg-ocr--set-progress "识别中")))
 
 (provide 'eimg-ocr)
 
