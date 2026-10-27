@@ -12,8 +12,9 @@
 ;;   - 第 1–6 节是**进程层**：把 `eimg-core-build-args' 拼出来的参数交给
 ;;     `bin/eimg-ocr'，异步收尾，并把「进行中 / 已完成 / 失败 / 被取消 / 超时」
 ;;     这些状态交给调用方。
-;;   - 第 7 节是**呈现层**：`eimg-ocr-mode' 结果 buffer、buffer 局部模式行与六条
-;;     键位。它只消费进程层与 `eimg-core' 的输出，自己不启动进程。
+;;   - 第 7 节是**呈现层**：`eimg-ocr-mode' 结果 buffer、buffer 局部模式行与七条
+;;     键位。它只消费进程层与 `eimg-core' 的输出，自己不启动进程（`v' 只是把
+;;     已有结构交给独立的 `eimg-ocr-view'，后者不在本文件）。
 ;;   - 第 8 节是**编排层**：`eimg-ocr--run' 把「拼参数 → 起进程 → 四态收尾」收成
 ;;     一份，三个入口命令（region / file / history）、后端查询与结果 buffer 的 `g'
 ;;     全部复用它。
@@ -38,6 +39,13 @@
 ;; 同仓库的纯逻辑层：渲染结果 buffer 要用它的 `eimg-core-render-org' 与 JSON 解析。
 ;; 它零第三方依赖，加载代价可忽略（`eimg.el' 本来也会加载它）。
 (require 'eimg-core)
+
+;; `eimg-ocr-view'（结果 buffer 的 `v' 键）定义在 `eimg-ocr-view.el'，由后续任务
+;; 创建，**这里只声明不 require**：那个文件要读本文件的 `eimg-ocr--result-data' /
+;; `eimg-ocr-buffer-name'，必然 require 本文件，本文件再 require 回去就成了顶层
+;; 循环依赖。声明只为让字节编译知道「这个符号最终会有函数定义」，避免
+;; \"the function is not known to be defined\" 类噪音。
+(declare-function eimg-ocr-view "eimg-ocr-view" ())
 
 ;;;; ── 1. 可配置项与模块状态 ────────────────────────────────────────────
 
@@ -196,6 +204,14 @@ ARGS 显式给出 `:ollama-url' 时以 ARGS 为准。"
   "最近一次截图函数返回的文件路径；nil 表示本会话还没截过图。
 `eimg-ocr--history-directory' 在 `eimg-ocr-images-dir' 为 nil 时用它反推目录——
 用户刚截了一张图，接着想看历史时最想知道的就是「刚才那些图在哪」。")
+
+(defvar-local eimg-ocr--result-data nil
+  "结果 buffer 里的结构化识别结果：plist `(:pages PAGES :meta META)'。
+为什么另存结构而不从 buffer 文本反推：文本是渲染产物，`box' / `conf' / 页图路径
+在渲染时就被丢掉了，反推不回来。视图层（`eimg-ocr-view'）需要原始 pages。
+buffer-local 而非模块全局：`eimg-ocr-buffer-name' 是固定名的单例 buffer，结果
+跟着它的 buffer 走；放全局则 `q' 关掉结果 buffer 之后任何 buffer 都能读到一份
+「上一批结果的幽灵」。")
 
 ;;;; ── 2. CLI 路径定位 ──────────────────────────────────────────────────
 
@@ -438,11 +454,74 @@ STAGE 是阶段名（如 \"识别中\"）；PAGES 为总页数、CURRENT 为当�
       (format " %s 共 %d 页 " stage pages))
      (t (format " %s " stage)))))
 
+;;;; ── 6b. 页图临时目录（PDF 输入的坐标依据） ──────────────────────────
+
+;; 联动视图要在地图上画出每个块的框，前提是**有图可画**：单图输入时图就是用户给
+;; 的那张文件，而 PDF 输入时 CLI 只吐页码与坐标，页图必须由 CLI 自己栅格化落到
+;; 某个目录（`--page-images-dir'）。这一节只做三件小事：判「这次是不是 PDF」、
+;; 建一个本次任务专属的临时目录、在没人接手时把它删掉。
+;;
+;; 目录的生命周期是**交接**制：`eimg-ocr--run' 建 → 失败 / 取消 / 解析失败当场删
+;; （结果 buffer 没有接手它）→ 成功时交给结果 buffer，由它的 kill-hook 或下一次
+;; rerun 删。于是每个目录恰好有一个负责人，不存在「谁都能删、于是谁都没删」。
+
+(defun eimg-ocr--pdf-input-p (config)
+  "CONFIG 的输入文件里是否有 PDF（按扩展名比较，大小写不敏感）。
+只看扩展名、不读文件头：这里要回答的是「这次要不要让 CLI 落页图」，而「是不是
+PDF」的判定标准本来就由 CLI 按扩展名做（它拒收别的格式并给退出码 2）。本层再嗅
+一次 `%PDF-' 只会引入两个可能不一致的判据。
+`eimg-core--as-list' 是 `eimg-core' 的内部函数，同包的 `eimg-ocr--config-source'
+已经在用它，这里保持同一口径而不是另写一份归一化——两份「字符串算不算列表」的
+实现迟早会在 `:files' 传单个字符串这种边角上分叉。"
+  (let ((files (append (eimg-core--as-list (plist-get config :file))
+                       (eimg-core--as-list (plist-get config :files)))))
+    (cl-some (lambda (file)
+               (and (stringp file)
+                    (string-equal (downcase (or (file-name-extension file) ""))
+                                  "pdf")))
+             files)))
+
+(defun eimg-ocr--make-pages-dir ()
+  "创建本次任务专属的页图目录，返回其绝对路径（无末尾斜杠）；失败返回 nil。
+**失败返回 nil 而不是 signal**：页图是增强能力——没有它，结果 buffer 里仍然有
+完整的文本与页码，只是联动视图退化成无框显示。让「临时目录不可写」这种环境问题
+把整次 OCR 判失败，代价远大于收益。
+返回形态不带末尾斜杠（`make-temp-file' 的约定），调用方拼子路径一律走
+`expand-file-name'，两种形态都能正确处理。"
+  (condition-case nil
+      (make-temp-file "eimg-ocr-pages-" t)
+    (error nil)))
+
+(defun eimg-ocr--delete-pages-dir (dir)
+  "删除 DIR 及其中全部内容；**仅在 DIR 位于 `temporary-file-directory' 之下时**。
+守卫是硬要求，不是洁癖：DIR 的最终出处是 plist（`eimg-ocr--result-data' 里的
+`:pages-dir'），而 plist 可以被任何一段 elisp 塞进任意路径。「收到什么就删什么」
+会把一次三元组的拼写错误变成删用户目录。三条同时成立才动手：
+  1. DIR 是非空字符串（nil / 符号 / 数字一律忽略）；
+  2. `file-directory-p' 为真——失败分支里 CLI 可能因 `--page-images-dir' 校验
+     失败而根本没建过该目录，此时静默返回；
+  3. 真实路径（`file-truename' 解开软链后的）位于 `temporary-file-directory'
+     的真实路径之下。
+第 3 条两边都取 `file-truename'：只解一边的话，`temporary-file-directory' 本身
+是软链时前缀比较恒假（该删的不删），而只信 DIR 一侧则一个指向用户目录的软链就
+能绕过守卫（不该删的删了）。
+局限：这是字符串前缀比较，`/tmpfoo' 与 `/tmp' 共享前缀，故两侧都先
+`file-name-as-directory' 补一个分隔符再比；除软链之外的挂载点（bind mount）不加
+区分——本函数只服务于自己用 `make-temp-file' 建的目录，足以防住「元数据被改成
+任意路径」，不承诺防住能改挂载表的攻击者。"
+  (when (and (stringp dir) (not (string-empty-p dir)))
+    (let* ((target (file-truename dir))
+           (root (file-truename (file-name-as-directory temporary-file-directory))))
+      (when (and (file-directory-p dir)
+                 (string-prefix-p root (file-name-as-directory target)))
+        (ignore-errors (delete-directory dir t))))))
+
 ;;;; ── 7. 结果 buffer 与键位 ────────────────────────────────────────────
 
 ;; 职责：把 `eimg-core-render-org' / `eimg-core-render-text'（按
 ;; `eimg-ocr-report-style' 二选一）的正文装进一个专用 buffer，配上**只属于这个
-;; buffer** 的模式行，并用六个键位覆盖「复制 / 回插 / 存盘 / 重跑 / 关闭 / 取消」。
+;; buffer** 的模式行，并用七个键位覆盖「复制 / 回插 / 存盘 / 重跑 / 联动视图 /
+;; 关闭 / 取消」。
 ;; 这一节不启动进程（`g' 例外：它只是把已有参数再交给进程层），也不决定「识别
 ;; 什么」——那是上层交互命令的职责。
 
@@ -506,11 +585,38 @@ buffer，否则每跑一次就漏一个 buffer，而且 `q' 关掉之后还能�
                    text)))
       (string-remove-suffix "\n" body))))
 
+(defun eimg-ocr--result-pages-dir ()
+  "返回当前结果 buffer 里记录的页图目录绝对路径；没有结果 / 没有目录时 nil。
+单独抽一个取值函数而不在各处写嵌套 `plist-get'：页图目录藏在 `:meta' 里
+（`(:pages … :meta (:pages-dir …))'），写成 `(plist-get eimg-ocr--result-data
+:pages-dir)' 会静默返回 nil——清理逻辑于是「看起来在跑、其实什么都没删」，
+这类错误测试里只会表现为「目录还在」，很难一眼看出是第一层键取错了。"
+  (plist-get (plist-get eimg-ocr--result-data :meta) :pages-dir))
+
+(defun eimg-ocr--result-buffer-cleanup ()
+  "结果 buffer 被 kill 时删掉它负责的页图目录，并抹掉 `eimg-ocr--result-data'。
+挂在 buffer-local 的 `kill-buffer-hook' 上（安装点见 `eimg-ocr--show-result'）。
+**必须幂等**：目录已被删、`:pages-dir' 为 nil、函数被连着调两次都只是什么都不
+做——清理函数一旦 signal，「关个 buffer」就变成用户可见的报错，而 kill-buffer-hook
+上的错误还会顺带打断 `kill-buffer' 的后续钩子。
+顺序不能反：先按旧值删目录，再置 nil；反过来就再也拿不到那个路径了。"
+  (eimg-ocr--delete-pages-dir (eimg-ocr--result-pages-dir))
+  (setq eimg-ocr--result-data nil))
+
 (defun eimg-ocr--show-result (pages args meta)
   "把 PAGES 渲染进 `eimg-ocr-buffer-name' 并返回该 buffer。
 ARGS 是产出这批结果的 CLI 参数（供 `eimg-ocr-rerun' 原样重跑），META 是 plist
-`:backend' / `:elapsed' / `:source'。调用时的**当前 buffer 即来源 buffer**，
-它被记进 `eimg-ocr--last-origin'，供 `eimg-ocr-insert' 回插。
+`:backend' / `:elapsed' / `:source' / `:pages-dir'。调用时的**当前 buffer 即来源
+buffer**，它被记进 `eimg-ocr--last-origin'，供 `eimg-ocr-insert' 回插。
+
+渲染之外还做两件事，都在结果 buffer 的上下文里：
+  1. 把结构另存进 buffer-local 的 `eimg-ocr--result-data'（plist
+     `(:pages PAGES :meta META)'）。渲染后的文本已经丢掉了 `box' / `conf' /
+     页图路径，联动视图只能吃原始 pages。
+  2. 把 `eimg-ocr--result-buffer-cleanup' 挂上本 buffer 的 `kill-buffer-hook'，
+     于是 META 里 `:pages-dir' 指向的页图目录随 buffer 一起消失。同一 buffer 上
+     重复 `add-hook' 同一函数是幂等的（`add-hook' 用 `member' 按符号去重），故
+     每次渲染都加一次也不会堆积。
 
 渲染风格由 `eimg-ocr-report-style' 决定，且**每次渲染现读**：
 `org' → `eimg-core-render-org'（带 `** 第 N 页'）、`text' →
@@ -531,6 +637,14 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
                  (eimg-core-render-org pages)))
          (buffer (get-buffer-create eimg-ocr-buffer-name)))
     (with-current-buffer buffer
+      ;; 旧结果的页图目录必须在这里就删掉：rerun 会渲染进**同一个** buffer，新结果
+      ;; 一旦接手，旧目录的路径就只存在于即将被覆盖的 `eimg-ocr--result-data' 里，
+      ;; 没人再记得它——每重跑一次就泄漏一个页图目录（PDF 页图从几 MB 到几十 MB）。
+      ;; 判「与本次不同」再删：同一个目录被重复渲染（如 `org' / `text' 换风格重渲）
+      ;; 时不该先删了自己马上要用的图。
+      (let ((stale-dir (eimg-ocr--result-pages-dir)))
+        (unless (equal stale-dir (plist-get meta :pages-dir))
+          (eimg-ocr--delete-pages-dir stale-dir)))
       (let ((inhibit-read-only t))
         (erase-buffer)
         (insert (eimg-ocr--header-line source backend page-count elapsed style) "\n")
@@ -539,7 +653,12 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
         ;; 先写完文本再开 mode：`special-mode' 会把 buffer 置为只读，反序会 write error。
         (eimg-ocr-mode)
         (goto-char (point-min))
-        (set-buffer-modified-p nil)))
+        (set-buffer-modified-p nil))
+      ;; 结构存进 buffer 局部变量：视图层要原始 pages，渲染后的文本反推不回来。
+      (setq eimg-ocr--result-data (list :pages pages :meta meta))
+      ;; `add-hook' 按符号去重，故每次渲染都加一遍不会让 hook 堆积；LOCAL 传 t，
+      ;; 该 hook 只属于这个 buffer（否则 kill 任何 buffer 都会去删这批页图）。
+      (add-hook 'kill-buffer-hook #'eimg-ocr--result-buffer-cleanup nil t))
     (setq eimg-ocr--last-args args
           eimg-ocr--last-origin origin
           eimg-ocr--last-meta meta
@@ -564,10 +683,22 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
 ;; 键位一律绑在 `eimg-ocr-mode-map'（`define-derived-mode' 已经建好、父表是
 ;; `special-mode-map'），不用 evil / general——本文件必须保持顶层零第三方依赖。
 ;; 不复用 `C-c xxx' 前缀：`C-c' 后跟单个字母是**用户保留**的键位空间。
+;;
+;; `v' 指向 `eimg-ocr-view'（联动视图）：它在 `eimg-ocr-view.el' 里、由后续任务
+;; 创建，本文件**只做符号绑定**，不在顶层 `require' 它。理由有两条：
+;;   1. 依赖方向是单向的——`eimg-ocr-view.el' 要读 `eimg-ocr--result-data' 与
+;;      `eimg-ocr-buffer-name'，必然 require 本文件；本文件再 require 回去就是
+;;      顶层循环依赖（Emacs 能勉强加载，但 `require' 的先后会决定哪一方拿到
+;;      半初始化的定义，症状是「有时能用有时 void-function」）。
+;;   2. 顶层零第三方依赖是本文件的硬约束（见 Commentary 约束 3），`eimg-ocr-view'
+;;      会用到图片渲染，不该被结果 buffer 的键位表拖进加载链。
+;; `eimg.el' 在 `eimg-ocr' 之后 require `eimg-ocr-view'，故用户按 `v' 时该函数
+;; 一定已定义；万一没定义，`commandp' 判假 → Emacs 报「未定义」，比静默无反应好。
 (keymap-set eimg-ocr-mode-map "y" #'eimg-ocr-copy)
 (keymap-set eimg-ocr-mode-map "i" #'eimg-ocr-insert)
 (keymap-set eimg-ocr-mode-map "w" #'eimg-ocr-write-file)
 (keymap-set eimg-ocr-mode-map "g" #'eimg-ocr-rerun)
+(keymap-set eimg-ocr-mode-map "v" #'eimg-ocr-view)
 (keymap-set eimg-ocr-mode-map "q" #'quit-window)
 (keymap-set eimg-ocr-mode-map "k" #'eimg-ocr-cancel)
 
@@ -818,6 +949,23 @@ sentinel 里 signal 会被 Emacs 打成 \"error in process sentinel\" 塞进 *Me
         (set-buffer-modified-p nil)))
     buffer))
 
+(defun eimg-ocr--start-with-pages-owned (owned argv callback)
+  "调 `eimg-ocr--start'；若它**同步**抛错，先删 OWNED 再原样重抛。
+为什么需要这一层：`eimg-ocr--run' 先建页图目录、后启动进程，而 `--start' 会在
+「CLI 不可执行」「已有任务在跑」这两种常见情形下同步 `user-error'。那时异步回调
+永远不会执行，四条清理路径（finished / failed / cancelled / 解析失败）一条都到不了，
+目录就成了纯泄漏——PDF 页图动辄几十 MB，一次误按就是一份垃圾。
+为什么单独成函数而不是内联 `condition-case'：内联会把 `--run' 里那个上百行的回调
+lambda 整体再缩进一层，纯格式改动淹没行为改动。删除用 `--delete-pages-dir'（它对
+nil / 非字符串 / 不在临时目录之下的路径一律静默），所以 OWNED 为 nil 时是空操作。
+错误必须原样重抛：`--start' 的同步错误是给调用者看的（菜单 / 命令要弹出来），
+吞掉它只会让「按了没反应」。"
+  (condition-case err
+      (eimg-ocr--start argv callback)
+    (error
+     (eimg-ocr--delete-pages-dir owned)
+     (signal (car err) (cdr err)))))
+
 (defun eimg-ocr--run (args &optional on-success on-failure)
   "用配置 ARGS 跑一次 OCR 并统一四态收尾；**立即返回**（纯异步）。
 ARGS 是**配置 plist**（`eimg-core-build-args' 的输入），不是 argv——argv 由本函数
@@ -836,6 +984,27 @@ ON-SUCCESS 在结果 buffer 渲染完成后、于**来源 buffer 的上下文里
 ON-FAILURE 仅在失败态以拼好的错误文案调用一次（超时也算失败）。
 两者都在 sentinel 里执行，异常只 `message' 不上抛——见 `eimg-ocr--safe-call'。
 
+**PDF 自动落页图**：输入里有 PDF 且调用方**没有**显式给 `:page-images-dir' 时，
+本函数建一个临时目录、用 `--page-images-dir' 让 CLI 把每页栅格图落进去（JSON 每页
+因此多一个 `image' 绝对路径），目录路径记进 META 的 `:pages-dir'，供联动视图把块的
+坐标框画到对应页图上。调用方显式给了 `:page-images-dir' 就完全不接管——目录不是
+本层建的，清理责任也不在本层（见下两段）。
+目录是**交接**制：成功 → 交给结果 buffer（kill 该 buffer 时删，rerun 覆盖旧结果时删
+旧的，见 `eimg-ocr--show-result'）；失败 / 取消 / 解析失败 → 当场删（这三条路上没有
+任何 buffer 接手，不删就是纯泄漏）。建目录失败不阻断 OCR：拿不到页图只是联动视图
+退化成无框显示。
+
+**所有权与实际生效目录是两件事**，本函数分开记账：`owned' 只有本层
+`make-temp-file' 新建的目录才非 nil，**只有它负责清理**；`effective' 是本次真正传给
+CLI 的目录（`(or owned explicit)'，`explicit' 即调用方配置里原本带的）。
+META 的 `:pages-dir' 记 `effective' 而不是 `owned'：`eimg-ocr-rerun' 复用的是上一轮
+合并后的配置，其中的 `:page-images-dir' 指向**上一轮建的临时目录**——本轮不拥有它，
+但 CLI 这次仍把页图写进它。若按 `owned' 记成 nil，
+`eimg-ocr--show-result' 比较「旧 `:pages-dir' = 上一层那个目录」与「新 `:pages-dir'
+= nil」会判为不同，把正在使用的目录当「旧目录」删掉，而页图刚刚写进去——重跑一次
+页图全失效，联动视图退化成「找不到页图」的一列文本。清理路径仍只看 `owned'，故
+「删」永远落在本层自己建的目录上，不会误删用户指定的或上一轮留下的目录。
+
 四态：
   finished  → `eimg-core-parse-json' → `eimg-ocr--show-result'（写结果 buffer）
   failed    → `eimg-core-exit-message' + `eimg-core-exit-hint' 拼成可读文案，一律
@@ -846,15 +1015,37 @@ ON-FAILURE 仅在失败态以拼好的错误文案调用一次（超时也算失
   解析失败  → `message' 说明「输出无法解析」，并把原始 stdout 前 500 字符存进
               `eimg-ocr-raw-buffer-name'；**不覆盖**已有结果 buffer。
 "
-  (let* ((config (eimg-ocr--config-with
-                  (eimg-ocr--merge-config (eimg-ocr--config-defaults) args)
-                  ;; 强制 json：ARGS 里的 `:format' 一律忽略（见 docstring）。
-                  :format "json"))
+  (let* ((base (eimg-ocr--config-with
+                (eimg-ocr--merge-config (eimg-ocr--config-defaults) args)
+                ;; 强制 json：ARGS 里的 `:format' 一律忽略（见 docstring）。
+                :format "json"))
+         ;; 「目录的所有权」与「本次实际生效的目录」必须分开记（见 docstring）：
+         ;;
+         ;;   explicit  —— 调用方配置里原本就带的 `:page-images-dir'。`g' 重跑时它
+         ;;                是**上一轮**建的临时目录，也可能是用户自己指的目录。
+         ;;   owned     —— 只有本层 `make-temp-file' 新建的目录才非 nil。
+         ;;                **只有它负责清理**：失败分支删的必须是 owned——配置里有
+         ;;                路径不等于这个路径归本层处置。
+         ;;   effective —— 本次真正传给 CLI 的目录，即 `(or owned explicit)'。
+         ;;
+         ;; 两者不一致的唯一场合就是 rerun（owned 为 nil、explicit 为上一轮的
+         ;; 临时目录）：此时 CLI 仍把页图写进 explicit，所以 META 必须记
+         ;; effective，否则 `eimg-ocr--show-result' 会把正在使用的目录当旧目录删掉。
+         (explicit (plist-get base :page-images-dir))
+         (owned (and (null explicit)
+                     (eimg-ocr--pdf-input-p base)
+                     (eimg-ocr--make-pages-dir)))
+         (effective (or owned explicit))
+         ;; 只在 owned 非 nil 时才需要把目录注入配置：explicit 本来就在 base 里。
+         (config (if owned
+                     (eimg-ocr--config-with base :page-images-dir owned)
+                   base))
          (argv (eimg-core-build-args config))
          (source (eimg-ocr--config-source config))
          (origin (current-buffer))
          (started (current-time)))
-    (eimg-ocr--start
+    (eimg-ocr--start-with-pages-owned
+     owned
      argv
      (lambda (status stdout stderr &optional code)
        (pcase status
@@ -868,28 +1059,53 @@ ON-FAILURE 仅在失败态以拼好的错误文案调用一次（超时也算失
                    pages argv
                    (list :backend (plist-get config :backend)
                          :source source
+                         ;; 页图目录也记进 META：结果 buffer 从它取「图在哪」，
+                         ;; 并在 kill / 下次重跑时据此删掉（见 show-result）。
+                         ;; 记的是 **effective**（实际生效目录）而不是 owned：
+                         ;; rerun 时 owned 为 nil 而 CLI 仍写进上一轮的目录，记 nil
+                         ;; 会让 show-result 把正在使用的目录当「旧目录」删掉。
+                         :pages-dir effective
                          ;; 配置本身也记下来：`eimg-ocr-rerun' 要重跑就得有配置，
                          ;; argv 是从它推出来的，反过来推不回去（选项顺序固定，但
                          ;; 无法区分「未指定」与「指定成默认值」）。记**合并后**的
                          ;; 完整配置：重跑要复现这次的结果，而不是复现调用方的原始
                          ;; 入参（后者会随 defcustom 改动而改变行为）。
+                         ;; 注意其中的 `:page-images-dir' 是本次实际生效的目录（含
+                         ;; rerun 沿用的上一轮目录），所以 `eimg-ocr--run' 在重跑时
+                         ;; 不会另建新目录：重跑沿用同一个目录 → 新旧 `:pages-dir'
+                         ;; 相同 → `eimg-ocr--show-result' 不删它（页图刚被这次
+                         ;; CLI 重写进该目录，删掉就等于重跑后页图全失效）。
                          :config config
                          :elapsed (float-time (time-subtract (current-time) started))))
                   (eimg-ocr--safe-call on-success pages)))
             (eimg-core-parse-error
              (eimg-ocr--clear-progress)
+             ;; 解析失败：结果 buffer 没接手这批页图，不删就没人删了。
+             ;; 只删 `owned'——explicit / effective 指向的目录本层不拥有（可能是
+             ;; 用户自己的目录，也可能是 rerun 沿用上一轮的临时目录）。
+             (eimg-ocr--delete-pages-dir owned)
              (eimg-ocr--remember-raw stdout)
              (message "eimg-ocr 输出无法解析：%s（原始输出前 %d 字符已存入 %s）"
                       (error-message-string err)
                       eimg-ocr--raw-limit
-                      eimg-ocr-raw-buffer-name))))
+                      eimg-ocr-raw-buffer-name))
+            ;; 兜底：`eimg-core-parse-json' 之外的错误（渲染 / 回调里冒出来的）同样
+            ;; 到不了结果 buffer，页图目录一样要删；删完原样重抛，让 sentinel 的
+            ;; \"error in process sentinel\" 照旧暴露问题，而不是被这里悄悄吞掉。
+            (error
+             (eimg-ocr--delete-pages-dir owned)
+             (signal (car err) (cdr err)))))
          ('failed
           (eimg-ocr--clear-progress)
+          ;; 失败态没有任何 buffer 接手页图目录，当场删（同样只删本层自建的）。
+          (eimg-ocr--delete-pages-dir owned)
           (let ((text (eimg-ocr--failure-text code stderr)))
             (eimg-ocr--safe-call on-failure text)
             (message "eimg-ocr：%s" text)))
          ('cancelled
           (eimg-ocr--clear-progress)
+          ;; 取消同理：用户半途按停，页图没有去处（只删本层自建的）。
+          (eimg-ocr--delete-pages-dir owned)
           (message "eimg-ocr：已取消")))))
     (eimg-ocr--set-progress "识别中")))
 

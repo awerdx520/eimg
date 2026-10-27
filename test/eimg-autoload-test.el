@@ -100,7 +100,10 @@ Emacs 复位为 nil，`buffer-file-name' 在 batch 下同样为 nil（实测
     ;; 前缀——三条命令只用到 `eimg-ocr.el' 自己的常量，故归属 `eimg-ocr.el'。
     ("eimg-ocr.el" . "eimg-ocr-show-result-buffer")
     ("eimg-ocr.el" . "eimg-ocr-open-directory")
-    ("eimg-ocr.el" . "eimg-ocr-setup-help"))
+    ("eimg-ocr.el" . "eimg-ocr-setup-help")
+    ;; 联动视图（`v'）从结果 buffer 打开，也是 `M-x' 入口：它复用 `eimg-ocr' 的
+    ;; 结果结构，但定义在自己的文件里，故 autoload 指向 `"eimg-ocr-view"'。
+    ("eimg-ocr-view.el" . "eimg-ocr-view"))
   "带 `;;;###autoload' cookie 的 defun 清单（文件 . 命令）。")
 
 (defconst eimg-autoload-test--declared-commands
@@ -112,8 +115,11 @@ Emacs 复位为 nil，`buffer-file-name' 在 batch 下同样为 nil（实测
 真 defun（声明在前、定义在后，末尾覆盖 autoload 桩，故文件内自加载安全）。")
 
 (ert-deftest eimg-autoload-test-cookies-present ()
-  "13 个入口命令的源码都带 autoload cookie，且 cookie 紧贴目标 form。
-不带 cookie 的命令在 `:defer t' 下就是 `void-function'。"
+  "14 个入口命令的源码都带 autoload cookie，且 cookie 紧贴目标 form。
+不带 cookie 的命令在 `:defer t' 下就是 `void-function'。
+（计数从 13 变 14 是本轮的行为变更：`eimg-ocr-view' 作为联动视图入口新增 autoload。
+清单本身仍是**穷尽式**的——加了命令就必须进清单，故这里同步更新数字而不是把
+`(should (= …))` 删掉。）"
   (let ((root (eimg-autoload-test--root)))
     (dolist (entry eimg-autoload-test--defun-commands)
       (let* ((file (car entry))
@@ -191,6 +197,7 @@ loaded）→ 再 require 正在加载的 feature → 报错，keymap 与注册�
                             ("eimg-ocr-show-result-buffer" . "eimg-ocr")
                             ("eimg-ocr-open-directory" . "eimg-ocr")
                             ("eimg-ocr-setup-help" . "eimg-ocr")
+                            ("eimg-ocr-view" . "eimg-ocr-view")
                             ("eimg-menu" . "eimg-transient")
                             ("eimg-embark-register" . "eimg-embark")))
             (should (equal (cdr expect)
@@ -228,7 +235,7 @@ loaded）→ 再 require 正在加载的 feature → 报错，keymap 与注册�
                           " (princ (format \"featurep-eimg=%S\\n\" (featurep 'eimg)))"
                           " (princ (format \"featurep-transient=%S\\n\" (featurep 'transient)))"
                           " (dolist (c '(eimg-capture eimg-insert-path eimg-ocr-region"
-                          "                eimg-ocr-file eimg-menu))"
+                          "                eimg-ocr-file eimg-ocr-view eimg-menu))"
                           "   (princ (format \"%s autoloadp=%S file=%S\\n\" c"
                           "                  (autoloadp (symbol-function c))"
                           "                  (and (autoloadp (symbol-function c))"
@@ -244,6 +251,7 @@ loaded）→ 再 require 正在加载的 feature → 报错，keymap 与注册�
             (should (string-match-p "eimg-insert-path autoloadp=t file=\"eimg-insert\"" output))
             (should (string-match-p "eimg-ocr-region autoloadp=t file=\"eimg-ocr\"" output))
             (should (string-match-p "eimg-ocr-file autoloadp=t file=\"eimg-ocr\"" output))
+            (should (string-match-p "eimg-ocr-view autoloadp=t file=\"eimg-ocr-view\"" output))
             (should (string-match-p "eimg-menu autoloadp=t file=\"eimg-transient\"" output))
             (should (string-match-p "fboundp-capture=t commandp-capture=t" output))))
       (ignore-errors (delete-file file)))))

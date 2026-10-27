@@ -15,6 +15,7 @@ eimg 把「采集图像 → 识别文字 → 产出可用文本或链接」收�
 | CLI 多后端（rapidocr / ollama / tesseract / auto） | 已有 | =bin/eimg-ocr=       |
 | PDF 栅格化与分页（ =--pdf-pages= / =--dpi= ）      | 已有 | =bin/eimg-ocr=       |
 | 阅读顺序排序（单栏横排）                           | 已有 | =bin/eimg-ocr=       |
+| 坐标对齐与联动视图（原图带框 + 文本双向联动）      | 已有 | =eimg-ocr-view.el=   |
 | 后端安装与体检                                     | 已有 | =bin/eimg-ocr-setup= |
 | 纯逻辑（参数拼装 / 退出码 / 解析 / 渲染）          | 已有 | =eimg-core.el=       |
 | 异步进程层与四态收尾                               | 已有 | =eimg-ocr.el=        |
@@ -207,21 +208,35 @@ embark 时本模块仍能加载。multitarget（多选）时每个目标各插�
 
 ** 参数表
 
-| 参数              | 取值                                         | 默认                     | 说明                                                                    |
-|-------------------+----------------------------------------------+--------------------------+-------------------------------------------------------------------------|
-| =--backend=       | =rapidocr= / =ollama= / =tesseract= / =auto= | =auto=                   | 后端选择； =auto= 按 rapidocr → ollama → tesseract 取第一个可用者     |
-| =--lang=          | tesseract 语法，如 =chi_sim+eng=             | =chi_sim+eng=            | 识别语言；rapidocr 忽略此参数（传了也不报错）                           |
-| =--format=        | =text= / =json= / =lines=                    | =text=                   | =text= 按页输出、页间 =\\f= 分隔； =lines= 每行一条文本； =json= 结构化 |
-| =--pdf-pages=     | 如 =1-5= 或 =3=                              | 全部页                   | PDF 只识别指定页；页码越界退出码 3。对图片无意义，会被忽略              |
-| =--dpi=           | 整数，如 =300=                               | =200=                    | PDF 栅格化精度                                                          |
-| =--python=        | 路径                                         | 自动探测                 | rapidocr 解释器；给了就只用它，无效即判 rapidocr 不可用                 |
-| =--tessdata-dir=  | 路径                                         | 自动                     | 语言数据目录；不给时先系统默认、再 =~/.local/share/eimg/tessdata=       |
-| =--ollama-model=  | 模型名，如 =qwen2.5vl:7b=                    | 未配置                   | ollama 视觉模型； *无内置默认* ，未配置即判 ollama 不可用               |
-| =--ollama-url=    | URL，如 =http://10.0.0.5:11434=              | =http://127.0.0.1:11434= | ollama 服务地址； =config.json= 的 =ollama_url= 优先于该默认            |
-| =--list-backends= | （无值）                                     | —                       | 列出后端可用性后退出；查询动作，无论有无可用后端都返回 0                |
+| 参数                | 取值                                         | 默认                     | 说明                                                                    |
+|---------------------+----------------------------------------------+--------------------------+-------------------------------------------------------------------------|
+| =--backend=         | =rapidocr= / =ollama= / =tesseract= / =auto= | =auto=                   | 后端选择； =auto= 按 rapidocr → ollama → tesseract 取第一个可用者       |
+| =--lang=            | tesseract 语法，如 =chi_sim+eng=             | =chi_sim+eng=            | 识别语言；rapidocr 忽略此参数（传了也不报错）                           |
+| =--format=          | =text= / =json= / =lines=                    | =text=                   | =text= 按页输出、页间 =\\f= 分隔； =lines= 每行一条文本； =json= 结构化 |
+| =--pdf-pages=       | 如 =1-5= 或 =3=                              | 全部页                   | PDF 只识别指定页；页码越界退出码 3。对图片无意义，会被忽略              |
+| =--dpi=             | 整数，如 =300=                               | =200=                    | PDF 栅格化精度                                                          |
+| =--page-images-dir= | =DIR=                                        | 不落页图                 | PDF 页图落盘目录（ = <主干>-p<页码>.png= ）；json 每页多 =image= 键     |
+| =--python=          | 路径                                         | 自动探测                 | rapidocr 解释器；给了就只用它，无效即判 rapidocr 不可用                 |
+| =--tessdata-dir=    | 路径                                         | 自动                     | 语言数据目录；不给时先系统默认、再 =~/.local/share/eimg/tessdata=       |
+| =--ollama-model=    | 模型名，如 =qwen2.5vl:7b=                    | 未配置                   | ollama 视觉模型； *无内置默认* ，未配置即判 ollama 不可用               |
+| =--ollama-url=      | URL，如 =http://10.0.0.5:11434=              | =http://127.0.0.1:11434= | ollama 服务地址； =config.json= 的 =ollama_url= 优先于该默认            |
+| =--list-backends=   | （无值）                                     | —                       | 列出后端可用性后退出；查询动作，无论有无可用后端都返回 0                |
 
 位置参数 =FILE ...= 可给多个，支持扩展名： =png= / =jpg= / =jpeg= / =webp= / =bmp= /
 =tif= / =tiff= / =gif= / =pdf= 。
+
+=--page-images-dir= 决定「页图落不落盘、落在哪」：PDF 的每页栅格 PNG 落到 DIR，命名
+=<源文件名主干>-p<真实页码>.png= （ =--pdf-pages 3= 时落的是 =x-p3.png= ，不是
+=x-p1.png= ），json 的每页因此多一个 ="image"= （绝对路径）；图片输入没有栅格化产物，
+="image"= 直接指向输入图本身（不复制文件）。DIR 不存在会自动创建（含多级），建不出来 /
+不可写 / 已是普通文件一律按 *参数错误* 退出 5，而不是退出 3——目录路径是命令行上敲进来的
+参数，与「输入文件读不出来」是两类问题。 *不传该参数时 json / text / lines 三种输出与旧版
+逐字节一致* （块序列、字段顺序、页间分隔符都没变），旧调用方与快照测试不受影响。校验发生
+在 =main()= 的 =try= 内且优先于查询动作： =--list-backends --page-images-dir /x= 也会顺手把
+=/x= 建出来（已知副作用，只会是一个空目录）。
+
+页图的下游消费者是联动视图，见下一节；elisp 侧识别 PDF 时会自己建临时目录，用户只在
+「想留住页图」时才需要手敲这个参数。
 
 ** 示例
 
@@ -244,12 +259,17 @@ bin/eimg-ocr --backend rapidocr \
 
 # 6. 用本地 ollama 的视觉模型识别（模型必须显式指定）
 bin/eimg-ocr --backend ollama --ollama-model qwen2.5vl:7b shot.png
+
+# 7. PDF 每页栅格图落到指定目录，JSON 的每页带上 image 绝对路径（联动视图用）
+bin/eimg-ocr --format json --page-images-dir /tmp/eimg-pages report.pdf
 #+end_src
 
 =--format json= 的形态：顶层 ={"backend": "...", "pages": [...]}= ，每页
 ={"page": N, "source": "<输入文件 basename>", "blocks": [{"text", "conf", "box"} ...]}= 。
 =page= 是 *真实页码* （ =--pdf-pages 2= 时第一个元素的 =page= 就是 2），elisp 侧依赖它回填
-文件名。三种格式都由同一份块序列派生，块按阅读顺序（先行后列）排列。
+文件名。给了 =--page-images-dir= 时每页还多一个 ="image"= （页图绝对路径）；不给则该键
+不出现（不是 ="image": null= ，否则不传参数的调用方会拿到字段集合变了的 JSON）。三种格式
+都由同一份块序列派生，块按阅读顺序（先行后列）排列。
 
 ** 退出码契约
 
@@ -279,6 +299,7 @@ bin/eimg-ocr --backend ollama --ollama-model qwen2.5vl:7b shot.png
 | =eimg-ocr-cancel=             | 取消正在进行的任务（无任务只提示，不报错）               | 结果 buffer =k=         |
 | =eimg-menu=                   | transient 菜单（三组动作 + 三个会话内选项）              | =SPC i m t= / =C-c m m= |
 | =eimg-ocr-show-result-buffer= | 切到最近一次的结果 buffer                                | 菜单 =r=                |
+| =eimg-ocr-view=               | 从结果 buffer（或菜单）打开联动视图：原图带框 + 文本列表 | 结果 buffer =v=         |
 | =eimg-ocr-open-directory=     | 用 Dired 打开 =eimg-ocr-images-dir=                      | 菜单 =d=                |
 | =eimg-ocr-setup-help=         | 展示安装指引（ *只展示，绝不执行* ）                     | 菜单 =S=                |
 
@@ -293,11 +314,65 @@ bin/eimg-ocr --backend ollama --ollama-model qwen2.5vl:7b shot.png
 | =i=  | =eimg-ocr-insert=     | 把正文插入 *来源 buffer* 的光标处（来源已 kill 则报错） |
 | =w=  | =eimg-ocr-write-file= | 写文件，默认 =<来源主干名>.org= ，已存在先确认覆盖      |
 | =g=  | =eimg-ocr-rerun=      | 用最近一次的配置重跑，结果仍写回本 buffer               |
+| =v=  | =eimg-ocr-view=       | 打开联动视图（原图带框 + 文本双向联动）                 |
 | =q=  | =quit-window=         | 关闭窗口                                                |
 | =k=  | =eimg-ocr-cancel=     | 取消当前任务                                            |
 
 首行是元信息（org 风格 =# eimg-ocr: 来源（backend=…，N 页，X.XXs）=、text 风格
 =;; eimg-ocr: …= ），复制 / 回插 / 存盘都会剥掉它。
+
+** 联动视图（位置对齐）
+
+结果 buffer 里按 =v= （或菜单「系统」组的 =v= ）打开 =*eimg-ocr-view*= ，它把一次识别的
+*结构化* 结果摆成能对照的两半：
+
+- 上半部分是 *原图带框* ：底图是原图（PDF 输入是 CLI 栅格化出来的页图），每块文字在自己
+  =box= 的位置上画一个框，当前块用异色描边 + 半透明填充标出。
+- 下半部分是 *文本列表* ：每行一块；多行块在列表里压成一行（完整原文仍保留在块数据里，
+  复制拿到的是原文，不是压平后的那行）。
+
+两侧 *双向联动* ：文本行的光标移动 → 图上对应的框高亮；鼠标点图上的框 → 光标跳到对应文本行。
+
+| 键位  | 命令                           | 作用                           |
+|-------+--------------------------------+--------------------------------|
+| =n=   | =eimg-ocr-view-next-block=     | 下一块（跨页自动换页）         |
+| =p=   | =eimg-ocr-view-previous-block= | 上一块（跨页自动换页）         |
+| =N=   | =eimg-ocr-view-next-page=      | 下一页                         |
+| =P=   | =eimg-ocr-view-previous-page=  | 上一页                         |
+| =RET= | =eimg-ocr-view-copy-block=     | 复制当前块文本到 kill-ring     |
+| =o=   | =eimg-ocr-view-open-image=     | 打开当前页的位图文件           |
+| =g=   | =eimg-ocr-view-revert=         | 重新从结果 buffer 取数据并重渲 |
+| =q=   | =quit-window=                  | 关闭视图                       |
+
+=RET= 是 *复制* 而非「跳到原图位置」：原图在 Emacs 里是一整张图片（不可分割的显示对象），
+没有「图片内位置」这种坐标可供定位，同一位置真正有用的动作是拿走那段文字。
+
+降级路径一律 *不报错* （文本列表照常可用，图区改写成一行能读懂的原因）：
+
+- 结果 buffer 里没有结构化数据（ =v= 出现之前的旧版结果）→ =user-error= ，提示重新识别。
+- 当前页的块全都没有 =box= （ollama 后端）→ 只显示文本列表，并提示「后端不提供 box」。
+- 找不到页图 → 只显示文本并说明缺什么（PDF 输入 / 重新识别）。
+- 原图字节数超过 =eimg-ocr-view-max-embed-bytes= （默认 8 MB）→ *降级为纯文本列表* ，并提示
+  「降低 =--dpi= 重新识别，或裁剪图片后再识别」。为什么是降级而不是降采样：Emacs 内置无法把
+  图片缩放后导出字节（ =create-image= 的 =:width= 只影响显示），真降采样需要额外的图像后端，
+  与「顶层零第三方依赖」冲突。
+- 页图读不出尺寸或读不出内容 → 只显示文本，提示里带路径与原因。
+
+*前提是 SVG* ：位图叠加走 SVG 合成（底图以 base64 =<image>= 内嵌，框是 =<rect>= ），要求
+Emacs 编译时带 librsvg，即 =(image-type-available-p 'svg)= 为 t。缺 SVG 支持时建不出图、图区
+走降级路径（代码里有显式判定，会直接说「当前 Emacs 没有 SVG 支持」，而不是含糊的「本页暂无
+可显示的页图」），文本列表与光标联动仍可用。中文译文（后续计划）另外依赖系统装 CJK 字体。
+
+*页图的生命周期* ：输入含 PDF 且调用方没显式给 =:page-images-dir= 时，识别过程自动建一个
+临时目录让 CLI 把每页栅格图落进去，成功后交给结果 buffer；结果 buffer 被 kill、或 =g= 重新
+识别（覆盖旧结果）时删掉旧目录，失败 / 取消 / 解析失败则当场删。单图输入不落页图（ ="image"=
+直接指向输入图），视图回退用元信息里的 =:source= 原图——要求它是绝对路径，只有文件名时不猜
+目录、直接降级。
+
+性能参考：24 块一页时，光标移动触发的重绘约 2ms（只重插图区，不重建文本列表）。底图 base64
+走 *前缀缓存* （失效键是「路径 / mtime / size / 原图宽高 / 显示宽高」），重绘只重拼 =<rect>=
+那几十行：5.6 MB SVG 的一页上实测从 62.6 ms/次降到 2.2 ms/次（GC 次数 7 → 3），缓存命中与
+未命中的输出字符串逐字相同。
 
 ** transient 菜单（ =eimg-menu= ）
 
@@ -314,6 +389,7 @@ bin/eimg-ocr --backend ollama --ollama-model qwen2.5vl:7b shot.png
 |          | =b=  | 插入内联图片（ =eimg-insert-display= ）                            |
 | 系统     | =?=  | 列出后端                                                           |
 |          | =r=  | 查看结果                                                           |
+|          | =v=  | 联动视图（原图带框 + 文本双向联动）                                |
 |          | =d=  | 打开截图目录                                                       |
 |          | =S=  | 安装指引                                                           |
 
@@ -325,7 +401,7 @@ CLI 默认）。 =transient= 不随 =eimg.el= 加载：不按菜单的人不为�
 =--list-backends= 的原始输出，只读， =q= 关闭。与结果 buffer 分开：它没有「页」「正文」，
 混进 =*eimg-ocr*= 会让 =y= / =w= 对着一份列表工作。
 
-* 配置项（21 个 defcustom：13 个在 =eimg-ocr.el= ，8 个在截图三模块）
+* 配置项（22 个 defcustom：13 个在 =eimg-ocr.el= ，8 个在截图三模块，1 个在 =eimg-ocr-view.el= ）
 
 | 配置项                          | 默认值              | 用途                                                                           |
 |---------------------------------+---------------------+--------------------------------------------------------------------------------|
@@ -350,6 +426,7 @@ CLI 默认）。 =transient= 不随 =eimg.el= 加载：不按菜单的人不为�
 | =eimg-select-item-roots=        | =nil=               | 「全部图片」候选的递归扫描根目录（无缓存，每次打开全量扫描）                   |
 | =eimg-select-preview-max-width= | =700=               | 预览与内联插入的像素宽上限                                                     |
 | =eimg-insert-plain-path-modes=  | ='(eca-chat-mode)=  | 只插裸缩写路径的 major-mode 家族（必须排在 markdown 分支之前）                 |
+| =eimg-ocr-view-max-embed-bytes= | =8388608= （8 MB）  | 联动视图单页底图允许内嵌进 SVG 的字节上限；超出则降级为纯文本列表             |
 
 =eimg-ocr-images-dir= 与 =eimg-capture-directory= 是 *两个独立变量* ：前者给 OCR 用
 （选文件 / 列历史），后者给截图用（落盘）。典型配置让两者指向同一目录，但代码不做互相推断。
@@ -382,6 +459,12 @@ CLI 默认）。 =transient= 不随 =eimg.el= 加载：不按菜单的人不为�
   「退出码 0 且文件存在」这两条。
 - *=eimg-capture-directory= 未配置时 =user-error=* ：不猜目录、不静默写到 =default-directory= 。
   =eimg-capture-history-file= 同理（丢记录必须是可见的失败）。
+- *ollama（VLM）后端不提供 =box=* ：联动视图对它的识别结果只有文本列表、图上无框（不报错，
+  图区写明原因）。要框就得用 rapidocr 或 tesseract。
+- *单图输入的「页图」就是原图本身* ：不复制、不落盘，视图回退到元信息里的 =:source= ；它若
+  只是文件名（无绝对路径）就不去猜目录，直接降级为无图。
+- *=--page-images-dir= 的目录创建优先于查询动作* ： =--list-backends --page-images-dir /x=
+  会顺手建出 =/x= 。副作用仅此（空目录）；不想留空目录就别把它和查询参数混用。
 
 * 开发与验证
 

@@ -16,6 +16,7 @@
 ;;   - plist → CLI 参数列表（`eimg-core-build-args'）
 ;;   - CLI 的 json 输出 → 页 / 块结构（`eimg-core-parse-json'）
 ;;   - 页 / 块结构 → org 或纯文本（`eimg-core-render-org' / `eimg-core-render-text'）
+;;   - 块坐标框与图片尺寸换算（`eimg-core-block-box' / `eimg-core-fit-size'）
 ;;   - 临时文件命名（`eimg-core-temp-image-path'）
 ;;
 ;; 两条设计约束，改动时不要打破：
@@ -106,7 +107,8 @@ STDERR 末行（没有则空串）——成功路径不应显示「成功」这�
     (:python       . "--python")
     (:tessdata-dir . "--tessdata-dir")
     (:ollama-model . "--ollama-model")
-    (:ollama-url   . "--ollama-url"))
+    (:ollama-url   . "--ollama-url")
+    (:page-images-dir . "--page-images-dir"))
   "plist 关键字到 CLI 选项名的映射；顺序即参数生成顺序。")
 
 (defun eimg-core--arg-value (value)
@@ -207,6 +209,68 @@ proper list 会 signal `wrong-type-argument listp'。"
                   (prog1 (eimg-core--normalize-page index page)
                     (setq index (1+ index))))
                 (cdr cells))))))
+
+;;;; ── 3b. 结构工具：块的坐标框与图片尺寸换算 ────────────────────────────
+
+;; 这两个函数都不产生渲染结果，只把「结构 → 可直接用的数值」这一步收敛到一处，
+;; 让预览（`eimg-preview'）与联动高亮（`eimg-ocr'）共享同一套换算与容错。
+;; 为什么必须放在纯逻辑层：它们只做算术与取值，不需要 frame / buffer / 子进程，
+;; 因而能被离线 ERT 直接覆盖——联动视图最易出错的正是这些边界值。
+
+(defun eimg-core-block-box (block)
+  "取 BLOCK 的坐标框，返回 \(X0 Y0 X1 Y1\) 四数列表；取不到可用坐标时返回 nil。
+BLOCK 是 `eimg-core-parse-json' 归一化后的块 alist（如
+\(\(text . \"a\") (conf . 0.9) (box . \(1 2 3 4\))\)\)。判定条件是 `box' 为长度
+≥ 4 的 proper list 且前四个元素都是数（rapidocr 与 tesseract 都可能给浮点，
+坐标可能是像素也可能是归一化比例——本层不解释单位，只保证是四个数），此时
+返回前四个数的列表；超长列表截断到前四个。
+
+**任何异常输入都返回 nil，绝不 signal**：box 缺失、box 为 nil、box 是字符串、
+元素不足四个、含 nil 或字符串等。理由：坐标来自第三方 OCR 输出，损坏的坐标
+只该让「这一个块没有框」，不该让整页渲染失败——整页失败会让用户连文本都看不到，
+代价远大于少画一个框。"
+  (when (consp block)
+    (let* ((box (alist-get 'box block))
+           (len (proper-list-p box)))
+      (when (and len
+                 (>= len 4)
+                 (numberp (nth 0 box))
+                 (numberp (nth 1 box))
+                 (numberp (nth 2 box))
+                 (numberp (nth 3 box)))
+        (list (nth 0 box) (nth 1 box) (nth 2 box) (nth 3 box))))))
+
+(defun eimg-core-fit-size (width height max-width max-height)
+  "把图片像素尺寸 WIDTH × HEIGHT 按显示上限 MAX-WIDTH / MAX-HEIGHT 换算缩放比。
+返回 plist \(:scale S :px-w W :px-h H\)；WIDTH 或 HEIGHT 不是正整数时返回 nil。
+MAX-WIDTH / MAX-HEIGHT 为 nil 或非正整数表示该方向不限制（只给一个上限即可只
+限制一个方向，两个都给 nil 时 S 恒为 1.0）。
+用途：联动视图要把图片缩到窗口内显示、预览要把大图缩到帧里，两处需要同一套
+「上限 → 缩放比 + 目标像素尺寸」的换算，故收敛在这里复用。
+
+约束与取舍：
+  - 只做像素算术，**不读 frame 的字符宽度或窗口宽度**：字符单位到像素的换算
+    依赖当前 frame 与本 buffer 的字体，属于调用方环境；本层保持纯逻辑，才能被
+    `emacs -Q' 的离线用例覆盖。
+  - WIDTH / HEIGHT 非法时返回 nil 而不报错：调用方拿 nil 就走「不缩放 / 无图」
+    降级，一张尺寸未知的图片不该让整条流程失败。
+  - S 恒 ≤ 1.0（不放大：放大会糊）且夹在 0.01 以上（避免 0 作为除数）。
+  - 夹取后 S 可能与 `:px-w' / `:px-h' 不自洽（例如 1000×1000 压到 1×1 时
+    S=0.001 被夹到 0.01，而 px 由 `round' 得出至少 1）。**调用方应以
+    `:px-w' / `:px-h' 为准显示，S 只供日志与「是否发生过缩放」的判断参考**。"
+  (when (and (integerp width) (> width 0)
+             (integerp height) (> height 0))
+    (let ((scale 1.0)
+          (w-limit (and (integerp max-width) (> max-width 0)))
+          (h-limit (and (integerp max-height) (> max-height 0))))
+      (when w-limit
+        (setq scale (min scale (/ (float max-width) width))))
+      (when h-limit
+        (setq scale (min scale (/ (float max-height) height))))
+      (setq scale (max scale 0.01))
+      (list :scale scale
+            :px-w (max 1 (round (* width scale)))
+            :px-h (max 1 (round (* height scale)))))))
 
 ;;;; ── 4. 渲染 ────────────────────────────────────────────────────────────
 

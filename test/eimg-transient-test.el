@@ -6,7 +6,7 @@
 
 ;;; Commentary:
 
-;; 覆盖 `eimg-menu' 的结构（三组十项 + 三 infix）、infix 取值到配置 plist 的解析、
+;; 覆盖 `eimg-menu' 的结构（三组十一项 + 三 infix）、infix 取值到配置 plist 的解析、
 ;; 「菜单取值经包装命令落到 argv」的完整链路、菜单项与命令的一一对应（含「不再有
 ;; 跨仓桥接层」这条边界），以及安装指引「只展示不执行」这条硬约束。
 ;;
@@ -114,10 +114,13 @@ suffix 读到的值走同一段代码（`transient-prefix-value' → `transient-
       (kill-buffer buffer))))
 
 (ert-deftest eimg-transient-test-menu-keys-resolve ()
-  "十项动作键位全部可解析，且指向预期命令。
+  "十一项动作键位全部可解析，且指向预期命令。
 `o' / `h' / `f' 指向 `eimg-menu-run-*' 薄包装：transient 用 `call-interactively'
 调 suffix，不会把 infix 取值当参数传，必须有一层把 `(eimg-ocr--menu-args)' 显式
-作为 ARGS 传进 OCR 命令。"
+作为 ARGS 传进 OCR 命令。
+`v' 是本轮新增的联动视图入口（原「系统」组四项变五项）：菜单里多一项不是纯增量——
+项数、键位、指向必须同时对，任一处漏改都会让某个键静默失效，故这里仍按「穷尽
+列表 + 逐条比对」写，不改成「包含即可」。"
   (let ((expected '(("s" . eimg-capture)
                     ("o" . eimg-menu-run-region)
                     ("h" . eimg-menu-run-history)
@@ -126,9 +129,10 @@ suffix 读到的值走同一段代码（`transient-prefix-value' → `transient-
                     ("b" . eimg-insert-display)
                     ("?" . eimg-ocr-list-backends)
                     ("r" . eimg-ocr-show-result-buffer)
+                    ("v" . eimg-ocr-view)
                     ("d" . eimg-ocr-open-directory)
                     ("S" . eimg-ocr-setup-help))))
-    (should (= 10 (length expected)))
+    (should (= 11 (length expected)))
     (dolist (entry expected)
       (let ((object (eimg-transient-test--suffix (car entry))))
         (should object)

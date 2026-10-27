@@ -7,7 +7,8 @@
 ;;; Commentary:
 
 ;; 覆盖 `eimg-core' 的每个公开函数，正常分支与错误分支都要有：
-;; 退出码映射、参数拼装、JSON 校验、org / text 渲染、临时文件命名，以及
+;; 退出码映射、参数拼装（含页图目录选项）、JSON 校验（含 `image' 字段保留）、
+;; 块坐标框、图片尺寸换算、org / text 渲染、临时文件命名，以及
 ;; 「顶层零第三方依赖」这条结构性不变量。
 ;;
 ;; 全部用例离线且确定性：不起子进程、不调真实 OCR、不读环境变量；唯一的外部
@@ -155,19 +156,25 @@
 ;; 新键按约定只能追加到映射表末尾，因此既验证「存在 / 取值形态」，也验证「位置」。
 
 (ert-deftest eimg-core-test-option-args-ollama-at-end ()
-  "`eimg-core-option-args' 末尾两项是 ollama 的键，且 `:tessdata-dir' 仍在它们之前。
-顺序即 argv 生成顺序：新键只允许追加到末尾。既有键的相对顺序一旦变动，所有既有
-调用方的 argv 日志 diff 都会失真，而功能上又看不出来。"
+  "ollama 的两个键都排在 `:tessdata-dir' 之后，且只允许更晚的键追加到它们后面。
+顺序即 argv 生成顺序：既有键的相对顺序一旦变动，所有既有调用方的 argv 日志 diff
+都会失真，而功能上又看不出来。注意此用例原本断言「ollama 两键是最后两项」，在
+`:page-images-dir' 按约定追加到末尾后该断言必然失效——故改成断言**不变量本身**
+（新键只能往后加、老键相对顺序不变），而不是钉死「谁是最后一项」。"
   (let* ((keys (mapcar #'car eimg-core-option-args))
          (pos-tessdata (cl-position :tessdata-dir keys))
          (pos-model (cl-position :ollama-model keys))
-         (pos-url (cl-position :ollama-url keys)))
-    (should (equal '(:ollama-model :ollama-url) (last keys 2)))
+         (pos-url (cl-position :ollama-url keys))
+         (pos-page-images (cl-position :page-images-dir keys)))
     (should pos-tessdata)
     (should pos-model)
     (should pos-url)
     (should (< pos-tessdata pos-model))
     (should (< pos-model pos-url))
+    ;; 更新的键只允许追加在 ollama 之后（`last' 取末尾，即「最新追加的」）。
+    (when pos-page-images
+      (should (< pos-url pos-page-images)))
+    (should (equal :page-images-dir (car (last keys))))
     ;; 映射的取值是 CLI 的真实选项名（拼错就是「参数错误」退出码 5）。
     (should (equal "--ollama-model" (cdr (assq :ollama-model eimg-core-option-args))))
     (should (equal "--ollama-url" (cdr (assq :ollama-url eimg-core-option-args))))))
@@ -214,6 +221,40 @@ URL nil 时用它内置的 `http://127.0.0.1:11434'。写成 `--ollama-model nil
     (should (string-match-p "--ollama-model" hint))
     (should (string-match-p "--rapidocr" hint))
     (should (string-match-p "--tessdata" hint))))
+
+;;;; ── 2c. 页图输出选项（--page-images-dir） ─────────────────────────────
+
+;; 这一节只覆盖 `:page-images-dir'：CLI 收到它时会在**每页**多写一个 `image' 键
+;; （该页对应图片的绝对路径），联动视图靠它定位原图；不传时 json 的字段集合与
+;; 旧版完全一致。本层只管「怎么拼进 argv」，选项语义属于 CLI。
+
+(ert-deftest eimg-core-test-build-args-page-images-dir-position ()
+  "`--page-images-dir' 落在 `--ollama-url' 之后、文件路径之前，取值原样透传。
+位置用下标逐项断言：只断言「存在」会放过「被插到选项区开头」这类回归。"
+  (let ((argv (eimg-core-build-args
+               (list :ollama-url "http://127.0.0.1:11434"
+                     :page-images-dir "/tmp/x"
+                     :file "input.pdf"))))
+    (should (equal '("--ollama-url" "http://127.0.0.1:11434"
+                     "--page-images-dir" "/tmp/x"
+                     "input.pdf")
+                   argv))
+    (should (< (cl-position "--ollama-url" argv :test #'equal)
+               (cl-position "--page-images-dir" argv :test #'equal)))
+    (should (< (cl-position "--page-images-dir" argv :test #'equal)
+               (cl-position "input.pdf" argv :test #'equal)))))
+
+(ert-deftest eimg-core-test-build-args-page-images-dir-nil-absent ()
+  "`:page-images-dir' 为 nil 时不进 argv（不传就保持旧版 json 字段集合）。
+写成 `--page-images-dir nil' 会让 CLI 拿到一个叫 \"nil\" 的目录名，比不传更糟。"
+  (should (equal '("input.png")
+                 (eimg-core-build-args
+                  '(:page-images-dir nil :file "input.png"))))
+  (should-not (member "--page-images-dir"
+                      (eimg-core-build-args '(:file "input.png"))))
+  ;; 只有选项、没有文件时也照样拼出来（拼接不依赖文件是否存在）。
+  (should (equal '("--page-images-dir" "/tmp/x")
+                 (eimg-core-build-args '(:page-images-dir "/tmp/x")))))
 
 ;;;; ── 3. JSON 解析 ───────────────────────────────────────────────────────
 
@@ -276,6 +317,143 @@ URL nil 时用它内置的 `http://127.0.0.1:11434'。写成 `--ollama-model nil
     (should (= 2 (length blocks)))
     (should (equal '("保留" "也保留")
                    (mapcar (lambda (block) (alist-get 'text block)) blocks)))))
+
+(ert-deftest eimg-core-test-parse-json-keeps-image-field ()
+  "`--page-images-dir' 带出的 `image' 字段归一化后仍在，`blocks' 仍在首位。
+归一化的实现是「摘掉 blocks 再拼回最前、其余键原样跟随」，所以 `image' 会被保住；
+而它是联动视图定位原图的唯一线索——一旦被归一化吃掉，框选就只剩坐标没有图。
+这条用例是**回归保护**：将来若把归一化改成正向白名单（只挑 page / source /
+blocks），它会立刻变红。"
+  (let* ((json "{\"pages\": [{\"page\": 1, \"source\": \"a.png\",
+                               \"blocks\": [{\"text\": \"t\"}],
+                               \"image\": \"/abs/a.png\"}]}")
+         (page (car (eimg-core-parse-json json))))
+    (should (equal "/abs/a.png" (alist-get 'image page)))
+    ;; 键顺序即实际行为：blocks 在最前（归一化时重新拼上去），其余键保持原序。
+    (should (equal '(blocks page source image) (mapcar #'car page)))
+    (should (equal 1 (alist-get 'page page)))
+    (should (equal "a.png" (alist-get 'source page)))
+    (should (equal "t" (alist-get 'text (nth 0 (alist-get 'blocks page)))))
+    ;; 不带 image 的输入不得凭空造出该字段（不传选项时字段集合与旧版一致）。
+    (should-not (assq 'image (car (eimg-core-parse-json
+                                   "{\"pages\": [{\"page\": 1, \"blocks\": []}]}"))))))
+
+;;;; ── 3b. 块坐标框（block-box） ──────────────────────────────────────────
+
+;; 坐标来自第三方 OCR（rapidocr 给像素、tesseract 给像素或比例，diff 都可能带浮点），
+;; 脏数据必须降级成「这一个块没有框」，绝不能整页 signal——故这一节的重点是
+;; **异常输入一律 nil 且不抛错**。
+
+(ert-deftest eimg-core-test-block-box-valid ()
+  "合法 box 返回前四个数：整型、浮点、超长截断、零与负数都接受。"
+  (should (equal '(1 2 3 4)
+                 (eimg-core-block-box '((text . "a") (box . (1 2 3 4))))))
+  ;; 浮点坐标：别用 `integerp' 过滤，否则 tesseract 的比例坐标会被整批丢掉。
+  (should (equal '(1.5 2.5 3.5 4.5)
+                 (eimg-core-block-box '((text . "a") (box . (1.5 2.5 3.5 4.5))))))
+  ;; 多于四个元素（未来可能带角度 / 多边形顶点）：只取前四个，不报错。
+  (should (equal '(1 2 3 4)
+                 (eimg-core-block-box '((box . (1 2 3 4 5 6))))))
+  ;; 归一化后的真实块形状：text / conf 之外仍能取到 box。
+  (should (equal '(0 0 1 1)
+                 (eimg-core-block-box '((text . "t") (conf . 0.9) (box . (0 0 1 1))))))
+  ;; 0 是合法坐标（左上角）；负数出现在旋转 / 裁剪场景，本层不额外过滤。
+  (should (equal '(0 -2 10 10)
+                 (eimg-core-block-box '((box . (0 -2 10 10)))))))
+
+(ert-deftest eimg-core-test-block-box-invalid ()
+  "缺 box / nil / 字符串 / 不足四个 / 含非数字：一律返回 nil，绝不 signal。
+`should-not' 本身也覆盖了「不报错」这层——signal 会让用例失败而不是返回 nil。"
+  (should-not (eimg-core-block-box '((text . "a"))))
+  (should-not (eimg-core-block-box '((text . "a") (box . nil))))
+  (should-not (eimg-core-block-box '((box . "1 2 3 4"))))
+  (should-not (eimg-core-block-box '((box . (1 2 3)))))
+  (should-not (eimg-core-block-box '((box . (1 2 3 nil)))))
+  (should-not (eimg-core-block-box '((box . (1 2 3 "4")))))
+  (should-not (eimg-core-block-box '((box . (1 2 3 x)))))
+  ;; 空 box：空列表是合法 proper list 但长度为 0，同样不属于可用坐标。
+  (should-not (eimg-core-block-box '((box . ()))))
+  (should-not (eimg-core-block-box nil))
+  ;; 点对 box（`(1 . 2)'）不是 proper list：不能走 `length' 而抛
+  ;; `wrong-type-argument listp'，必须仍然安静返回 nil。
+  (should-not (eimg-core-block-box (list (cons 'box (cons 1 2)))))
+  ;; BLOCK 本身不是 alist（字符串 / 数字）时也不炸。
+  (should-not (eimg-core-block-box "junk"))
+  (should-not (eimg-core-block-box 42)))
+
+;;;; ── 3c. 图片尺寸换算（fit-size） ────────────────────────────────────────
+
+;; 规则：scale = min(1.0, 宽上限/宽, 高上限/高)，再夹到 ≥ 0.01；px 由 `round'
+;; 得出并至少 1。字符单位 → 像素的换算与 frame 相关，留在调用方，本层只做像素算术。
+
+(ert-deftest eimg-core-test-fit-size-no-scaling ()
+  "上限不小于实际尺寸时不放大：scale 恒 1.0，px 等于原尺寸。"
+  (should (equal '(:scale 1.0 :px-w 100 :px-h 50)
+                 (eimg-core-fit-size 100 50 200 200)))
+  ;; 恰好等于上限同样是 1.0（「刚好装得下」不该被算成一次缩放）。
+  (should (equal '(:scale 1.0 :px-w 100 :px-h 50)
+                 (eimg-core-fit-size 100 50 100 50))))
+
+(ert-deftest eimg-core-test-fit-size-width-limited ()
+  "宽受限时按宽度比缩放，高度等比跟随（纵横比不变）。"
+  (should (equal '(:scale 0.5 :px-w 50 :px-h 25)
+                 (eimg-core-fit-size 100 50 50 200))))
+
+(ert-deftest eimg-core-test-fit-size-height-limited ()
+  "高受限时按高度比缩放；两个方向都算，取更小的那个比值。"
+  (should (equal '(:scale 0.5 :px-w 50 :px-h 25)
+                 (eimg-core-fit-size 100 50 200 25)))
+  ;; 宽度上限极宽松，也不能把吃紧的高度拉回 1.0。
+  (should (equal '(:scale 0.25 :px-w 25 :px-h 25)
+                 (eimg-core-fit-size 100 100 1000 25))))
+
+(ert-deftest eimg-core-test-fit-size-single-limit ()
+  "只给一个上限时另一个方向完全不受限；非正整数上限等同「不限制」。"
+  (should (equal '(:scale 0.5 :px-w 50 :px-h 25)
+                 (eimg-core-fit-size 100 50 50 nil)))
+  (should (equal '(:scale 0.5 :px-w 50 :px-h 25)
+                 (eimg-core-fit-size 100 50 nil 25)))
+  ;; 0 / 负数 / 字符串不能被当成「缩到 0 像素」或「按字符串比」。
+  (should (equal '(:scale 1.0 :px-w 100 :px-h 50)
+                 (eimg-core-fit-size 100 50 0 -1)))
+  (should (equal '(:scale 1.0 :px-w 100 :px-h 50)
+                 (eimg-core-fit-size 100 50 "200" nil))))
+
+(ert-deftest eimg-core-test-fit-size-no-limit ()
+  "两个上限都为 nil：scale 1.0、px 等于原尺寸（等价于「不缩放」而非「算不出来」）。"
+  (should (equal '(:scale 1.0 :px-w 800 :px-h 600)
+                 (eimg-core-fit-size 800 600 nil nil))))
+
+(ert-deftest eimg-core-test-fit-size-invalid-dimensions ()
+  "WIDTH / HEIGHT 非正整数时返回 nil（调用方据此降级），且不 signal。
+像素尺寸通常来自 `image-size'；拿不到尺寸时应当是「无图 / 不缩放」，不是崩溃。"
+  (should-not (eimg-core-fit-size 0 50 10 10))
+  (should-not (eimg-core-fit-size 100 0 10 10))
+  (should-not (eimg-core-fit-size -1 50 10 10))
+  (should-not (eimg-core-fit-size 100 -50 10 10))
+  (should-not (eimg-core-fit-size "100" 50 10 10))
+  (should-not (eimg-core-fit-size nil 50 10 10))
+  (should-not (eimg-core-fit-size 100 nil 10 10))
+  ;; 浮点尺寸同样拒绝：整数像素是本函数的输入契约。
+  (should-not (eimg-core-fit-size 100.0 50 10 10)))
+
+(ert-deftest eimg-core-test-fit-size-extreme ()
+  "极端缩放（1×1 上限）时 scale 不为 0（避免除零），且 px 至少 1 个像素。
+scale 被夹到 0.01 后与 px 不再自洽（100 像素按 0.01 应该是 1，而 1000 像素按
+0.01 是 10）；docstring 已声明 px 才是显示尺寸的权威值，scale 只表示「缩过」。"
+  (let ((fit (eimg-core-fit-size 100 50 1 1)))
+    (should fit)
+    (should (= 0.01 (plist-get fit :scale)))
+    (should (> (plist-get fit :scale) 0))
+    (should (>= (plist-get fit :px-w) 1))
+    (should (>= (plist-get fit :px-h) 1))
+    (should (integerp (plist-get fit :px-w)))
+    (should (integerp (plist-get fit :px-h))))
+  ;; 更大的图也不会缩成 0 像素：钳位后仍按 0.01 给像素数。
+  (let ((fit (eimg-core-fit-size 100000 100000 1 1)))
+    (should (= 0.01 (plist-get fit :scale)))
+    (should (= 1000 (plist-get fit :px-w)))
+    (should (= 1000 (plist-get fit :px-h)))))
 
 ;;;; ── 4. 渲染 ────────────────────────────────────────────────────────────
 

@@ -319,6 +319,17 @@ def build_parser() -> EimgArgumentParser:
         help=f"PDF 栅格化 DPI（默认 {DEFAULT_DPI}）",
     )
     parser.add_argument(
+        "--page-images-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "把 PDF 每页栅格化后的 PNG 落到 DIR（命名 <源文件名>-p<页码>.png），"
+            "并在 json 的每一页输出 image 绝对路径，供「原图与坐标对齐」使用；"
+            "图片输入则直接输出输入图的绝对路径（不复制）。"
+            "DIR 不存在会自动创建。不传则该字段不出现，输出与旧版一致"
+        ),
+    )
+    parser.add_argument(
         "--python",
         default=None,
         metavar="PATH",
@@ -1285,9 +1296,18 @@ def serialize_json(pages: list[dict], backend: str | None = None) -> str:
 
     每页恒带 `source`（输入文件 basename）——多文件输入时下游靠它把页归回文件，
     单文件时保留同一形状，避免下游写「有时有有时没有」的分支。
+
+    `image`（页面对应的图片绝对路径）是**条件性**字段：只有 `--page-images-dir`
+    生效时 `pages` 里才会带这个键，此处照实透传、否则不出现。不能恒输出
+    `"image": null`——那会让不传参数的旧调用方拿到一份字段集合变了的 JSON，快照
+    测试、`==` 对比与严格 schema 都会因此变红，「不传参数时输出不变」是本参数存在
+    的前提。
     """
-    normalized = [
-        {
+    normalized: list[dict] = []
+    for index, page in enumerate(pages):
+        # 显式重建而不是复制原 dict：`pages` 里还可能带后端/内部用的临时键（例如
+        # recognize_pdf 中间态的字段），只放行契约内的字段才不会被内部实现泄漏出去。
+        entry = {
             "page": int(page.get("page", index + 1)),
             "source": page.get("source"),
             "blocks": [
@@ -1299,8 +1319,11 @@ def serialize_json(pages: list[dict], backend: str | None = None) -> str:
                 for block in (page.get("blocks") or [])
             ],
         }
-        for index, page in enumerate(pages)
-    ]
+        # 追加在最后：page / source / blocks 的相对顺序与旧版完全一致，新键只在尾部
+        # 出现，按前缀读取的老解析逻辑不受影响。
+        if "image" in page:
+            entry["image"] = page["image"]
+        normalized.append(entry)
     return json.dumps(
         {"backend": backend, "pages": normalized},
         ensure_ascii=False,
@@ -2032,6 +2055,81 @@ def rasterize_pdf(
 # ─── 识别入口 ────────────────────────────────────────────────────────────────
 
 
+def _prepare_page_images_dir(explicit: str | None) -> Path | None:
+    """把 `--page-images-dir` 的取值变成一个可写的目录；未给出则返回 None。
+
+    目录不存在时**自动创建**（`parents=True, exist_ok=True`）：调用方（elisp 侧）传的
+    通常是临时目录，让每个调用点自己先 mkdir 只会把「先有鸡还是先有蛋」复制到各处。
+
+    失败一律按**参数错误**（退出码 5）报，而不是输入错误（3）：目录路径是命令行上敲
+    进来的参数，建不出来 / 不可写说明参数本身不可用，与「输入文件读不出来」是两类
+    问题，混成一个码会让上游分不清该改命令行还是该改文件。
+    必须在 `main()` 的 `try` 内调用——`fail()` 抛的是 `EimgError`，掉到 `try` 外就是
+    裸 traceback + 退出码 1，那正是退出码契约里不允许出现的形态。
+    """
+    if explicit is None:
+        return None
+
+    target = Path(explicit).expanduser()
+    # 先判类型再 mkdir：`mkdir(exist_ok=True)` 撞上「同名普通文件」时抛的是
+    # FileExistsError（文案「File exists」），用户看不出到底哪不对；提前给出
+    # 「已存在但不是目录」比让他自己猜强。
+    if target.exists() and not target.is_dir():
+        raise fail(
+            EXIT_BAD_ARGS,
+            f"参数错误: --page-images-dir {explicit}（已存在但不是目录）",
+        )
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise fail(
+            EXIT_BAD_ARGS,
+            f"参数错误: --page-images-dir {explicit}（无法创建目录: "
+            f"{exc.strerror or exc}）",
+        )
+    # 显式探一次可写性：否则要等栅格化完、识别完才在 `shutil.copy2` 处失败，用户白等
+    # 十几秒才看到「参数错误」。
+    if not os.access(target, os.W_OK | os.X_OK):
+        raise fail(
+            EXIT_BAD_ARGS,
+            f"参数错误: --page-images-dir {explicit}（目录不可写）",
+        )
+    return target
+
+
+def _copy_page_image(
+    image: Path,
+    source: Path,
+    number: int,
+    destination: Path,
+) -> Path:
+    """把栅格化出的单页 PNG 复制进 `destination`，返回其**绝对**路径。
+
+    为什么必须复制、不能把栅格化临时目录里的路径直接给下游：那个目录在
+    `recognize_pdf` 的 `finally` 里无条件删除（防止失败路径漏删把 /tmp 撑爆），
+    直接引用等于给下游一个「命令一退出就失效」的路径。
+
+    命名取 `<源文件名主干>-p<真实页码>.png`：页码用 PDF 里的真实页号而非数组下标，
+    与 `pages[i]["page"]` 同一口径——`--pdf-pages 3` 时落地文件必须是 `x-p3.png`
+    而不是 `x-p1.png`，否则下游按页号找图会整体偏移。
+
+    写不进去按「识别失败」（退出码 4）报：参数目录已在校验阶段确认可写，此刻失败
+    属于运行期 IO 故障（磁盘满 / 权限中途变化），与「参数敲错」无关。
+    """
+    target = destination / f"{source.stem}-p{number}.png"
+    try:
+        shutil.copy2(image, target)
+    except OSError as exc:
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {source}（无法写出页面图片 {target}: {exc.strerror or exc}）",
+        )
+    # resolve() 而不是 str(target)：契约是「绝对路径」（下游要把它当独立文件名用，
+    # 不能依赖当时的 cwd）。用户传相对 DIR 时 str(target) 仍带相对成分，resolve()
+    # 才把它钉成绝对路径并消掉 `..` / 符号链接歧义。
+    return target.resolve()
+
+
 def recognize_image(path: Path, backend: dict, args) -> list[dict]:
     """识别单张图片，返回 blocks 列表（不含页码包装，**已按阅读顺序排好**）。"""
     kind = TYPE_DESCRIPTIONS.get(path.suffix.lower().lstrip("."), "文件")
@@ -2098,18 +2196,25 @@ def recognize_pdf(path: Path, backend: dict, args) -> list[dict]:
                 )
 
     workdir = tempfile.mkdtemp(prefix=TEMP_PREFIX)
+    destination = getattr(args, "page_images_dir_path", None)
     try:
         rasterized = rasterize_pdf(path, dpi, requested, workdir, total)
-        pages = [
-            # 图片路径已在 `recognize_image` 内排过序；这里再对每页显式排一次是
-            # 幂等兜底（同一份 block 集合必然收敛到同一顺序），让 PDF 路径的顺序
-            # 不依赖「recognize_image 内部做了什么」这一实现细节。
-            make_page(
+        # 逐页构造（而非列表推导）：给了 `--page-images-dir` 时每页还要多一个 `image`
+        # 键，推导式里塞条件分支会比循环更难读。
+        pages: list[dict] = []
+        for number, image in rasterized:
+            page = make_page(
                 number,
+                # 图片路径已在 `recognize_image` 内排过序；这里再对每页显式排一次是
+                # 幂等兜底（同一份 block 集合必然收敛到同一顺序），让 PDF 路径的顺序
+                # 不依赖「recognize_image 内部做了什么」这一实现细节。
                 sort_blocks_reading_order(recognize_image(image, backend, args)),
             )
-            for number, image in rasterized
-        ]
+            if destination is not None:
+                page["image"] = str(
+                    _copy_page_image(image, path, number, destination)
+                )
+            pages.append(page)
     finally:
         # 一份 200 dpi 的 A4 页解出来是几百 KB，失败路径漏删会在 /tmp 长期堆积。
         shutil.rmtree(workdir, ignore_errors=True)
@@ -2126,10 +2231,20 @@ def recognize_file(path: Path, backend: dict, args) -> list[dict]:
     固定中英文，忽略该参数但不报错——这一差异已在 `--help` 里注明。
     `--dpi` / `--pdf-pages` 只影响 PDF 路径，对图片输入无意义（忽略而不报错，
     免得「同一批混排文件」因其中一个参数而整批失败）。
+    `--page-images-dir` 对两类输入都生效，但含义不同：PDF 是「每页栅格化图落到该
+    目录」，图片是「直接指向输入图本身」（见下方注释）。
     """
     if path.suffix.lower() == ".pdf":
         return recognize_pdf(path, backend, args)
-    return [make_page(1, recognize_image(path, backend, args))]
+
+    page = make_page(1, recognize_image(path, backend, args))
+    if getattr(args, "page_images_dir_path", None) is not None:
+        # 图片输入没有栅格化产物，`--page-images-dir` 在这里的语义只剩「告诉我这页来自
+        # 哪张原图」：直接给输入图路径，不复制——原图本来就一直在，复制只会多出一份会
+        # 与源文件悄悄漂移的副本。
+        # resolve() 让相对路径输入（`eimg-ocr x.png`）也给出绝对路径，下游不必再拼 cwd。
+        page["image"] = str(path.resolve())
+    return [page]
 
 
 # ─── 主流程 ──────────────────────────────────────────────────────────────────
@@ -2155,6 +2270,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.ollama_url:
             _validate_ollama_url(args.ollama_url)
+        # `--page-images-dir` 与 ollama 地址同属「敲进来的参数」：目录建不出来 / 不可写
+        # 就是参数错误（退出码 5），不该等到识别完才在 copy 处炸，也不该被折成 4。
+        # 校验同样放在 `try` 内（理由见上）。解析结果挂回 args 而不是层层传参：识别函数
+        # 已经统一从 args 取 `dpi` / `pdf_pages`，加一个字段比改三条函数签名影响面小。
+        # 这里对 `--list-backends` 也照常校验——参数错误优先于查询动作，与上面的地址
+        # 校验保持同一口径；代价是纯查询时会顺手建一个空目录，这是用户显式请求的副作用。
+        args.page_images_dir_path = _prepare_page_images_dir(args.page_images_dir)
         if args.list_backends:
             # --list-backends 是**查询**动作而非识别任务：即便所有后端都不可用，
             # 命令本身也成功完成了「告诉你哪个后端可用、为什么不可用」这件事，
