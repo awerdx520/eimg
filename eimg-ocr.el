@@ -888,6 +888,7 @@ ON-FAILURE 仅在失败态以拼好的错误文案调用一次（超时也算失
              (length body)
              (if insert (format "并插入 %s" (buffer-name origin)) ""))))
 
+;;;###autoload
 (defun eimg-ocr-region (&optional args)
   "框选屏幕区域并识别，正文进 `kill-ring'；`C-u' 时同时插入当前 buffer。
 ARGS 是覆盖默认配置的 plist（供 T5d 的 transient infix 用，ARGS 优先）；
@@ -911,6 +912,7 @@ ARGS 是覆盖默认配置的 plist（供 T5d 的 transient infix 用，ARGS 优
      (eimg-ocr--config-with args :file path)
      (lambda (_pages) (eimg-ocr--deliver-body origin insert-p)))))
 
+;;;###autoload
 (defun eimg-ocr-file (&optional args)
   "选一个图片或 PDF 文件做 OCR，结果进 `eimg-ocr-buffer-name'。
 ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先，缺的键落 defcustom）。
@@ -959,6 +961,7 @@ ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先，缺的键落 defcustom
                          (file-attribute-modification-time (file-attributes a))))))
     (cl-subseq files 0 (min limit (length files)))))
 
+;;;###autoload
 (defun eimg-ocr-history (&optional args)
   "从最近的截图里挑一张做 OCR，结果进 `eimg-ocr-buffer-name'。
 ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先，缺的键落 defcustom）。
@@ -1001,6 +1004,7 @@ ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先，缺的键落 defcustom
              eimg-ocr-backends-buffer-name lines)
     buffer))
 
+;;;###autoload
 (defun eimg-ocr-list-backends ()
   "列出 OCR 后端及可用状态，输出写入 `eimg-ocr-backends-buffer-name'。
 用与 OCR **同一套**异步进程层，而不是 `call-process'：`call-process' 阻塞到子进程

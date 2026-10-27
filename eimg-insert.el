@@ -150,6 +150,7 @@ region 文本来源不确定（用户可能选中的是链接、光路径、带 
 
 ;;;; ── 4. 插入命令 ────────────────────────────────────────────────────────
 
+;;;###autoload
 (defun eimg-insert-path (&optional arg)
   "插入图片链接；带前缀 ARG 时改为插入内联图片。
 
@@ -188,6 +189,7 @@ region 文本来源不确定（用户可能选中的是链接、光路径、带 
       (when visual
         (and (fboundp 'evil-normal-state) (evil-normal-state))))))
 
+;;;###autoload
 (defun eimg-insert-display (&optional path)
   "把图片插入为内联显示；PATH 为 nil 时交互式选择。
 

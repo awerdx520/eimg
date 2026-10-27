@@ -5,7 +5,19 @@
 
 ## [未发布]
 
-（无）
+### 新增
+
+- **交互命令的 autoload cookie**：13 个用户入口（截图 2 / 插入 2 / OCR 4 / 结果与安装
+  相关 3 / 菜单 1 / embark 注册 1）带 `;;;###autoload`，宿主可用 `use-package :defer t`
+  延迟加载本包而不丢按键——`make` 之外的文件名映射由 `loaddefs-generate` 按实际定义
+  位置填写（`eimg-ocr-show-result-buffer` / `-open-directory` / `-setup-help` 定义在
+  `eimg-transient.el`，故指向该文件；不用 `use-package :commands`，它假设文件名等于符号名）。
+- **embark 注册的延迟加载补偿**：`eimg-embark.el` 把注册抽成 `eimg-embark-register`
+  并带 autoloads 补偿 form，`:defer t` 下 `C-.` 菜单仍在 embark 加载时注册。补偿**不能**
+  写成 `(with-eval-after-load 'embark (require 'eimg-embark))`——那会 `Recursive require`。
+- **`test/eimg-autoload-test.el`**：6 条用例锁定 cookie 覆盖、反向断言（buffer-only 命令
+  不加 cookie）、embark 补偿形态、真跑 `loaddefs-generate` 的映射表、仅加载 autoloads 时
+  的 `fboundp` / `autoloadp` 语义、以及 embark 加载后的注册结果。
 
 ## [0.1.0] - 2026-10-27
 

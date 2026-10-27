@@ -207,6 +207,7 @@ DPI 取不到正整数时原样返回字符串：宁可让 CLI 报参数错误�
 「首次安装需显式运行」这句是**硬要求**：用户看完这段必须知道下一步该敲什么、
 以及为什么菜单不代劳。")
 
+;;;###autoload
 (defun eimg-ocr-show-result-buffer ()
   "切到最近一次 OCR 的结果 buffer。
 还没有任何结果时 `user-error'：静默新建一个空的结果 buffer 会让用户以为「识别
@@ -219,6 +220,7 @@ DPI 取不到正整数时原样返回字符串：宁可让 CLI 报参数错误�
       (pop-to-buffer buffer))
     buffer))
 
+;;;###autoload
 (defun eimg-ocr-open-directory ()
   "用 Dired 打开 `eimg-ocr-images-dir'（截图目录）。
 未配置或目录不存在时 `user-error'：本命令只做「打开已知目录」，不去猜
@@ -230,6 +232,7 @@ DPI 取不到正整数时原样返回字符串：宁可让 CLI 报参数错误�
                   (if directory directory "nil")))
     (dired directory)))
 
+;;;###autoload
 (defun eimg-ocr-setup-help ()
   "在 `eimg-ocr-setup-buffer-name' 里展示 OCR 后端安装指引（**只展示，不执行**）。
 为什么单独一条命令而不是把文本塞进菜单描述：指引有二十多行，菜单里放不下，而

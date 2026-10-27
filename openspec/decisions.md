@@ -144,3 +144,29 @@
   keymap 符号（`eimg-image-map`），与 `eimg-select--read` 的 `:category` 逐字一致——
   embark 对 `embark-keymap-alist` 的取值做 `symbol-value`，差一个字符就是按 `C-.` 时
   `void-variable`。
+
+## D11 交互命令 autoload 策略：包内 cookie + embark 注册的补偿形态（2026-10-27）
+
+- **决策**：13 个用户入口在**包内**加 `;;;###autoload`（12 个交互命令 + `eimg-embark-register`），
+  文件名映射交给 `loaddefs-generate` 按实际定义位置生成；宿主侧只写 `:defer t`，
+  **不用** `use-package :commands`。embark 的 `C-.` 注册由
+  `;;;###autoload (with-eval-after-load 'embark (eimg-embark-register))` 承担，
+  `eimg-embark-register` 经另一条纯数据 `autoload` 声明拉入 `eimg-embark.el`。
+- **理由一（为什么不用 `:commands`）**：`:commands` 的隐式 autoload 假设「文件名 = 符号名」。
+  本包三个命令是 `eimg-ocr-*` 前缀却定义在 `eimg-transient.el`
+  （`eimg-ocr-show-result-buffer` / `-open-directory` / `-setup-help`——它们只服务菜单的
+  「系统」组，且用 transient 侧的 buffer 名常量），`:commands` 会指向不存在的文件。包内
+  cookie 的映射由 `loaddefs-generate` 生成，实测这三条正确指向 `eimg-transient`。
+- **理由二（补偿为什么不能 require）**：`(with-eval-after-load 'embark (require 'eimg-embark))`
+  会在真实链路里 **Recursive require**：embark 加载完成 → autoloads 的钩子触发 require →
+  加载 `eimg-embark.el` → 文件顶层同一条钩子在「embark 已 loaded」的上下文立即执行 →
+  再 require 正在加载的 feature → 报错，keymap 与注册一起废掉（实测：手动
+  `--eval` 复现 `Recursive ‘require’ for feature ‘eimg-embark’`）。改成「调用一个 autoload
+  函数」后链路自洽：未加载 → autoload 触发加载 → 加载完成后函数已定义 → 调用一次；
+  已加载上下文里加载本文件 → 同一条 form 只调用一个幂等函数，不引回自身。
+- **不变的判据**：`eimg-menu` 仍是「cookie + 纯数据 autoload 声明」（D8 的理由成立）；
+  仅 `*eimg-ocr*` buffer 内使用的 5 条命令与菜单内部包装 `eimg-menu-run-*` 不加 cookie
+  —— 它们工作时包必然已加载，加 cookie 只会把 buffer 内按键误当启动入口。
+- **机械检查**：`test/eimg-autoload-test.el` 6 条用例（cookie 覆盖 + 反向断言 + embark
+  补偿形态 + 真跑 `loaddefs-generate` 的 13 条映射 + 仅加载 autoloads 时
+  `featurep-eimg=nil` / `fboundp` 为 t + embark 加载后注册成功）。

@@ -83,8 +83,9 @@
 (ert-deftest eimg-select-test-embark-registration-source ()
   "embark 注册、keymap 定义与 `:category' 三者逐字一致（源码文本断言）。
 
-`defvar-keymap' 与 `add-to-list' 都在 `with-eval-after-load 'embark' 内，
-`emacs -Q' 下永不执行，故只能断言源码锚点：
+`defvar-keymap' 与 `add-to-list' 都在 `eimg-embark-register' 里，由
+`with-eval-after-load 'embark' 的钩子触发（`emacs -Q' 下 embark 不存在，
+永不执行），故只能断言源码锚点：
 - 注册值必须是**已定义**的 keymap 符号（embark 对它做 `symbol-value'）；
 - 注册的 category 必须与 `eimg-select--read' 里的 `:category' 逐字相同，
   否则按 `C-.'` 时 refine 失配——一个在 `eimg-embark.el'、一个在
@@ -93,7 +94,7 @@
         (select (eimg-select-test--source "eimg-select")))
     (should embark)
     (should select)
-    ;; 注册与 keymap 定义都在延迟加载块内（避免启动期硬依赖 embark）
+    ;; 注册与 keymap 定义都由 after-load 钩子触发（避免启动期硬依赖 embark）
     (should (string-match-p
              (regexp-quote "(with-eval-after-load 'embark") embark))
     (should (string-match-p (regexp-quote "(add-to-list 'embark-keymap-alist")

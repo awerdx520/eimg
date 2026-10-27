@@ -192,6 +192,7 @@
             candidate (expand-file-name (format "%s-%d.png" stem suffix) dir)))
     candidate))
 
+;;;###autoload
 (defun eimg-capture ()
   "调用外部工具截屏，存到截图目录并写入历史。
 
@@ -231,6 +232,7 @@
                     (if (numberp status) status "未启动")
                     (if leftover "；已删除残留文件" ""))))))
 
+;;;###autoload
 (defun eimg-capture-open-directory ()
   "用 dired 打开截图存储目录。"
   (interactive)
