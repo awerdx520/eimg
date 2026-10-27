@@ -947,6 +947,214 @@ batch 环境本身就是「无图形」的真实场景，这里再显式绑一�
       (should (string-prefix-p "截图失败：" text))
       (should (string-match-p "用户取消了截图" text)))))
 
+;;;; ── 9. 配置项（defcustom）与参数拼装链 ────────────────────────────────
+
+;; 这一节的判据是「**接线**」而不是「有没有定义变量」：五个新 defcustom 单独存在
+;; 毫无价值，价值在于 `eimg-ocr--run' 真的把它们垫进 argv、且 ARGS 能覆盖它们。
+;; 所有断言都通过 `eimg-ocr--start' 打桩读 argv（绝不起真实 CLI）。
+
+(defun eimg-ocr-test--capture-argv (args)
+  "调用 `eimg-ocr--run' 传入 ARGS，返回它交给 `eimg-ocr--start' 的 argv。
+`eimg-ocr--start' 换成记录参数的空实现；回调不执行，故不会写结果 buffer、
+也不会触发解析。顺带断言「argv 非空」——空 argv 说明接线整段断了。"
+  (let (captured)
+    (cl-letf (((symbol-function 'eimg-ocr--start)
+               (lambda (argv _callback) (setq captured argv) 'eimg-ocr-test-proc)))
+      (eimg-ocr--run args))
+    captured))
+
+(defun eimg-ocr-test--arg-value (argv option)
+  "返回 ARGV 里 OPTION 后面的取值；OPTION 不在时返回 nil。"
+  (cadr (member option argv)))
+
+(ert-deftest eimg-ocr-test-config-defcustoms-and-defaults ()
+  "五个新 defcustom 均已定义，且默认值与计划一致。
+逐个 `should' 而不是循环比对整张表：失败信息里直接指出是哪一项，不必回头数下标。"
+  (should (boundp 'eimg-ocr-backend))
+  (should (equal "auto" (default-value 'eimg-ocr-backend)))
+  (should (boundp 'eimg-ocr-lang))
+  (should (equal "chi_sim+eng" (default-value 'eimg-ocr-lang)))
+  (should (boundp 'eimg-ocr-pdf-dpi))
+  (should (equal 200 (default-value 'eimg-ocr-pdf-dpi)))
+  (should (boundp 'eimg-ocr-python))
+  (should (null (default-value 'eimg-ocr-python)))
+  (should (boundp 'eimg-ocr-report-style))
+  (should (eq 'org (default-value 'eimg-ocr-report-style)))
+  ;; 类型也要是计划的形态：report-style 是 choice，否则「用户能不能改」
+  ;; 在 Customize 里就无从表达；backend / dpi 同理。
+  (should (eq 'choice (car (get 'eimg-ocr-report-style 'custom-type))))
+  (should (eq 'choice (car (get 'eimg-ocr-backend 'custom-type))))
+  (should (eq 'choice (car (get 'eimg-ocr-pdf-dpi 'custom-type)))))
+
+(ert-deftest eimg-ocr-test-run-takes-defaults-from-defcustoms ()
+  "未传 ARGS 时 argv 取 defcustom 默认值：`--backend auto --lang chi_sim+eng
+--dpi 200'，`--python' 因 nil 不出现，`--format' 恒 json。
+这条把「defcustom 真的接进了拼装链」钉死——只定义变量不接线时它会红。"
+  (eimg-ocr-test--reset)
+  (let ((argv (eimg-ocr-test--capture-argv '(:file "/tmp/eimg-a.png"))))
+    (should (equal "auto" (eimg-ocr-test--arg-value argv "--backend")))
+    (should (equal "chi_sim+eng" (eimg-ocr-test--arg-value argv "--lang")))
+    (should (equal "200" (eimg-ocr-test--arg-value argv "--dpi")))
+    (should (equal "json" (eimg-ocr-test--arg-value argv "--format")))
+    ;; nil 的 defcustom 必须**完全不出现在 argv** 里：写成 `--python nil' 会让
+    ;; CLI 收到一个叫 "nil" 的路径，比不传更糟。
+    (should-not (member "--python" argv))
+    ;; 文件路径恒在末尾（`eimg-core-build-args' 的固定顺序）。
+    (should (equal "/tmp/eimg-a.png" (car (last argv))))))
+
+(ert-deftest eimg-ocr-test-run-args-override-defcustoms ()
+  "ARGS 显式给出的 `:backend' / `:lang' / `:dpi' / `:python' 全部覆盖 defcustom。
+优先级链是「ARGS > defcustom > CLI 默认」，这是菜单 infix 能生效的前提。"
+  (eimg-ocr-test--reset)
+  (let ((argv (eimg-ocr-test--capture-argv
+               '(:backend "tesseract" :lang "eng" :dpi 300
+                 :python "/x/python" :file "/tmp/eimg-a.png"))))
+    (should (equal "tesseract" (eimg-ocr-test--arg-value argv "--backend")))
+    (should (equal "eng" (eimg-ocr-test--arg-value argv "--lang")))
+    (should (equal "300" (eimg-ocr-test--arg-value argv "--dpi")))
+    (should (equal "/x/python" (eimg-ocr-test--arg-value argv "--python")))
+    ;; 覆盖之后不得残留被覆盖的默认值（同一选项只出现一次）。
+    (should (= 1 (cl-count "--backend" argv :test #'equal)))
+    (should-not (member "auto" argv))
+    (should-not (member "chi_sim+eng" argv))))
+
+(ert-deftest eimg-ocr-test-run-python-from-defcustom ()
+  "`eimg-ocr-python' 非 nil 时 argv 含 `--python <值>'（来自 defcustom 而非 ARGS）。"
+  (eimg-ocr-test--reset)
+  (let* ((eimg-ocr-python "/usr/bin/python3")
+         (argv (eimg-ocr-test--capture-argv '(:file "/tmp/eimg-a.png"))))
+    (should (equal "/usr/bin/python3"
+                   (eimg-ocr-test--arg-value argv "--python")))))
+
+(ert-deftest eimg-ocr-test-run-forces-json-format ()
+  "ARGS 里的 `:format' 被忽略，argv 恒为 `--format json'。
+理由：结果 buffer 必须按页解析结构化输出；渲染风格是**另一件事**
+（`eimg-ocr-report-style'），它绝不能反过来改变请求格式。"
+  (eimg-ocr-test--reset)
+  (let ((argv (eimg-ocr-test--capture-argv
+               '(:format "text" :file "/tmp/eimg-a.png"))))
+    (should (equal "json" (eimg-ocr-test--arg-value argv "--format")))
+    (should-not (member "text" argv))))
+
+(ert-deftest eimg-ocr-test-run-records-merged-config ()
+  "`eimg-ocr--last-meta' 的 `:config' 记的是**合并后**的完整配置。
+重跑（`g'）要复现这次的结果，因此配置必须含默认值；只存调用方原始入参的话，
+用户改一次 defcustom 再按 `g'，得到的就是另一次识别。"
+  (eimg-ocr-test--reset)
+  (eimg-ocr-test--with-stub stub (eimg-ocr-test--json-command)
+    (let ((eimg-ocr-cli-path stub))
+      (with-temp-buffer
+        (eimg-ocr--run '(:file "a.png"))
+        (should (eimg-ocr-test--wait
+                 (lambda () (plist-get eimg-ocr--last-meta :config))))
+        (let ((config (plist-get eimg-ocr--last-meta :config)))
+          (should (equal "auto" (plist-get config :backend)))
+          (should (equal "chi_sim+eng" (plist-get config :lang)))
+          (should (equal 200 (plist-get config :dpi)))
+          (should (equal "json" (plist-get config :format)))
+          (should (equal "a.png" (plist-get config :file))))))))
+
+(ert-deftest eimg-ocr-test-report-style-text-uses-render-text ()
+  "`eimg-ocr-report-style' = `text' 时结果 buffer 用 `eimg-core-render-text'：
+**不含** `** 第 N 页'，页间用换页符，头行换成 `;; eimg-ocr: ' 前缀。
+两种风格都请求 JSON，区别只在渲染阶段——所以这条与上一条 `:format' 断言并存不矛盾。"
+  (eimg-ocr-test--reset)
+  (let ((eimg-ocr-report-style 'text))
+    (with-current-buffer (eimg-ocr-test--render)
+      (let ((text (buffer-string)))
+        (should-not (string-match-p "\\*\\* 第 " text))
+        (should (string-match-p "第一页第一块" text))
+        (should (string-match-p "\f" text))
+        (should (string-prefix-p ";; eimg-ocr: " text)))))
+  ;; 头行换前缀之后，正文提取仍要剥干净（否则复制 / 存盘会带上元信息）。
+  (let ((eimg-ocr-report-style 'text))
+    (with-current-buffer (eimg-ocr-test--render)
+      (should (equal (concat "第一页第一块\n第一页第二块\n\f"
+                             "第二页第一块\n第二页第二块")
+                     (eimg-ocr--collect-body))))))
+
+(ert-deftest eimg-ocr-test-report-style-org-is-default ()
+  "默认（`org'）风格：结果 buffer 含 `** 第 1 页'，头行是 `# eimg-ocr: ' 前缀。
+默认值必须保持 org——老用户复制出来的正文形态不该因为加了开关而变。"
+  (eimg-ocr-test--reset)
+  (should (eq 'org eimg-ocr-report-style))
+  (with-current-buffer (eimg-ocr-test--render)
+    (let ((text (buffer-string)))
+      (should (string-match-p "\\*\\* 第 1 页" text))
+      (should (string-match-p "\\*\\* 第 2 页" text))
+      (should-not (string-match-p "\f" text))
+      (should (string-prefix-p "# eimg-ocr: " text)))))
+
+(ert-deftest eimg-ocr-test-menu-args-do-not-write-defcustoms ()
+  "菜单 infix 的取值（等价于 ARGS）只进 argv，不写回 defcustom。
+判据：跑完之后 `(default-value 'eimg-ocr-backend)' 仍是 \"auto\"、
+`eimg-ocr-lang' / `eimg-ocr-pdf-dpi' 的默认值原样。
+「我只在这个菜单里试了下 tesseract」不该变成「配置文件被改了」。"
+  (eimg-ocr-test--reset)
+  (let* ((backend-before (default-value 'eimg-ocr-backend))
+         (lang-before (default-value 'eimg-ocr-lang))
+         (dpi-before (default-value 'eimg-ocr-pdf-dpi))
+         (argv (eimg-ocr-test--capture-argv
+                '(:backend "tesseract" :lang "eng" :dpi 300
+                  :file "/tmp/eimg-a.png"))))
+    (should (equal "tesseract" (eimg-ocr-test--arg-value argv "--backend")))
+    (should (equal backend-before (default-value 'eimg-ocr-backend)))
+    (should (equal "auto" (default-value 'eimg-ocr-backend)))
+    (should (equal lang-before (default-value 'eimg-ocr-lang)))
+    (should (equal dpi-before (default-value 'eimg-ocr-pdf-dpi)))))
+
+(defun eimg-ocr-test--setq-targets (form)
+  "返回 FORM 这棵树里被 `setq' / `setq-default' 赋值的符号列表。
+用 S 表达式遍历而不是正则：`(setq a 1 b 2)' 里的第二个目标、跨行赋值、
+以及注释掉的赋值，正则都要么漏、要么误判；`read' 出来的树没有这些歧义（它天然
+跳过注释与字符串内容）。"
+  (cond
+   ((not (consp form)) nil)
+   ((memq (car form) '(setq setq-default))
+    (let ((rest (cdr form))
+          targets)
+      (while (consp rest)
+        (push (car rest) targets)
+        (setq rest (cdr rest))
+        ;; 取值表达式内部可能还嵌着 setq，一并递归。
+        (when (consp rest)
+          (setq targets (append (eimg-ocr-test--setq-targets (car rest)) targets)
+                rest (cdr rest))))
+      targets))
+   (t
+    (let ((rest form)
+          targets)
+      ;; 用 `while (consp ...)' 而不是 `dolist'：源码里有 `(:k . "v")' 这样的
+      ;; 点对字面量，`dolist' 会顺着 cdr 走到字符串上并 `listp' 报错。
+      (while (consp rest)
+        (setq targets (append (eimg-ocr-test--setq-targets (car rest)) targets)
+              rest (cdr rest)))
+      targets))))
+
+(ert-deftest eimg-ocr-test-config-defcustoms-have-no-global-setq ()
+  "源码里不存在对这五个 defcustom 的全局 `setq' / `setq-default'。
+一旦有人用 `setq' 把它们钉死，用户的 Customize 设置会被静默覆盖（且谁赢取决于
+加载时机），而代码里看不出任何异常——这类回归只能在文本层锁住。
+注释里出现这些名字是允许的（`read' 会跳过注释），故不受影响。"
+  (let* ((root (file-name-directory (file-truename (locate-library "eimg"))))
+         (files (directory-files root t "\\`eimg.*\\.el\\'"))
+         (names '(eimg-ocr-backend eimg-ocr-lang eimg-ocr-pdf-dpi
+                  eimg-ocr-python eimg-ocr-report-style)))
+    (should files)
+    (dolist (file files)
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        (let (targets)
+          (condition-case nil
+              (while t
+                (setq targets
+                      (append (eimg-ocr-test--setq-targets (read (current-buffer)))
+                              targets)))
+            (end-of-file nil))
+          (dolist (name names)
+            (should-not (memq name targets))))))))
+
 (provide 'eimg-ocr-test)
 
 ;;; eimg-ocr-test.el ends here

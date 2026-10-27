@@ -182,7 +182,8 @@ nil 与 `()' 对 `plist-get' 等价，但对「用户有没有表达意图」不
 (ert-deftest eimg-transient-test-menu-args-drive-argv ()
   "菜单里设 `-b tesseract' 后，经包装命令拼出的 CLI argv 含 `--backend tesseract'。
 链路：`transient-values'（已保存取值）→ `transient-args' → `eimg-ocr--menu-args'
-→ `eimg-ocr-file' 的 ARGS 合并 → `eimg-core-build-args' → `eimg-ocr--start'。
+→ `eimg-ocr-file' 的 ARGS → `eimg-ocr--run' 补 defcustom 默认 →
+`eimg-core-build-args' → `eimg-ocr--start'。
 进程层用 `cl-letf' 换成记录参数的空实现，绝不起真实 CLI。"
   (let* ((file (make-temp-file "eimg-transient-test-" nil ".png"))
          argv)
@@ -197,9 +198,14 @@ nil 与 `()' 对 `plist-get' 等价，但对「用户有没有表达意图」不
           (should argv)
           (should (member "--backend" argv))
           (should (equal "tesseract" (cadr (member "--backend" argv))))
-          ;; infix 的其它项未设置时不得凭空出现（未设置 ≠ 空值）。
-          (should-not (member "--lang" argv))
-          (should-not (member "--dpi" argv)))
+          ;; T5e 之后「infix 未设置」不再等于「argv 里没有这个选项」：没被 infix
+          ;; 覆盖的键落到 defcustom 默认值（`eimg-ocr-lang' / `eimg-ocr-pdf-dpi'），
+          ;; 只有 defcustom 也是 nil 的键（如 `eimg-ocr-python'）才真正不进 argv。
+          ;; 这条链是「infix > defcustom > CLI 默认」，故这里断言的是**取到了
+          ;; defcustom 的值**，而不是「没出现」。
+          (should (equal "chi_sim+eng" (cadr (member "--lang" argv))))
+          (should (equal "200" (cadr (member "--dpi" argv))))
+          (should-not (member "--python" argv)))
       (ignore-errors (delete-file file)))))
 
 (ert-deftest eimg-transient-test-menu-does-not-change-defcustoms ()

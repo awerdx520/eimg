@@ -20,7 +20,9 @@
 ;;   2. **infix 不改 defcustom**：三个 infix 的取值由 `eimg-ocr--menu-args' 解析成
 ;;      配置 plist，再作为 ARGS 传给 OCR 命令（ARGS 优先于 defcustom）。在菜单里
 ;;      换一次后端不该悄悄改掉用户配置——否则「我只在这个菜单里试了下 tesseract」
-;;      会变成「配置文件被改了」，而且退出 Emacs 后还在。
+;;      会变成「配置文件被改了」，而且退出 Emacs 后还在。优先级链的落地位置是
+;;      `eimg-ocr--run'：`ARGS' > `eimg-ocr--config-defaults'（defcustom）> CLI 默认，
+;;      因此菜单只需给出**改过的那几项**，其余键自动落到用户配置上。
 ;;   3. **软依赖不影响菜单的可见性**：截图与插入能力仍在 thomas-emacs
 ;;      （`eimg-capture' / `+thomas/screenshot' / `+thomas/insert-image-path' /
 ;;      `+thomas/insert-image-display'）。缺失时**不隐藏菜单项**——项留着、调用时

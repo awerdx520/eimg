@@ -53,6 +53,37 @@
   :type '(choice (const :tag "自动推导" nil) file)
   :group 'eimg)
 
+(defcustom eimg-ocr-backend "auto"
+  "OCR 后端：`auto' 自动选择，或指定 `rapidocr' / `tesseract'。
+落成 CLI 参数 `--backend VALUE'。`eimg-ocr--run' 拼 argv 时取本值，但**ARGS 里
+显式给出的 `:backend' 优先**（菜单 infix `-b' 走的就是这条路），故菜单里换一次
+后端不会写回本变量——「只在这次调用里试了下 tesseract」不该变成改配置。"
+  :type '(choice (const :tag "自动选择" "auto")
+                 (const :tag "rapidocr" "rapidocr")
+                 (const :tag "tesseract" "tesseract"))
+  :group 'eimg)
+
+(defcustom eimg-ocr-lang "chi_sim+eng"
+  "tesseract 识别语言，多语言用 `+' 连接（CLI 侧语法）。
+落成 CLI 参数 `--lang VALUE'。`rapidocr' 后端不使用该选项；ARGS 显式给出
+`:lang' 时以 ARGS 为准（菜单 infix `-l'）。"
+  :type 'string
+  :group 'eimg)
+
+(defcustom eimg-ocr-pdf-dpi 200
+  "PDF 分页渲染 DPI（仅 PDF 输入生效），落成 CLI 参数 `--dpi VALUE'。
+数值越高文字越清晰、耗时与内存越大；ARGS 显式给出 `:dpi' 时以 ARGS 为准
+（菜单 infix `-D'）。nil 表示不写该选项，交给 CLI 自己的默认值。"
+  :type '(choice (const :tag "交给 CLI 默认" nil) integer)
+  :group 'eimg)
+
+(defcustom eimg-ocr-python nil
+  "rapidocr 后端使用的 Python 解释器路径；nil 表示交给 `bin/eimg-ocr' 自己探测。
+落成 CLI 参数 `--python PATH'。只在 `rapidocr' 后端有意义；ARGS 显式给出
+`:python' 时以 ARGS 为准。探测失败时的排查顺序见 CLI 的退出码 4 提示。"
+  :type '(choice (const :tag "交给 CLI 探测" nil) file)
+  :group 'eimg)
+
 (defcustom eimg-ocr-timeout 300
   "单次 OCR 的整体超时秒数（含 PDF 全部分页）。
 到点 `delete-process'，收尾状态取 `failed'、退出码取
@@ -79,6 +110,21 @@ OCR 侧零改动。被指定的值必须是**交互命令**（`commandp`）：�
 (defcustom eimg-ocr-history-size 10
   "`eimg-ocr-history' 最多列出多少个最近的图片文件（按修改时间降序）。"
   :type 'natnum
+  :group 'eimg)
+
+(defcustom eimg-ocr-report-style 'org
+  "结果 buffer 的渲染风格。
+`org' 走 `eimg-core-render-org'：每页一个二级标题 `** 第 N 页'，块逐行排列，
+适合在 org buffer 里折叠 / 导出。
+`text' 走 `eimg-core-render-text'：与 CLI `--format text' 同构的纯文本，页间用
+换页符分隔，不带任何 org 标题——复制到终端、邮件、日志里不会被当成标记。
+
+两种风格**都请求 JSON**（`:format` 恒为 \"json\"）：分页结构必须先解析出来才能
+渲染，区别只在渲染阶段。说明头行随风格换前缀——`org' 用 `# eimg-ocr: '（org
+注释，不进大纲），`text' 用 `;; eimg-ocr: '（保留一行元信息又不破坏纯文本观感）；
+`eimg-ocr--collect-body' 两种前缀都会剥掉，复制 / 存盘 / 回插不带元信息。"
+  :type '(choice (const :tag "org（带页标题）" org)
+                 (const :tag "纯文本（无页标题）" text))
   :group 'eimg)
 
 (defconst eimg-ocr--timeout-exit-code 124
@@ -364,7 +410,8 @@ STAGE 是阶段名（如 \"识别中\"）；PAGES 为总页数、CURRENT 为当�
 
 ;;;; ── 7. 结果 buffer 与键位 ────────────────────────────────────────────
 
-;; 职责：把 `eimg-core-render-org' 的正文装进一个专用 buffer，配上**只属于这个
+;; 职责：把 `eimg-core-render-org' / `eimg-core-render-text'（按
+;; `eimg-ocr-report-style' 二选一）的正文装进一个专用 buffer，配上**只属于这个
 ;; buffer** 的模式行，并用六个键位覆盖「复制 / 回插 / 存盘 / 重跑 / 关闭 / 取消」。
 ;; 这一节不启动进程（`g' 例外：它只是把已有参数再交给进程层），也不决定「识别
 ;; 什么」——那是上层交互命令的职责。
@@ -375,20 +422,35 @@ STAGE 是阶段名（如 \"识别中\"）；PAGES 为总页数、CURRENT 为当�
 buffer，否则每跑一次就漏一个 buffer，而且 `q' 关掉之后还能重开。")
 
 (defconst eimg-ocr--header-prefix "# eimg-ocr: "
-  "结果 buffer 首行的前缀。
+  "结果 buffer 首行的前缀（`eimg-ocr-report-style' 为 `org' 时）。
 用 `#' 开头而不是 org 标题：它是给人（以及 `eimg-ocr--collect-body'）看的元信息，
 不该进 org 大纲，复制 / 导出 / 折叠时都会被当成注释行跳过。")
+
+(defconst eimg-ocr--text-header-prefix ";; eimg-ocr: "
+  "结果 buffer 首行的前缀（`eimg-ocr-report-style' 为 `text' 时）。
+纯文本模式下面向的是终端 / 邮件 / 日志，`#' 在那里不是注释而是标题符号，会把
+一行元信息读成正文的一部分；`;;' 在任何按行看的场合都明显是注释。
+两条前缀都由 `eimg-ocr--collect-body' 剥离，复制 / 存盘 / 回插不受风格影响。")
+
+(defun eimg-ocr--header-prefix-for-style (style)
+  "返回渲染风格 STYLE 对应的头行前缀。
+只有 `text' 用 `eimg-ocr--text-header-prefix'；其余（含 nil / 未知值）一律按
+`org' 处理——宁可多一行 org 注释，也不要让「配置写错一个符号」变成结果 buffer
+完全无法产出。"
+  (if (eq style 'text) eimg-ocr--text-header-prefix eimg-ocr--header-prefix))
 
 (defun eimg-ocr--summary-string (pages elapsed)
   "返回完成摘要的模式行文本。PAGES 是页数，ELAPSED 是耗时秒数（可为 nil）。"
   (format " 完成（%d 页，%.2fs） " (or pages 0) (or elapsed 0)))
 
-(defun eimg-ocr--header-line (source backend pages elapsed)
-  "拼出结果 buffer 的说明头行：`# eimg-ocr: 来源（backend=…，N 页，X.XXs）'。
-四个参数都容忍 nil：来源 / 后端未知时显示「未知来源」「未知后端」，宁可在头行上
+(defun eimg-ocr--header-line (source backend pages elapsed &optional style)
+  "拼出结果 buffer 的说明头行：`<前缀>来源（backend=…，N 页，X.XXs）'。
+前缀由 STYLE 决定（见 `eimg-ocr--header-prefix-for-style'）：`org' 风格用
+`# eimg-ocr: '、`text' 风格用 `;; eimg-ocr: '。
+四个位置参数都容忍 nil：来源 / 后端未知时显示「未知来源」「未知后端」，宁可在头行上
 暴露「不知道」也不要让渲染整个失败——识别结果本身仍然是有用的。"
   (format "%s%s（backend=%s，%d 页，%.2fs）"
-          eimg-ocr--header-prefix
+          (eimg-ocr--header-prefix-for-style style)
           (or source "未知来源")
           (or backend "未知后端")
           (or pages 0)
@@ -397,12 +459,18 @@ buffer，否则每跑一次就漏一个 buffer，而且 `q' 关掉之后还能�
 (defun eimg-ocr--collect-body (&optional buffer)
   "返回 BUFFER（默认当前 buffer）中**去掉说明头行**的正文。
 `y' / `w' / `i' 三个命令共用：头行是元信息，复制、存盘、回插都不该带上它。
-首行不以 `eimg-ocr--header-prefix' 开头时原样返回，这样手工编辑过的 buffer
+两条头行前缀（org 风格的 `eimg-ocr--header-prefix' 与 text 风格的
+`eimg-ocr--text-header-prefix'）**都**剥掉：剥哪一条由用户当前的
+`eimg-ocr-report-style' 决定，而复制 / 存盘的人不该被这个开关影响。
+首行不是任一前缀时原样返回，这样手工编辑过的 buffer
 （或用户自己把结果 buffer 改了）也不会被吞掉第一行。
 返回值不含末尾换行：写进其他 buffer 与 kill-ring 时由调用方按需补。"
   (with-current-buffer (or buffer (current-buffer))
     (let* ((text (buffer-substring-no-properties (point-min) (point-max)))
-           (body (if (string-prefix-p eimg-ocr--header-prefix text)
+           (hit (cl-find-if (lambda (prefix) (string-prefix-p prefix text))
+                            (list eimg-ocr--header-prefix
+                                  eimg-ocr--text-header-prefix)))
+           (body (if hit
                      (let ((newline (string-search "\n" text)))
                        (if newline (substring text (1+ newline)) ""))
                    text)))
@@ -413,19 +481,29 @@ buffer，否则每跑一次就漏一个 buffer，而且 `q' 关掉之后还能�
 ARGS 是产出这批结果的 CLI 参数（供 `eimg-ocr-rerun' 原样重跑），META 是 plist
 `:backend' / `:elapsed' / `:source'。调用时的**当前 buffer 即来源 buffer**，
 它被记进 `eimg-ocr--last-origin'，供 `eimg-ocr-insert' 回插。
+
+渲染风格由 `eimg-ocr-report-style' 决定，且**每次渲染现读**：
+`org' → `eimg-core-render-org'（带 `** 第 N 页'）、`text' →
+`eimg-core-render-text'（纯文本、页间换页符）。头行前缀随风格切换（见
+`eimg-ocr--header-prefix-for-style'），两条前缀都会被
+`eimg-ocr--collect-body' 剥掉，故改风格不影响复制 / 存盘 / 回插的结果形态。
+
 batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' 走的就是这条路，
 而 `display-buffer' 在没有窗口系统的批处理里没有意义、也不该成为失败点。"
   (let* ((source (plist-get meta :source))
          (backend (plist-get meta :backend))
          (elapsed (plist-get meta :elapsed))
+         (style eimg-ocr-report-style)
          (origin (current-buffer))
          (page-count (length pages))
-         (body (eimg-core-render-org pages))
+         (body (if (eq style 'text)
+                   (eimg-core-render-text pages)
+                 (eimg-core-render-org pages)))
          (buffer (get-buffer-create eimg-ocr-buffer-name)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (eimg-ocr--header-line source backend page-count elapsed) "\n")
+        (insert (eimg-ocr--header-line source backend page-count elapsed style) "\n")
         (insert body)
         (insert "\n")
         ;; 先写完文本再开 mode：`special-mode' 会把 buffer 置为只读，反序会 write error。
@@ -644,6 +722,23 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
             overrides (cddr overrides)))
     result))
 
+(defun eimg-ocr--config-defaults ()
+  "把 defcustom 的取值拼成配置 plist（`eimg-core-build-args' 的输入）。
+`eimg-ocr--run' 用它垫在 ARGS **之下**：ARGS 显式给出的键赢，没给的取这里。
+这就是「会话内覆盖（菜单 infix）> 用户配置（defcustom）> CLI 默认」这条链的
+中间两级；最后一级由 `eimg-core-build-args' 只输出非 nil 项来保证——值为 nil
+的键根本不会进 argv，CLI 才会用它的默认值。
+
+`:format' 恒为 \"json\"：结果 buffer 必须先拿到结构化输出才能分页渲染，它与
+`eimg-ocr-report-style' 无关（后者只管渲染阶段走 org 还是纯文本）。
+`:pdf-pages' 没有对应的 defcustom——页范围是**每次调用**才决定的东西，
+默认「全部页」恰好就是「不写这个选项」，故不需要一个可持久化的默认值。"
+  (list :backend eimg-ocr-backend
+        :lang eimg-ocr-lang
+        :format "json"
+        :dpi eimg-ocr-pdf-dpi
+        :python eimg-ocr-python))
+
 (defun eimg-ocr--config-source (config)
   "从配置 CONFIG 里取第一个输入文件路径；没有时返回 nil。
 `--run' 用它填结果头行的「来源」——头行写的是人看的来源，不是 argv 里的位置。"
@@ -690,6 +785,14 @@ sentinel 里 signal 会被 Emacs 打成 \"error in process sentinel\" 塞进 *Me
 ARGS 是**配置 plist**（`eimg-core-build-args' 的输入），不是 argv——argv 由本函数
 现拼，调用方不必关心选项顺序，也不必重复一遍「哪些 nil 项要跳过」的规则。
 
+**默认值链**：ARGS 显式给出的键 > `eimg-ocr--config-defaults' 里的 defcustom
+取值 > CLI 自己的默认（值为 nil 的键不进 argv）。因此 ARGS 只需写它关心的那几项，
+缺的项自动落到用户配置上；菜单 infix 走的就是「只覆盖我改过的那几项」。
+唯一例外是 `:format'：ARGS 里给了也会被忽略，argv 恒为 `--format json'——结果
+buffer 必须先拿到结构化输出才能分页渲染。
+拼好的完整配置（含默认值）会记进 `eimg-ocr--last-meta' 的 `:config'，供
+`eimg-ocr-rerun' 原样重跑。
+
 ON-SUCCESS 在结果 buffer 渲染完成后、于**来源 buffer 的上下文里**以 PAGES 调用
 一次（来源 buffer 已死时退化为当前 buffer）。
 ON-FAILURE 仅在失败态以拼好的错误文案调用一次（超时也算失败）。
@@ -705,8 +808,12 @@ ON-FAILURE 仅在失败态以拼好的错误文案调用一次（超时也算失
   解析失败  → `message' 说明「输出无法解析」，并把原始 stdout 前 500 字符存进
               `eimg-ocr-raw-buffer-name'；**不覆盖**已有结果 buffer。
 "
-  (let* ((argv (eimg-core-build-args args))
-         (source (eimg-ocr--config-source args))
+  (let* ((config (eimg-ocr--config-with
+                  (eimg-ocr--merge-config (eimg-ocr--config-defaults) args)
+                  ;; 强制 json：ARGS 里的 `:format' 一律忽略（见 docstring）。
+                  :format "json"))
+         (argv (eimg-core-build-args config))
+         (source (eimg-ocr--config-source config))
          (origin (current-buffer))
          (started (current-time)))
     (eimg-ocr--start
@@ -721,12 +828,14 @@ ON-FAILURE 仅在失败态以拼好的错误文案调用一次（超时也算失
                                        (current-buffer))
                   (eimg-ocr--show-result
                    pages argv
-                   (list :backend (plist-get args :backend)
+                   (list :backend (plist-get config :backend)
                          :source source
                          ;; 配置本身也记下来：`eimg-ocr-rerun' 要重跑就得有配置，
                          ;; argv 是从它推出来的，反过来推不回去（选项顺序固定，但
-                         ;; 无法区分「未指定」与「指定成默认值」）。
-                         :config args
+                         ;; 无法区分「未指定」与「指定成默认值」）。记**合并后**的
+                         ;; 完整配置：重跑要复现这次的结果，而不是复现调用方的原始
+                         ;; 入参（后者会随 defcustom 改动而改变行为）。
+                         :config config
                          :elapsed (float-time (time-subtract (current-time) started))))
                   (eimg-ocr--safe-call on-success pages)))
             (eimg-core-parse-error
@@ -767,8 +876,9 @@ ON-FAILURE 仅在失败态以拼好的错误文案调用一次（超时也算失
 
 (defun eimg-ocr-region (&optional args)
   "框选屏幕区域并识别，正文进 `kill-ring'；`C-u' 时同时插入当前 buffer。
-ARGS 是覆盖默认配置的 plist（供 T5d 的 transient infix 用，ARGS 优先），默认只强制
-`:format \"json\"'——结果 buffer 需要结构化输出才能分页渲染。
+ARGS 是覆盖默认配置的 plist（供 T5d 的 transient infix 用，ARGS 优先）；
+未给出的键落到 defcustom（`eimg-ocr--config-defaults'），`--run' 负责串这条链。
+本命令只补一个 `:file'。
 
 无图形环境直接 `user-error'：框选依赖屏幕坐标与图形化的选择器，在终端 / 批处理里
 不可能工作，硬跑到截图函数只会得到一句底层的、更难懂的报错。"
@@ -784,14 +894,12 @@ ARGS 是覆盖默认配置的 plist（供 T5d 的 transient infix 用，ARGS 优
          (path (eimg-ocr--capture capture)))
     (setq eimg-ocr--last-capture path)
     (eimg-ocr--run
-     (eimg-ocr--config-with
-      (eimg-ocr--merge-config (list :format "json") args)
-      :file path)
+     (eimg-ocr--config-with args :file path)
      (lambda (_pages) (eimg-ocr--deliver-body origin insert-p)))))
 
 (defun eimg-ocr-file (&optional args)
   "选一个图片或 PDF 文件做 OCR，结果进 `eimg-ocr-buffer-name'。
-ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先）。
+ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先，缺的键落 defcustom）。
 默认目录取 `eimg-ocr-images-dir'，未配置时用 `default-directory'。
 选择器用 `read-file-name' 而不是 `read-file-name' 之外的补全框架：本文件必须保持
 顶层零第三方依赖，且 shell 与 Dired 里 `default-directory' 天然就是用户期望的起点。"
@@ -806,9 +914,7 @@ ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先）。
       (user-error "不支持的输入文件：%s（只支持 %s）"
                   file (string-join eimg-ocr--image-extensions "/")))
     (eimg-ocr--run
-     (eimg-ocr--config-with
-      (eimg-ocr--merge-config (list :format "json") args)
-      :file file))))
+     (eimg-ocr--config-with args :file file))))
 
 (defun eimg-ocr--history-directory ()
   "返回历史截图的扫描目录；目录不存在时 `user-error'。
@@ -841,7 +947,7 @@ ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先）。
 
 (defun eimg-ocr-history (&optional args)
   "从最近的截图里挑一张做 OCR，结果进 `eimg-ocr-buffer-name'。
-ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先）。
+ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先，缺的键落 defcustom）。
 没有候选时 `user-error' 而不是 `completing-read' 一个空表：空表在部分补全框架下
 会静默返回空串，然后调用方拿着空文件名去起进程，报错点就飘到 CLI 那一侧了。"
   (interactive)
@@ -851,9 +957,7 @@ ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先）。
       (user-error "没有可用的历史截图：%s 下没有图片文件" directory))
     (let ((file (completing-read "历史截图: " files nil t)))
       (eimg-ocr--run
-       (eimg-ocr--config-with
-        (eimg-ocr--merge-config (list :format "json") args)
-        :file file)
+       (eimg-ocr--config-with args :file file)
        nil))))
 
 (define-derived-mode eimg-ocr-backends-mode special-mode "eimg-OCR 后端"
