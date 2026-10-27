@@ -64,7 +64,9 @@
   "截图函数；nil 表示按 `eimg-ocr--capture-function' 自动探测。
 截图能力本轮尚未迁移进 eimg，故运行期按 `eimg-capture' → `+thomas/screenshot'
 的顺序探测；迁移完成后把本值指向新函数（或让新函数占用 `eimg-capture' 这个名字），
-OCR 侧零改动。被指定的函数必须返回**截图文件的绝对路径**（返回 nil 视为失败）。"
+OCR 侧零改动。被指定的值必须是**交互命令**（`commandp`）：调用方走
+`call-interactively'，与用户手工按键执行的路径逐字一致——返回值契约是「命令执行
+完毕后的返回值即截图文件的绝对路径」，返回 nil / 非字符串 / 不可读路径都算失败。"
   :type '(choice (const :tag "自动探测" nil) function)
   :group 'eimg)
 
@@ -586,6 +588,33 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
       (user-error "%s" eimg-ocr--capture-missing-message))
     function))
 
+(defun eimg-ocr--capture (function)
+  "调用截图命令 FUNCTION，返回它产出的截图文件绝对路径。
+用 `call-interactively' 而不是 `funcall'：截图函数是**交互命令**，其对外契约是
+「命令执行完毕后的返回值就是文件路径」。实测（emacs -Q --batch，打桩
+`call-process' 与历史写入后 `(call-interactively '+thomas/screenshot)'）返回
+`string'、绝对路径、存在、与命令内部生成的路径逐字相同；成功分支的最后一个
+表达式就是 `file'。走 `call-interactively' 与用户手工执行是同一条路径，不会像
+`funcall' 那样漏掉 `(interactive ...)' 里做的参数准备。
+
+四类结果分三态报错，文案必须可区分（否则用户看不出是「命令没返回」还是
+「返回了但文件不在」）：
+  - 字符串且是**普通文件** → 原样返回
+  - 非字符串（含 nil）→ 「截图函数没有返回文件路径」
+  - 字符串但 `file-regular-p' 为 nil → 「截图函数返回的路径不可读: PATH」
+  - FUNCTION 自身 signal（含它主动报的 `user-error'，如用户按了取消、外部工具
+    没装）→ 包成「截图失败：<原始 message>」再抛 `user-error'：前缀统一让用户
+    一眼看出「是截图这一步挂了」，原文保留让原因（取消 / 未安装 / 权限）不被吞掉。"
+  (let ((path (condition-case err
+                  (call-interactively function)
+                (error (user-error "截图失败：%s" (error-message-string err))))))
+    (cond
+     ((not (stringp path))
+      (user-error "截图函数没有返回文件路径（返回 %s）" (type-of path)))
+     ((not (file-regular-p path))
+      (user-error "截图函数返回的路径不可读: %s" path))
+     (t path))))
+
 (defun eimg-ocr--supported-file-p (file)
   "FILE 的扩展名是否在 `eimg-ocr--image-extensions' 里。
 只比扩展名、不碰文件系统：调用方（选择 / 列举）已经拿到了候选路径，再问一次
@@ -750,12 +779,9 @@ ARGS 是覆盖默认配置的 plist（供 T5d 的 transient infix 用，ARGS 优
          (origin (current-buffer))
          (capture (or (eimg-ocr--capture-function)
                       (user-error "%s" eimg-ocr--capture-missing-message)))
-         (path (condition-case err
-                   (funcall capture)
-                 (error (user-error "截图失败：%s" (error-message-string err))))))
-    (unless (and (stringp path) (file-exists-p path))
-      (user-error "截图失败：截图函数没有返回可读的文件%s"
-                  (if (stringp path) (format "（%s）" path) "")))
+         ;; 取返回值、判可读、区分失败文案都在 `eimg-ocr--capture' 里：本命令只
+         ;; 负责「要一张图」这件事，截图函数长什么样与它无关。
+         (path (eimg-ocr--capture capture)))
     (setq eimg-ocr--last-capture path)
     (eimg-ocr--run
      (eimg-ocr--config-with

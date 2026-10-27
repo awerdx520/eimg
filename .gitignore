@@ -14,6 +14,10 @@ __pycache__/
 *.pyc
 .venv/
 
+# 测试临时目录：`make test' 把 TMPDIR 钉在这里（见 Makefile 的 TEST_TMPDIR），
+# 保证 `make-temp-file' 的产物不会漂到用户自己的仓库里。正常跑完即删，不入库。
+.tmp-test/
+
 # 编辑器与系统杂项。
 .dir-locals-2.el
 *~

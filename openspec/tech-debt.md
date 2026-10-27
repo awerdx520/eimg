@@ -38,3 +38,28 @@ rapidocr 需 onnxruntime + numpy + pillow，首轮依赖用户已有 venv 或 `-
 
 留作后续：要真正还原需做栏检测（按 x 投影切栏）与书写方向判定（竖排需按 y 优先、
 x 递减）；当前实现刻意只做最保守的一维聚类，宁可排错也不猜版面。
+
+## sentinel 状态判定不得依赖 event 文案（0b75ecc 引入、d128464 修复）
+`make-process` 的 sentinel 事件串对「因信号死亡」的描述取自 `strsignal`，会经 gettext
+翻译：本机 zh_CN 下 `delete-process` 给出的是「已杀死」、SIGINT 给出「中断」，按
+`"killed"` / `"interrupt"` 字面匹配永远不命中——取消与超时两条路径整个哑掉（回调不执行、
+状态不复位、`eimg-ocr--process` 一直停在被删的进程对象上，后续每次识别都报「已有任务」）。
+判据必须换成与文案无关的 `process-status`（`exit` / `signal`）+ `process-exit-status`
+（退出码），超时与用户取消再靠进程属性 `eimg-timeout` 区分。
+
+**风险形态是假绿**：英文 locale 下 `strsignal` 返回 "killed" / "interrupted"，同一份代码
+全绿；只有中文环境才暴露。因此这类缺陷不能靠「本地 `make test` 通过」证明不存在——
+新增任何依赖进程事件串的分支时，必须同时断言在非英文 locale 下的行为（或用
+`process-status` 这类语言无关来源）。
+
+## `+thomas/screenshot` 的返回值契约未经跨仓契约测试
+`eimg-ocr-region` 通过软依赖调用 thomas-emacs 的 `+thomas/screenshot`，靠它的**返回值**
+（成功分支最后一个表达式 `file`）拿截图路径。实测（`emacs -Q --batch` 打桩
+`call-process` + 历史写入后 `call-interactively`）确认当前返回绝对路径字符串，但这条契约
+只写在对方的 docstring 里，没有任何测试跨仓锁定：上游若把成功分支改成「先 `message`
+再返回 nil」或在末尾追加一句 `(force-mode-line-update)` 之类，返回值就变成非路径，而
+eimg 侧只会得到「截图函数没有返回文件路径」——功能静默退化，且改的是**另一个仓库**，
+本仓库的 ERT 看不见。
+
+迁移到 `eimg-capture` 之后，截图实现与 OCR 同仓，应把这条契约改成同仓 ERT 锁定
+（命令返回绝对路径 + 文件确实存在 + 走 `call-interactively` 路径），届时本条债务关闭。

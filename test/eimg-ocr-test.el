@@ -572,12 +572,14 @@ Emacs 会为同一进程在不同时机多次调用 sentinel：若没有守卫�
      ,@forms))
 
 (defmacro eimg-ocr-test--with-capture (captured &rest forms)
-  "在 FORMS 执行期间把截图探测替换成「返回 CAPTURED 路径的函数」。
+  "在 FORMS 执行期间把截图探测替换成「返回 CAPTURED 路径的**交互命令**」。
 被替换的是 `eimg-ocr--capture-function'（探测层），而不是 `eimg-ocr-region' 里
-的调用点——探测层的返回约定（返回函数）才是 `eimg-ocr-region' 真正依赖的东西。"
+的调用点——探测层的返回约定（返回函数）才是 `eimg-ocr-region' 真正依赖的东西。
+返回的函数必须带 `(interactive)'：`eimg-ocr--capture' 走 `call-interactively'，
+普通 lambda 会 `Not a command' 直接失败（不是用例想要的失败方式）。"
   (declare (indent 1))
   `(cl-letf (((symbol-function 'eimg-ocr--capture-function)
-              (lambda () (lambda () ,captured))))
+              (lambda () (lambda () (interactive) ,captured))))
      ,@forms))
 
 (defvar eimg-ocr-test--messages nil
@@ -874,6 +876,76 @@ batch 环境本身就是「无图形」的真实场景，这里再显式绑一�
       (should (string-match-p "后端列表已写入"
                               (car (last messages))))
       (should (null eimg-ocr--progress)))))
+
+;;;; ── 8. 截图函数返回值契约 ────────────────────────────────────────────
+
+;; 这一节锁定 `eimg-ocr--capture' 的**四态**：拿到路径 / 返回非字符串 /
+;; 返回不可读路径 / 命令自身 signal。为什么要单独成节：截图是软依赖（thomas-emacs
+;; 的 `+thomas/screenshot'），返回值契约没有任何跨仓测试兜住，一旦上游把成功分支的
+;; 最后一个表达式改掉，识别会静默退化成「什么也没发生」——这里把契约钉在 eimg 侧。
+
+(defun eimg-ocr-test--stub-capture (value)
+  "构造一个返回 VALUE 的**交互命令** lambda。
+用统一构造器而不是每处手写 lambda：`call-interactively' 的调用路径要求
+`commandp' 为真，漏写 `(interactive)' 只会得到一句 `Not a command'。"
+  (lambda () (interactive) value))
+
+(ert-deftest eimg-ocr-test-capture-uses-command-return-value ()
+  "截图命令返回合法路径 → `eimg-ocr--capture' 原样返回该路径。
+同时断言走的是 `call-interactively' 那条路径：stub 必须是 `commandp'，
+否则「用 `funcall' 也能过」会让本用例失去意义。"
+  (let ((file (make-temp-file "eimg-capture-cmd-" nil ".png")))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'eimg-ocr-test--stub-capture)
+                     (eimg-ocr-test--stub-capture file)))
+            (should (commandp 'eimg-ocr-test--stub-capture))
+            (should (equal file (eimg-ocr--capture 'eimg-ocr-test--stub-capture)))))
+      (ignore-errors (delete-file file)))))
+
+(ert-deftest eimg-ocr-test-capture-nil-return-errors ()
+  "截图命令返回 nil → `user-error'，文案指出「没有返回文件路径」。
+这条是上游契约被破坏时最先亮的那盏灯：命令跑完了、什么也没返回，若静默通过，
+用户会看到「OCR 正在识别」然后卡在一个不存在的文件上。"
+  (cl-letf (((symbol-function 'eimg-ocr-test--stub-capture)
+             (eimg-ocr-test--stub-capture nil)))
+    (let ((text (condition-case err
+                    (eimg-ocr--capture 'eimg-ocr-test--stub-capture)
+                  (user-error (error-message-string err)))))
+      (should (stringp text))
+      (should (string-match-p "没有返回文件路径" text))
+      ;; 必须与「路径不可读」区分开：两种失败的排障方向完全不同。
+      (should-not (string-match-p "不可读" text)))))
+
+(ert-deftest eimg-ocr-test-capture-unreadable-path-errors ()
+  "截图命令返回一个**不存在**的路径 → `user-error' 含「不可读」与该路径。
+刻意不建这个文件：`file-regular-p' 对「不存在」与「是目录」都返回 nil，两种都在
+本态覆盖范围内。"
+  (let ((missing (expand-file-name "eimg-capture-missing.png"
+                                   temporary-file-directory)))
+    (should-not (file-exists-p missing))
+    (cl-letf (((symbol-function 'eimg-ocr-test--stub-capture)
+               (eimg-ocr-test--stub-capture missing)))
+      (let ((text (condition-case err
+                      (eimg-ocr--capture 'eimg-ocr-test--stub-capture)
+                    (user-error (error-message-string err)))))
+        (should (stringp text))
+        (should (string-match-p "不可读" text))
+        ;; 报错必须带路径本身：只报「不可读」用户不知道去找哪个文件。
+        (should (string-match-p (regexp-quote missing) text))))))
+
+(ert-deftest eimg-ocr-test-capture-command-error-keeps-prefix ()
+  "截图命令自身 `user-error' → 外层仍是 `user-error'，文案形如「截图失败：<原文>」。
+前缀统一让用户一眼看出失败发生在「截图」这一步；原文必须保留，否则「用户按了
+取消」「外部工具没装」这类原因会被吞成一句无从下手的通用报错。"
+  (cl-letf (((symbol-function 'eimg-ocr-test--stub-capture)
+             (lambda () (interactive) (user-error "用户取消了截图"))))
+    (let ((text (condition-case err
+                    (eimg-ocr--capture 'eimg-ocr-test--stub-capture)
+                  (user-error (error-message-string err)))))
+      (should (stringp text))
+      (should (string-prefix-p "截图失败：" text))
+      (should (string-match-p "用户取消了截图" text)))))
 
 (provide 'eimg-ocr-test)
 

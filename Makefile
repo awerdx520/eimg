@@ -14,6 +14,17 @@ EL_FILES := $(shell find . -name '*.el' -not -path './.git/*' -not -path './.loc
 # 测试文件约定为 test/*-test.el；用 sort 保证加载顺序稳定（ERT 按加载顺序注册用例）。
 TEST_FILES := $(sort $(wildcard test/*-test.el))
 
+# 测试临时目录：**显式钉在仓库内**，不继承调用者的环境。
+#
+# 为什么必须显式设：ERT 用例里的 `make-temp-file' 用的是 Emacs 的
+# `temporary-file-directory'，而它直接取自环境变量 TMPDIR（未设时才是 /tmp/）。
+# 也就是说「测试产物落在哪」由跑测试的那个 shell 决定：一旦 TMPDIR 被指向
+# ~/thomas-emacs 这类用户仓库，`eimg-ocr-write-XXXX/out.org`、`eimg-ocr-stub-XXXX.sh`
+# 就会生成在别人的版本库里——跨仓污染，而且测试自己看不见（它只关心文件内容）。
+# 钉到 $(CURDIR)/.tmp-test 后，产物与仓库同生命周期，跑完（无论成败）即删；
+# 中途被 Ctrl-C 打断时留下的残留也在仓库内，`make clean` 一并清掉。
+TEST_TMPDIR := $(CURDIR)/.tmp-test
+
 .PHONY: all check-parens test py-check full-check clean
 
 all: full-check
@@ -34,12 +45,20 @@ check-parens:
 # L2：ERT。自动加载 test/ 下全部 *-test.el，交给 ert 自跑。
 # 为什么这里不检查 python：OCR 后端（bin/ 下的 Python 脚本）出问题不该让 elisp 测试
 # 整体变红，所以 python 检查单独成 py-check 目标，与 test 解耦。
+#
+# TMPDIR 必须显式指向 $(TEST_TMPDIR)（理由见文件头注释），且在**任何**退出路径上
+# 都删掉它：这里用 `rc=$$?' 捕获退出码再 `rm -rf'，等价于 unwind-protect——
+# 无论 ERT 全绿、有失败、还是 Emacs 自己崩掉，临时目录都不会残留。
 test:
 	@if [ -z "$(TEST_FILES)" ]; then \
 		echo "no test files"; \
 	else \
 		echo "test: $(TEST_FILES)"; \
-		$(EMACS) -Q --batch -L . -L test $(addprefix -l ,$(TEST_FILES)) -f ert-run-tests-batch-and-exit; \
+		mkdir -p "$(TEST_TMPDIR)"; \
+		TMPDIR="$(TEST_TMPDIR)" $(EMACS) -Q --batch -L . -L test $(addprefix -l ,$(TEST_FILES)) -f ert-run-tests-batch-and-exit; \
+		rc=$$?; \
+		rm -rf "$(TEST_TMPDIR)"; \
+		exit $$rc; \
 	fi
 
 # L1 补充：bin/ 下可执行 Python 脚本的语法检查（py_compile）。
@@ -68,8 +87,10 @@ py-check:
 # 完整检查只串 L1 + L2：py-check 与 elisp 骨架无因果关系，按需单独跑。
 full-check: check-parens test
 
-# 清理可再生产物：.elc / 原生编译缓存 / Python 字节码缓存。
+# 清理可再生产物：.elc / 原生编译缓存 / Python 字节码缓存 / 测试临时目录。
+# `.tmp-test' 是 `make test' 的 TMPDIR（见 `TEST_TMPDIR'）：正常跑完会自动删，
+# 这里兜住「中途被打断」的残留。
 clean:
-	rm -rf eln-cache .eln-cache
+	rm -rf eln-cache .eln-cache .tmp-test
 	find . -name '*.elc' -not -path './.git/*' -delete
 	find . -name '__pycache__' -type d -not -path './.git/*' -prune -exec rm -rf {} +
