@@ -71,6 +71,8 @@
 - **理由**：两仓并行推进时，OCR 不该被截图迁移阻塞；探测用 `fboundp` 而**不** require 宿主
   文件，否则 `emacs -Q` 下加载即失败。迁移完成后让新函数占用 `eimg-capture` 这个名字，
   OCR 侧零改动。菜单项**不因软依赖缺失而隐藏**——项留着、调用时报错，用户才知道缺什么。
+- **已被 D10 取代（2026-10-27）**：截图能力已迁入本仓，探测链只剩
+  「`eimg-ocr-capture-function` → `eimg-capture`」，菜单项改为直连本包命令。
 
 ## D6 配置链：ARGS > defcustom > CLI 默认（2026-10-27）
 
@@ -116,3 +118,29 @@
   惯例可减少一次凭据体系分支。代价是推送依赖 credential store（`credential.helper = store`）。
 - **不变**：D1 的附则一（不登记 `versions.lock.el`）与附则二（`:files` 排除 autoloads）继续
   有效，不受传输方式影响。
+
+## D10 截图能力迁移（2026-10-27）
+
+- **决策**：把截图链路整体迁入 eimg，切成四个模块——`eimg-capture.el`（采集：外部命令
+  调用、目标文件命名、历史读写）、`eimg-select.el`（选择：consult 多源候选、posframe
+  预览、尺寸换算）、`eimg-insert.el`（插入：四模式格式分派、选区当路径、内联显示）、
+  `eimg-embark.el`（embark 动作菜单）。宿主仓库只保留接线（straight recipe、键位、
+  三个配置项的 `setq`），不再持有实现。D5 的软依赖探测链随之取消：运行期只剩
+  「`eimg-ocr-capture-function` → `eimg-capture`」，一个都没有才 `user-error`。
+- **理由**：① 跨仓软依赖把契约写在对方 docstring 里，`make test` 看不到，上游改一行
+  成功分支的返回值，识别会静默退化成「什么也没发生」；② 四个模块的可执行代码约 87%
+  可原样搬移（只有命名与 `init-const` 常量引用要改），迁移成本远低于长期维护两份真相；
+  ③ 键位与历史文件路径保持零变化，用户感知不到迁移（迁移不做任何键位重排）。
+- **风险处置**：唯一有状态的是截图历史文件——若两套采集并存，同一张截图会被写进两份
+  历史、候选列表出现重复。故分两步并在**同一轮**完成：先建四模块但不接线（宿主仍是
+  唯一采集方，历史只写旧文件），确认模块自身测试全绿后原子切换（一次性改宿主接线 +
+  OCR 探测链），切换后只有 `eimg-capture` 会写历史。不做「双写兼容期」：双写本身就会
+  制造重复候选，而 eimg 与宿主读写的是同一个 plist 形态，切换不需要数据迁移。
+- **附则一**：包内**不提供** `+thomas/*` 兼容 alias（`+thomas/screenshot` /
+  `+thomas/insert-image-path` / `+thomas/insert-image-display` 一律不再可用）。理由是
+  alias 会让「迁移完成」变成永久半迁移状态，且 `+thomas/` 前缀在本仓是外来命名。
+  宿主的旧键位改指新命令即可，用户侧无需知道旧名。
+- **附则二**：embark 动作 category 由宿主命名改为 `eimg/image`，注册值仍是**已定义**的
+  keymap 符号（`eimg-image-map`），与 `eimg-select--read` 的 `:category` 逐字一致——
+  embark 对 `embark-keymap-alist` 的取值做 `symbol-value`，差一个字符就是按 `C-.` 时
+  `void-variable`。

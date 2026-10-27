@@ -9,8 +9,9 @@
 
 ## [0.1.0] - 2026-10-27
 
-首轮只交付 OCR：CLI、纯逻辑层、异步进程层、结果 buffer 与 transient 菜单。截图采集与图片
-插入仍在 thomas-emacs，eimg 通过软依赖调用，迁移见 `openspec/tech-debt.md`。
+首版交付两组能力：OCR（CLI、纯逻辑层、异步进程层、结果 buffer、transient 菜单）与截图链路
+（采集、选择预览、图片插入、embark 集成）。后者四个模块从宿主仓库迁入，eimg 内不再有跨仓
+软依赖，迁移决策见 `openspec/decisions.md` 的 D10。
 
 ### 新增
 
@@ -37,13 +38,34 @@
 - **`eimg-transient.el` 菜单 `eimg-menu`**：三组动作（采集 `s/o/h`、文件 `f/p/b`、
   系统 `?/r/d/S`）+ 三个会话内 infix（`-b` 后端 / `-l` 语言 / `-D` DPI）。
 - **`eimg.el`**：版本常量 `eimg-version` 与模块加载入口。
-- **ERT 用例 99 条**（`test/eimg-core-test.el` / `test/eimg-ocr-test.el` /
-  `test/eimg-transient-test.el`）+ fixtures（`test/fixtures/hello.png`、
-  `test/fixtures/three-pages.pdf`）。
+- **截图采集 `eimg-capture.el`**：`eimg-capture`（调外部截图工具，双条件判成功，
+  截图画 `shot-<YYYYMMDD-HHMMSS>.png` 且绝不覆盖）、`eimg-capture-open-directory`，
+  以及 plist 形态的截图历史（同一路径去重、按 `eimg-capture-history-size` LRU 截断、
+  每次 push 立即落盘、读取只 `read` 不 `eval` 并逐条结构校验）。
+- **选择预览 `eimg-select.el`**：consult 多源候选（截图历史 + 递归扫描
+  `eimg-select-item-roots`）、右侧标注、posframe child frame 预览与尺寸换算
+  （`eimg-select--preview-fit` 纯函数，超父 frame 上限时等比缩小而非静默裁剪）。
+- **图片插入 `eimg-insert.el`**：`eimg-insert-path`（插入链接，`C-u` 内联）/
+  `eimg-insert-display`（插入内联图片），四模式格式分派（裸路径 / org / markdown /
+  其他）、选区文本当路径解析与替换、`image-scaling-factor` 中和。
+- **embark 集成 `eimg-embark.el`**：completion category `eimg/image` 注册到
+  `embark-keymap-alist`，`C-.` 动作菜单含 `i` 插入链接 / `b` 插入内联图片 / 打开 /
+  删除 / 复制路径，multitarget 支持。
+- **ERT 用例 123 条**（`test/eimg-core-test.el` / `test/eimg-ocr-test.el` /
+  `test/eimg-transient-test.el` / `test/eimg-capture-test.el` /
+  `test/eimg-select-test.el` / `test/eimg-insert-test.el`）+ fixtures
+  （`test/fixtures/hello.png`、`test/fixtures/three-pages.pdf`）。
 
 ### 变更
 
-- 无（首个版本）。
+- **截图链路命名统一为 `eimg-` 前缀**：宿主仓库的 `+thomas/screenshot*` 迁入后变为
+  `eimg-capture*`，`+thomas/insert-image-path` / `+thomas/insert-image-display` 变为
+  `eimg-insert-path` / `eimg-insert-display`；embark 动作 category 由宿主命名改为
+  `eimg/image`。包内不提供 `+thomas/*` 兼容 alias（旧名一律不再可用）。
+- **跨仓软依赖改为同仓直连**：`eimg-ocr--capture-function` 的探测链简化为
+  「`eimg-ocr-capture-function` → `eimg-capture`」，删除对宿主截图命令的 `fboundp`
+  探测；transient 菜单的 `s` / `p` / `b` 直连 `eimg-capture` / `eimg-insert-path` /
+  `eimg-insert-display`，删掉两个转调桥接命令及其缺失文案函数。
 
 ### 修复
 

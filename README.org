@@ -4,27 +4,27 @@
 
 * eimg — 截图与 OCR 一体化工具包
 
-eimg 把「采集图像 → 识别文字 → 产出可用文本或链接」收成一个包。当前版本 *0.1.0* 只交付
-OCR 能力（CLI + 纯逻辑 + 异步进程层 + 结果 buffer + transient 菜单）；截图采集与图片插入
-仍在 thomas-emacs，eimg 通过 *软依赖* 调用，迁移计划见 [[file:openspec/tech-debt.md][技术债]]。
+eimg 把「采集图像 → 识别文字 → 产出可用文本或链接」收成一个包。当前版本 *0.1.0* 交付
+两组能力，都在本包内：截图链路（采集 / 选择预览 / 插入 / embark 集成，四个模块）与 OCR
+链路（CLI + 纯逻辑 + 异步进程层 + 结果 buffer + transient 菜单）。
 
 * 能力矩阵
 
-| 能力                                          | 状态                                     | 落地位置             |
-|-----------------------------------------------+------------------------------------------+----------------------|
-| CLI 多后端（rapidocr / tesseract / auto）     | 已有                                     | =bin/eimg-ocr=       |
-| PDF 栅格化与分页（ =--pdf-pages= / =--dpi= ） | 已有                                     | =bin/eimg-ocr=       |
-| 阅读顺序排序（单栏横排）                      | 已有                                     | =bin/eimg-ocr=       |
-| 后端安装与体检                                | 已有                                     | =bin/eimg-ocr-setup= |
-| 纯逻辑（参数拼装 / 退出码 / 解析 / 渲染）     | 已有                                     | =eimg-core.el=       |
-| 异步进程层与四态收尾                          | 已有                                     | =eimg-ocr.el=        |
-| 结果 buffer（复制 / 回插 / 存盘 / 重跑）      | 已有                                     | =eimg-ocr.el=        |
-| 三个入口命令（region / file / history）       | 已有                                     | =eimg-ocr.el=        |
-| transient 菜单 =eimg-menu=                    | 已有                                     | =eimg-transient.el=  |
-| 截图采集（ =eimg-capture= ）                  | 计划（当前软依赖 =+thomas/screenshot= ） | thomas-emacs         |
-| 选择预览（consult + posframe）                | 计划                                     | thomas-emacs         |
-| 图片插入（ =+thomas/insert-image-*= ）        | 计划（当前软依赖）                       | thomas-emacs         |
-| embark 集成                                   | 计划                                     | thomas-emacs         |
+| 能力                                          | 状态 | 落地位置             |
+|-----------------------------------------------+------+----------------------|
+| CLI 多后端（rapidocr / tesseract / auto）     | 已有 | =bin/eimg-ocr=       |
+| PDF 栅格化与分页（ =--pdf-pages= / =--dpi= ） | 已有 | =bin/eimg-ocr=       |
+| 阅读顺序排序（单栏横排）                      | 已有 | =bin/eimg-ocr=       |
+| 后端安装与体检                                | 已有 | =bin/eimg-ocr-setup= |
+| 纯逻辑（参数拼装 / 退出码 / 解析 / 渲染）     | 已有 | =eimg-core.el=       |
+| 异步进程层与四态收尾                          | 已有 | =eimg-ocr.el=        |
+| 结果 buffer（复制 / 回插 / 存盘 / 重跑）      | 已有 | =eimg-ocr.el=        |
+| 三个入口命令（region / file / history）       | 已有 | =eimg-ocr.el=        |
+| transient 菜单 =eimg-menu=                    | 已有 | =eimg-transient.el=  |
+| 截图采集（ =eimg-capture= ，写历史）          | 已有 | =eimg-capture.el=    |
+| 选择预览（consult + posframe）                | 已有 | =eimg-select.el=     |
+| 图片插入（ =eimg-insert-*= ，四模式）         | 已有 | =eimg-insert.el=     |
+| embark 集成（ =eimg/image= 动作菜单）         | 已有 | =eimg-embark.el=     |
 
 * 安装
 
@@ -59,13 +59,13 @@ OCR 能力（CLI + 纯逻辑 + 异步进程层 + 结果 buffer + transient 菜�
 =--tessdata-dir DIR= 覆盖默认解释器与语言数据目录。
 
 *=--tessdata= 装完即用，无需再配路径* ：语言数据落在 =~/.local/share/eimg/tessdata/=
-（遵循 =XDG_DATA_HOME= ），而 =bin/eimg-ocr= 在**没有**显式 =--tessdata-dir= 时会自动使用
+（遵循 =XDG_DATA_HOME= ），而 =bin/eimg-ocr= 在 **没有** 显式 =--tessdata-dir= 时会自动使用
 该目录（前提是里面已有 =*.traineddata= ），探测的 =reason= 里会注明
 =默认使用 eimg 安装目录: …= 。只有把语言数据放在别处才需要显式指向。
 
 *CA 证书报错的排错* ： =--tessdata= 下载时报
 =SSL: CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate= ，说明
-**解释器**的 CA 配置有问题（常见于 conda / 自编译 Python：编译期 cafile 路径不存在，且
+**解释器** 的 CA 配置有问题（常见于 conda / 自编译 Python：编译期 cafile 路径不存在，且
 不看 =SSL_CERT_FILE= ），系统信任库本身通常是好的（ =curl= 能通）。脚本已自动按顺序尝试
 =/etc/ssl/cert.pem= 、 =/etc/ssl/certs/ca-certificates.crt= 、
 =/etc/pki/tls/certs/ca-bundle.crt= 与已安装的 =certifi= ，全部不可用才回退解释器默认。
@@ -87,6 +87,97 @@ rapidocr 的解释器解析顺序（ =--python= 一旦给出就只用它，不�
 
 配置与数据目录： =~/.local/share/eimg/= （遵循 =XDG_DATA_HOME= ），内含 =config.json= 、
 =venv/= 、 =tessdata/= 。 =--check= 会逐项打印它们的现状。
+
+* 截图与图片插入
+
+截图链路是基础能力（OCR 的 =eimg-ocr-region= 也复用它），由四个模块组成：采集
+（ =eimg-capture.el= ）、选择预览（ =eimg-select.el= ）、插入（ =eimg-insert.el= ）、
+embark 集成（ =eimg-embark.el= ）。四者都在 =(require 'eimg)= 时加载，顶层零第三方依赖
+（consult / posframe / embark 一律在函数体内懒加载）。
+
+** 命令
+
+| 命令                          | 作用                                                        | 返回               |
+|-------------------------------+-------------------------------------------------------------+--------------------|
+| =eimg-capture=                | 调外部截图工具，存到截图目录并写历史，成功后 *只提示不插入* | 截图文件的绝对路径 |
+| =eimg-capture-open-directory= | 用 Dired 打开 =eimg-capture-directory=                      | —                 |
+| =eimg-insert-path=            | 插入图片链接； =C-u= 改为插入内联图片                       | —                 |
+| =eimg-insert-display=         | 把图片插入为内联显示（ =:max-width= / =:max-height= 夹住）  | —                 |
+
+采集与插入刻意分离：采集只负责「拿到一张图」，插入才决定「怎么放进当前文档」。
+=eimg-capture= 的成功判据是 *双条件* （退出码 0 且目标文件存在）；失败时删除半成品并
+=user-error= （带命令名与退出码），不写历史、不静默。
+
+=eimg-insert-path= / =eimg-insert-display= 的选区语义一致：活动选区文本能解析成图片路径
+就替换选区；解析失败则删选区并弹选择界面。仅当进入时处于 evil visual state 才在结束时回
+normal（normal / insert 下不切 state，避免打断输入）。
+
+** 配置项（8 个，分属三个模块）
+
+| 配置项                          | 默认值              | 所属    | 用途                                                    |
+|---------------------------------+---------------------+---------+---------------------------------------------------------|
+| =eimg-capture-directory=        | =nil=               | capture | 截图落盘目录； *未配置时 =user-error=* ，绝不猜目录     |
+| =eimg-capture-command=          | ="flameshot.exe"=   | capture | 截图程序名（在 =exec-path= 中查找）                     |
+| =eimg-capture-command-args=     | ='("gui" "--path")= | capture | 传给截图程序的参数，目标文件路径追加在末尾              |
+| =eimg-capture-history-size=     | =200=               | capture | 历史最大条目数，超出丢弃最旧                            |
+| =eimg-capture-history-file=     | =nil=               | capture | 历史文件绝对路径； *未配置时写入 =user-error=*          |
+| =eimg-select-item-roots=        | =nil=               | select  | 「全部图片」候选的递归扫描根目录（每次打开都全量扫描）  |
+| =eimg-select-preview-max-width= | =700=               | select  | 预览与内联插入的像素宽上限                              |
+| =eimg-insert-plain-path-modes=  | ='(eca-chat-mode)=  | insert  | 只插裸缩写路径（不包 org / markdown 链接）的 major-mode |
+
+注意 =eimg-capture-directory= 与 =eimg-ocr-images-dir= 是 *两个不同的变量* ：前者是截图
+落盘目录（ =eimg-capture= 写入位置），后者是 OCR 的图片目录（ =eimg-ocr-file= 的默认目录、
+=eimg-ocr-history= 的扫描目录）。典型配置让后者指向前者，但两者互不推断——只有一个被配置时
+另一个不会自动跟随。
+
+** 插入格式（四模式）
+
+| 场景                                                         | 插入形态                  |
+|--------------------------------------------------------------+---------------------------|
+| =eimg-insert-plain-path-modes= 家族（默认 =eca-chat-mode= ） | =~/pics/a.png= （裸路径） |
+| =org-mode=                                                   | =[[file:~/pics/a.png]]=   |
+| =markdown-mode=                                              | =![](file:~/pics/a.png)=  |
+| 其他 major-mode                                              | =~/pics/a.png= （裸路径） |
+
+判序是 *硬约束* ： =eimg-insert-plain-path-modes= 分支必须排在 =markdown-mode= 之前——
+=eca-chat-mode= 经 =gfm-mode= 两跳派生自 =markdown-mode= ，排在后面就永远命不中。路径一律
+=abbreviate-file-name= （图片与文档物理分离，且 =~/Org= 是符号链接，相对路径的基准随打开
+方式变化必有一端失效）。
+
+=eimg-insert-display= 的退化顺序：命中裸路径模式 → 只插路径文本并 =message= 提示；无图形能力
+（ =display-graphic-p= 为 nil）或图片类型不受支持 → 插链接并提示；其余情况插入带
+=:max-width= （ =eimg-select-preview-max-width= ）与 =:max-height= （窗口 body 高度的一半）
+的内联图片对象。
+
+** 历史文件
+
+=eimg-capture-history= 是 plist 列表，元素 =(:path <绝对路径> :time <时间字符串>)= ，最新在
+头部；每次 push 后 *立即落盘* （daemon 崩溃不丢记录）。push 的顺序固定：同一路径去重 →
+头插 → 按 =eimg-capture-history-size= 从尾部截断 → 写文件。
+
+落盘编码固定 =utf-8-unix= ，读入只用 =read= 不 =eval= （历史是数据，不得执行其中代码）。
+读取时逐条做结构校验（合法 = 列表 plist 且 = :path= 是字符串）：手工编辑、旧版本残留留下的
+=("a" "b")= 之类形态会被整份忽略并 =message= 提示，而不是让 =plist-get= 抛
+=wrong-type-argument= 。已在磁盘上消失的路径在取候选时过滤（历史保留、候选不含）。
+
+** embark 集成
+
+选择界面的候选 category 是 =eimg/image= ，注册在 =embark-keymap-alist= 上。在候选上按
+=C-.= 得到动作菜单：
+
+| 键          | 动作                                         |
+|-------------+----------------------------------------------|
+| =i=         | 插入图片链接（ =eimg-embark-insert-link= ）  |
+| =b=         | 插入内联图片（ =eimg-embark-insert-image= ） |
+| =RET= / =f= | 打开文件                                     |
+| =o=         | 在另一窗口打开                               |
+| =x=         | 外部程序打开                                 |
+| =d=         | 删除文件                                     |
+| =w=         | 复制路径                                     |
+
+=i= / =b= 是对 =embark-general-map= 同名键的显式覆盖（ =i= 原本是 =embark-insert= ），
+其余键继承自 =embark-general-map= 。整个注册在 =with-eval-after-load 'embark= 内，未装
+embark 时本模块仍能加载。multitarget（多选）时每个目标各插一次。
 
 * CLI 用法
 
@@ -135,7 +226,7 @@ bin/eimg-ocr --backend rapidocr \
 
 | 码  | 含义                                                                                           | stderr 关键子串         |
 |-----+------------------------------------------------------------------------------------------------+-------------------------|
-| =0= | 成功（含 =--list-backends= 的查询结果）                                                        | —                       |
+| =0= | 成功（含 =--list-backends= 的查询结果）                                                        | —                      |
 | =2= | 无可用 OCR 后端                                                                                | =未找到可用的 OCR 后端= |
 | =3= | 输入不可读 / 不存在 / 不支持格式 / 页码越界 / PDF 无法栅格化（缺 =pdftoppm= 、文件损坏或加密） | =无法读取输入=          |
 | =4= | 识别失败（含后端超时）                                                                         | =识别失败=              |
@@ -158,9 +249,6 @@ bin/eimg-ocr --backend rapidocr \
 | =eimg-ocr-list-backends=      | 列出后端可用性，输出进 =*eimg-ocr-backends*=             | 菜单 =?=                |
 | =eimg-ocr-cancel=             | 取消正在进行的任务（无任务只提示，不报错）               | 结果 buffer =k=         |
 | =eimg-menu=                   | transient 菜单（三组动作 + 三个会话内选项）              | =SPC i m t= / =C-c m m= |
-| =eimg-ocr-capture-command=    | 截图并识别（先探软依赖再委托 =eimg-ocr-region= ）        | 菜单 =s=                |
-| =eimg-ocr-insert-path=        | 插入图片链接（转调 =+thomas/insert-image-path= ）        | 菜单 =p=                |
-| =eimg-ocr-insert-display=     | 插入内联图片（转调 =+thomas/insert-image-display= ）     | 菜单 =b=                |
 | =eimg-ocr-show-result-buffer= | 切到最近一次的结果 buffer                                | 菜单 =r=                |
 | =eimg-ocr-open-directory=     | 用 Dired 打开 =eimg-ocr-images-dir=                      | 菜单 =d=                |
 | =eimg-ocr-setup-help=         | 展示安装指引（ *只展示，绝不执行* ）                     | 菜单 =S=                |
@@ -189,12 +277,12 @@ bin/eimg-ocr --backend rapidocr \
 | 识别选项 | =-b= | 后端（ =auto= / =rapidocr= / =tesseract= ），会话内覆盖 |
 |          | =-l= | 语言（ =chi_sim+eng= / =eng= ），会话内覆盖             |
 |          | =-D= | DPI（ =200= / =300= ），会话内覆盖                      |
-| 采集     | =s=  | 截图并识别                                              |
-|          | =o=  | 框选区域识别                                            |
+| 采集     | =s=  | 截图（ =eimg-capture= ：存盘 + 写历史，不识别）         |
+|          | =o=  | 截图并识别（框选区域）                                  |
 |          | =h=  | 历史截图识别                                            |
 | 文件     | =f=  | 选择文件识别                                            |
-|          | =p=  | 插入图片链接                                            |
-|          | =b=  | 插入内联图片                                            |
+|          | =p=  | 插入图片链接（ =eimg-insert-path= ）                    |
+|          | =b=  | 插入内联图片（ =eimg-insert-display= ）                 |
 | 系统     | =?=  | 列出后端                                                |
 |          | =r=  | 查看结果                                                |
 |          | =d=  | 打开截图目录                                            |
@@ -208,24 +296,37 @@ CLI 默认）。 =transient= 不随 =eimg.el= 加载：不按菜单的人不为�
 =--list-backends= 的原始输出，只读， =q= 关闭。与结果 buffer 分开：它没有「页」「正文」，
 混进 =*eimg-ocr*= 会让 =y= / =w= 对着一份列表工作。
 
-* 配置项（11 个 defcustom，全在 =eimg-ocr.el= ）
+* 配置项（19 个 defcustom：11 个在 =eimg-ocr.el= ，8 个在截图三模块）
 
-| 配置项                      | 默认值          | 用途                                                                           |
-|-----------------------------+-----------------+--------------------------------------------------------------------------------|
-| =eimg-ocr-cli-path=         | =nil=           | =bin/eimg-ocr= 绝对路径； =nil= 按 .el 位置反推（straight build 目录也能解开） |
-| =eimg-ocr-backend=          | ="auto"=        | 后端；落成 =--backend=                                                         |
-| =eimg-ocr-lang=             | ="chi_sim+eng"= | tesseract 语言；落成 =--lang=                                                  |
-| =eimg-ocr-pdf-dpi=          | =200=           | PDF 栅格化 DPI； =nil= 表示不写该选项                                          |
-| =eimg-ocr-python=           | =nil=           | rapidocr 解释器； =nil= 交给 CLI 探测                                          |
-| =eimg-ocr-tessdata-dir=     | =nil=           | tesseract 语言数据目录； =nil= 交给 CLI（含 eimg 安装目录兜底）                |
-| =eimg-ocr-timeout=          | =300=           | 单次 OCR 整体超时秒数（含全部分页）；超时按失败处理，伪退出码 124              |
-| =eimg-ocr-capture-function= | =nil=           | 截图函数（必须是交互命令）； =nil= 自动探测                                    |
-| =eimg-ocr-images-dir=       | =nil=           | 历史截图目录，也是 =eimg-ocr-file= 的默认目录                                  |
-| =eimg-ocr-history-size=     | =10=            | =eimg-ocr-history= 最多列出多少张（按修改时间降序）                            |
-| =eimg-ocr-report-style=     | ='org=          | 结果 buffer 风格： =org= （带 =** 第 N 页= ）/ =text= （纯文本、页间换页符）   |
+| 配置项                          | 默认值              | 用途                                                                           |
+|---------------------------------+---------------------+--------------------------------------------------------------------------------|
+| =eimg-ocr-cli-path=             | =nil=               | =bin/eimg-ocr= 绝对路径； =nil= 按 .el 位置反推（straight build 目录也能解开） |
+| =eimg-ocr-backend=              | ="auto"=            | 后端；落成 =--backend=                                                         |
+| =eimg-ocr-lang=                 | ="chi_sim+eng"=     | tesseract 语言；落成 =--lang=                                                  |
+| =eimg-ocr-pdf-dpi=              | =200=               | PDF 栅格化 DPI； =nil= 表示不写该选项                                          |
+| =eimg-ocr-python=               | =nil=               | rapidocr 解释器； =nil= 交给 CLI 探测                                          |
+| =eimg-ocr-tessdata-dir=         | =nil=               | tesseract 语言数据目录； =nil= 交给 CLI（含 eimg 安装目录兜底）                |
+| =eimg-ocr-timeout=              | =300=               | 单次 OCR 整体超时秒数（含全部分页）；超时按失败处理，伪退出码 124              |
+| =eimg-ocr-capture-function=     | =nil=               | 截图函数（必须是交互命令）； =nil= 探测 =eimg-capture=                         |
+| =eimg-ocr-images-dir=           | =nil=               | OCR 的图片目录： =eimg-ocr-file= 默认目录 + =eimg-ocr-history= 扫描目录        |
+| =eimg-ocr-history-size=         | =10=                | =eimg-ocr-history= 最多列出多少张（按修改时间降序）                            |
+| =eimg-ocr-report-style=         | ='org=              | 结果 buffer 风格： =org= （带 =** 第 N 页= ）/ =text= （纯文本、页间换页符）   |
+| =eimg-capture-directory=        | =nil=               | 截图落盘目录； *未配置时 =eimg-capture= 直接 =user-error=*                     |
+| =eimg-capture-command=          | ="flameshot.exe"=   | 截图程序名（在 =exec-path= 中查找）                                            |
+| =eimg-capture-command-args=     | ='("gui" "--path")= | 传给截图程序的参数，目标文件路径追加在末尾                                     |
+| =eimg-capture-history-size=     | =200=               | 截图历史最大条目数                                                             |
+| =eimg-capture-history-file=     | =nil=               | 截图历史文件； *未配置时写入 =user-error=*                                     |
+| =eimg-select-item-roots=        | =nil=               | 「全部图片」候选的递归扫描根目录（无缓存，每次打开全量扫描）                   |
+| =eimg-select-preview-max-width= | =700=               | 预览与内联插入的像素宽上限                                                     |
+| =eimg-insert-plain-path-modes=  | ='(eca-chat-mode)=  | 只插裸缩写路径的 major-mode 家族（必须排在 markdown 分支之前）                 |
 
-thomas-emacs 侧当前把它接到截图目录与默认后端上（ =eimg-ocr-images-dir= /
-=eimg-ocr-backend= / =eimg-ocr-lang= / =eimg-ocr-pdf-dpi= ）。
+=eimg-ocr-images-dir= 与 =eimg-capture-directory= 是 *两个独立变量* ：前者给 OCR 用
+（选文件 / 列历史），后者给截图用（落盘）。典型配置让两者指向同一目录，但代码不做互相推断。
+截图侧 8 项的详细说明见「截图与图片插入」章节。
+
+宿主仓库侧把它接到截图目录与默认后端上（ =eimg-ocr-images-dir= / =eimg-ocr-backend= /
+=eimg-ocr-lang= / =eimg-ocr-pdf-dpi= / =eimg-capture-directory= / =eimg-capture-history-file= /
+=eimg-select-item-roots= ）。
 
 * 已知边界
 
@@ -242,16 +343,21 @@ thomas-emacs 侧当前把它接到截图目录与默认后端上（ =eimg-ocr-im
   =call-interactively= 同步等外部截图进程， =eimg-ocr-file= / =eimg-ocr-history= 用
   =read-file-name= / =completing-read= ， =eimg-ocr-write-file= 覆盖前 =y-or-n-p=——这些
   提示在没有 attached frame 的 daemon 或 =noninteractive= 里无法完成。
-- *截图与插入是跨仓软依赖* ： =eimg-capture= → =+thomas/screenshot= 与
-  =+thomas/insert-image-path/display= 都在 thomas-emacs，契约只写在对方 docstring 里，
-  没有跨仓测试锁定。
+- *预览需要 GUI + posframe* ：选择界面的预览走 child frame（posframe）。缺图形能力、缺
+  posframe 或图片类型不受支持时一律 *降级* —— 只 =message= 或静默关闭预览，不向上抛错，
+  「挑图」本身照常可用。
+- *=eimg-capture= 同步等外部程序* ：内部用 =call-process= ，截图工具不返回就一直占住主线程
+  （与 OCR 的异步进程层不同）。截图工具的弹窗行为、退出码语义由它自己决定，eimg 只判
+  「退出码 0 且文件存在」这两条。
+- *=eimg-capture-directory= 未配置时 =user-error=* ：不猜目录、不静默写到 =default-directory= 。
+  =eimg-capture-history-file= 同理（丢记录必须是可见的失败）。
 
 * 开发与验证
 
 | 命令                | 内容                                                               |
 |---------------------+--------------------------------------------------------------------|
 | =make check-parens= | L1：逐文件 =check-parens= （每个文件一个 =emacs -Q --batch= 进程） |
-| =make test=         | L2：加载 =test/*-test.el= 跑 ERT（当前 99 条）                     |
+| =make test=         | L2：加载 =test/*-test.el= 跑 ERT（当前 123 条）                    |
 | =make py-check=     | =bin/= 下可执行 Python 脚本的 =py_compile= （无 python3 则跳过）   |
 | =make full-check=   | =check-parens= + =test= （不含 =py-check= ）                       |
 | =make clean=        | 清 =.elc= / 原生编译缓存 / =__pycache__= / 测试临时目录            |
@@ -268,9 +374,5 @@ thomas-emacs 侧当前把它接到截图目录与默认后端上（ =eimg-ocr-im
 - thomas-emacs 通过 straight =:local-repo "/home/thomas/Workspace/eimg"= + =:branch "main"=
   接入，不登记 =versions.lock.el= （ =:local-repo= 下 lock 无效）。
 - 版本号在 =eimg.el= 的 =eimg-version= 常量里，当前 =0.1.0= 。
-
-* 截图能力迁移待办
-
-截图采集、选择预览、图片插入、embark 集成仍在 thomas-emacs 的
-=site-lisp/thomas-screenshot.el= ；eimg 侧通过软依赖调用，迁移完成后删除原文件。详见
-[[file:openspec/tech-debt.md][openspec/tech-debt.md]] 的第一条。
+- 截图四模块（capture / select / insert / embark）已从宿主仓库迁入本仓，宿主侧只留接线；
+  迁移决策与取舍见 [[file:openspec/decisions.md][decisions D10]]。

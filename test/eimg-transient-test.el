@@ -7,8 +7,8 @@
 ;;; Commentary:
 
 ;; 覆盖 `eimg-menu' 的结构（三组十项 + 三 infix）、infix 取值到配置 plist 的解析、
-;; 「菜单取值经包装命令落到 argv」的完整链路、四个软依赖桥接命令的缺失路径，以及
-;; 安装指引「只展示不执行」这条硬约束。
+;; 「菜单取值经包装命令落到 argv」的完整链路、菜单项与命令的一一对应（含「不再有
+;; 跨仓桥接层」这条边界），以及安装指引「只展示不执行」这条硬约束。
 ;;
 ;; 四条硬约束：
 ;;   1. **绝不运行真实 `bin/eimg-ocr'**：所有会起进程的路径都用 `cl-letf' 把
@@ -118,12 +118,12 @@ suffix 读到的值走同一段代码（`transient-prefix-value' → `transient-
 `o' / `h' / `f' 指向 `eimg-menu-run-*' 薄包装：transient 用 `call-interactively'
 调 suffix，不会把 infix 取值当参数传，必须有一层把 `(eimg-ocr--menu-args)' 显式
 作为 ARGS 传进 OCR 命令。"
-  (let ((expected '(("s" . eimg-ocr-capture-command)
+  (let ((expected '(("s" . eimg-capture)
                     ("o" . eimg-menu-run-region)
                     ("h" . eimg-menu-run-history)
                     ("f" . eimg-menu-run-file)
-                    ("p" . eimg-ocr-insert-path)
-                    ("b" . eimg-ocr-insert-display)
+                    ("p" . eimg-insert-path)
+                    ("b" . eimg-insert-display)
                     ("?" . eimg-ocr-list-backends)
                     ("r" . eimg-ocr-show-result-buffer)
                     ("d" . eimg-ocr-open-directory)
@@ -271,51 +271,68 @@ nil 与 `()' 对 `plist-get' 等价，但对「用户有没有表达意图」不
     (when (get-buffer eimg-ocr-setup-buffer-name)
       (kill-buffer eimg-ocr-setup-buffer-name))))
 
-;;;; ── 4. 软依赖：缺失时可见、调用时 user-error ──────────────────────────
+;;;; ── 4. 菜单项直连本包命令（无跨仓桥接层） ────────────────────────────
 
-(ert-deftest eimg-transient-test-insert-path-soft-dependency-missing ()
-  "宿主没装 `+thomas/insert-image-path' 时 `eimg-ocr-insert-path' 抛 `user-error'，
-文案含「尚未迁移」。"
-  (eimg-transient-test--without-functions '(+thomas/insert-image-path)
-    (let ((error-data (should-error (eimg-ocr-insert-path) :type 'user-error)))
-      (should (string-match-p "尚未迁移" (error-message-string error-data)))
-      (should (string-match-p "insert-image-path" (error-message-string error-data))))))
+;; 这一节锁的是「菜单显示的键 → 真正执行的命令」这条一一对应关系，以及
+;; 「不再有跨仓桥接命令」这条边界。原来这里测的是「宿主命令缺失时的 `user-error'」
+;; 与「转调宿主命令」——截图四模块迁进本仓后，三个桥接命令（`eimg-ocr-` 前缀里带
+;; 插入 / 采集语义的那几个）整段删除，判据随之换成「菜单直连」与「桥接符号已消失」，
+;; 否则删掉实现而测试仍绿就等于没人看着。
 
-(ert-deftest eimg-transient-test-insert-display-soft-dependency-missing ()
-  "同上，`+thomas/insert-image-display' 缺失时同样抛 `user-error'。"
-  (eimg-transient-test--without-functions '(+thomas/insert-image-display)
-    (let ((error-data (should-error (eimg-ocr-insert-display) :type 'user-error)))
-      (should (string-match-p "尚未迁移" (error-message-string error-data)))
-      (should (string-match-p "insert-image-display" (error-message-string error-data))))))
+(ert-deftest eimg-transient-test-menu-p-binds-insert-path ()
+  "菜单 `p' 直接指向 `eimg-insert-path'，且该命令确实可用（`commandp'）。
+判据必须是「suffix 的 command 槽是哪个符号」而不是「按下去不报错」：桥接层存在
+时两者都能通过，只有前者能区分「直连」与「转调」。"
+  (let ((object (eimg-transient-test--suffix "p")))
+    (should object)
+    (should (eq 'eimg-insert-path (oref object command)))
+    (should (commandp (oref object command)))))
 
-(ert-deftest eimg-transient-test-insert-path-delegates ()
-  "宿主命令存在时转调它（`call-interactively'），本命令自己不实现插入逻辑。"
-  (let (called)
-    (unwind-protect
-        (progn
-          (fset '+thomas/insert-image-path (lambda () (interactive) (setq called t)))
-          (eimg-ocr-insert-path)
-          (should called))
-      (fmakunbound '+thomas/insert-image-path))))
+(ert-deftest eimg-transient-test-menu-b-binds-insert-display ()
+  "菜单 `b' 直接指向 `eimg-insert-display'，且该命令确实可用。"
+  (let ((object (eimg-transient-test--suffix "b")))
+    (should object)
+    (should (eq 'eimg-insert-display (oref object command)))
+    (should (commandp (oref object command)))))
 
-(ert-deftest eimg-transient-test-menu-keeps-items-without-soft-deps ()
-  "宿主能力全缺时菜单项仍在 layout 里（可见但调用报错），不被静默隐藏。"
-  (eimg-transient-test--without-functions
-      '(+thomas/insert-image-path +thomas/insert-image-display eimg-capture +thomas/screenshot)
-    (dolist (entry '(("s" . eimg-ocr-capture-command)
-                     ("p" . eimg-ocr-insert-path)
-                     ("b" . eimg-ocr-insert-display)))
-      (let ((object (eimg-transient-test--suffix (car entry))))
-        (should object)
-        (should (eq (cdr entry) (oref object command)))))))
+(ert-deftest eimg-transient-test-menu-s-binds-capture ()
+  "菜单 `s' 直接指向 `eimg-capture'（截图并写历史），不经任何包装。
+`eimg-capture' 与 `eimg-insert-path' / `eimg-insert-display' 都不接受 infix 参数
+（后端 / 语言 / DPI 与截图、插入无关），所以它们不需要 `eimg-menu-run-*' 那层
+ARGS 包装——少一层包装就少一处「文案分叉」的机会。"
+  (let ((object (eimg-transient-test--suffix "s")))
+    (should object)
+    (should (eq 'eimg-capture (oref object command)))
+    (should (commandp (oref object command)))))
 
-(ert-deftest eimg-transient-test-capture-command-missing-capture ()
-  "一个截图函数都没有时 `eimg-ocr-capture-command' 抛 `user-error'，
-文案含「未找到截图函数」。"
-  (let ((eimg-ocr-capture-function nil))
-    (eimg-transient-test--without-functions '(eimg-capture +thomas/screenshot)
-      (let ((error-data (should-error (eimg-ocr-capture-command) :type 'user-error)))
-        (should (string-match-p "未找到截图函数" (error-message-string error-data)))))))
+(ert-deftest eimg-transient-test-bridge-commands-removed ()
+  "跨仓桥接命令已不存在：`eimg-ocr-' 前缀里带插入语义或采集语义的符号一个都没有。
+
+判据走 `obarray' 扫描而不是逐个 `fboundp' 字面量，有两个理由：① 源码里不复述旧符号名
+（这样「桥接层是否已删」就只剩运行期事实可依，不靠 grep 之外的记性）；② 覆盖「换个名字
+把桥接层加回来」——按前缀 + 语义扫描，改叫 `eimg-ocr-insert-image` 也会被抓到。
+
+两条模式刻意收窄：`eimg-ocr-insert'（把 OCR 正文回插来源 buffer）是合法命令，故插入只
+匹配 `eimg-ocr-insert-' 前缀，不含它本身。"
+  (let (found)
+    (mapatoms
+     (lambda (symbol)
+       (let ((name (symbol-name symbol)))
+         (when (and (string-prefix-p "eimg-ocr-" name)
+                    (or (string-prefix-p "eimg-ocr-insert-" name)
+                        (string-suffix-p "capture-command" name)))
+           (push symbol found)))))
+    (should-not found)))
+
+(ert-deftest eimg-transient-test-menu-actions-all-commandp ()
+  "十个动作项指向的命令全部 `commandp'（infix 三项不在内）。
+比逐个断言 `fboundp' 更强：`commandp' 同时覆盖「函数存在」与「可 `call-interactively'」，
+漏一个 `(interactive)' 就会在按键时才炸。"
+  (dolist (key '("s" "o" "h" "f" "p" "b" "?" "r" "d" "S"))
+    (let* ((object (eimg-transient-test--suffix key))
+           (command (and object (oref object command))))
+      (should object)
+      (should (commandp command)))))
 
 ;;;; ── 5. 系统组命令 ──────────────────────────────────────────────────────
 

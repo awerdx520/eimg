@@ -23,24 +23,26 @@
 ;;      会变成「配置文件被改了」，而且退出 Emacs 后还在。优先级链的落地位置是
 ;;      `eimg-ocr--run'：`ARGS' > `eimg-ocr--config-defaults'（defcustom）> CLI 默认，
 ;;      因此菜单只需给出**改过的那几项**，其余键自动落到用户配置上。
-;;   3. **软依赖不影响菜单的可见性**：截图与插入能力仍在 thomas-emacs
-;;      （`eimg-capture' / `+thomas/screenshot' / `+thomas/insert-image-path' /
-;;      `+thomas/insert-image-display'）。缺失时**不隐藏菜单项**——项留着、调用时
-;;      `user-error' 说明「能力尚未迁移」，否则用户面对的是一个「少了几项的菜单」，
-;;      根本无从知道缺什么。
+;;   3. **菜单项全部直连本包命令**：截图（`eimg-capture'）与插入
+;;      （`eimg-insert-path' / `eimg-insert-display'）都已在本包内，菜单里不再有
+;;      「转调到别处、缺失时报错」的中间层——项指向哪个命令，按键就执行哪个命令，
+;;      不存在「菜单显示得出来、按下去才说能力缺失」的两套真相。
 ;;   4. **安装只在用户手里**：`eimg-ocr-setup-help' 只把指引写进 buffer，绝不执行
 ;;      任何安装命令（后端与语言数据动辄几百 MB、数分钟，必须由用户显式触发）。
 ;;
 ;; 键位（与计划 D8 一致）：
-;;   采集：`s' 截图并识别 / `o' 框选区域识别 / `h' 历史截图识别
+;;   采集：`s' 截图（写历史、返回路径）/ `o' 截图并识别 / `h' 历史截图识别
 ;;   文件：`f' 选择文件识别 / `p' 插入图片链接 / `b' 插入内联图片
 ;;   系统：`?' 列出后端 / `r' 查看结果 / `d' 打开截图目录 / `S' 安装指引
 ;;
-;; 两处需要说明的实现选择：
+;; 三处需要说明的实现选择：
 ;;   - `o' / `h' / `f' 绑的是 `eimg-menu-run-*' 薄包装（而非 `eimg-ocr-region' 等
 ;;     本体）：transient 调用 suffix 走 `call-interactively'，**不会**把 infix 取值
 ;;     当参数传进去，因此必须有一层把 `(eimg-ocr--menu-args)' 作为 ARGS 显式传入。
 ;;     OCR 命令本身保持与菜单无关（`&optional ARGS' 是唯一接口）。
+;;   - `s' / `p' / `b' 直接绑本包命令，不经任何包装：它们不接受 infix 参数
+;;     （截图工具与插入格式都与后端 / 语言 / DPI 无关），少一层包装就少一处
+;;     「文案分叉」的机会。
 ;;   - `?' 在 transient 自己的 `transient-map' 里是 `transient-help'，本菜单把它
 ;;     覆盖成「列出后端」（需求如此）。菜单内仍有 `C-h' 可查帮助。
 
@@ -51,6 +53,8 @@
 ;; 菜单本体依赖 `transient'：`transient-define-prefix' / `transient-define-argument'
 ;; 是宏，定义时必须已加载——这正是本文件被做成「按需加载」的原因（见 Commentary 1）。
 (require 'transient)
+(require 'eimg-capture)
+(require 'eimg-insert)
 (require 'eimg-ocr)
 
 ;;;; ── 1. 三个会话内 infix ────────────────────────────────────────────────
@@ -154,47 +158,7 @@ DPI 取不到正整数时原样返回字符串：宁可让 CLI 报参数错误�
   (interactive)
   (eimg-ocr-file (eimg-ocr--menu-args)))
 
-(defun eimg-ocr-capture-command ()
-  "截图并识别（采集组的 `s'）。
-截图能力是**软依赖**：`eimg-capture' → `+thomas/screenshot'（见
-`eimg-ocr--capture-function'），一个都没有时 `user-error' 说明「未找到截图函数」。
-
-先单独探一次软依赖、再委托 `eimg-ocr-region'：后者一进门就检查图形环境，
-在无 GUI 的场景里会先报「需要图形环境」，把「截图能力缺失」这个更根本的原因
-盖掉。两次探测都走同一个函数，文案不会分叉。"
-  (interactive)
-  (eimg-ocr--capture-function)
-  (eimg-ocr-region (eimg-ocr--menu-args)))
-
-;;;; ── 4. 软依赖桥接：图片插入 ────────────────────────────────────────────
-
-(defconst eimg-transient--insert-missing-template
-  "插入能力尚未迁移到 eimg：当前依赖 thomas-emacs 的 %s"
-  "插入类命令缺宿主函数时的统一文案。
-写成常量：两条命令一个字都不该差——用户看到的提示要能指向同一个东西（宿主侧
-的命令名），否则「为什么另一个键能插、这个键不行」就没法用同一句话解释。")
-
-(defun eimg-transient--host-command (symbol)
-  "返回宿主命令 SYMBOL；它没有定义时 `user-error'（文案见上一条常量）。
-只判 `fboundp'，不 require 任何宿主文件：本仓库必须能在 `emacs -Q' 里加载。"
-  (unless (fboundp symbol)
-    (user-error eimg-transient--insert-missing-template symbol))
-  symbol)
-
-(defun eimg-ocr-insert-path ()
-  "把图片链接插入当前 buffer。
-软依赖 `+thomas/insert-image-path'（选区解析、选择界面、链接格式都在它那儿），
-本命令只负责「转调 + 缺失时说清楚缺什么」。"
-  (interactive)
-  (call-interactively (eimg-transient--host-command '+thomas/insert-image-path)))
-
-(defun eimg-ocr-insert-display ()
-  "把图片以内联形态插入当前 buffer。
-软依赖 `+thomas/insert-image-display'，语义同 `eimg-ocr-insert-path'。"
-  (interactive)
-  (call-interactively (eimg-transient--host-command '+thomas/insert-image-display)))
-
-;;;; ── 5. 系统组：结果 / 目录 / 安装指引 ──────────────────────────────────
+;;;; ── 4. 系统组：结果 / 目录 / 安装指引 ──────────────────────────────────
 
 (defconst eimg-ocr-setup-buffer-name "*eimg-ocr-setup*"
   "安装指引 buffer 的名字。
@@ -284,7 +248,7 @@ DPI 取不到正整数时原样返回字符串：宁可让 CLI 报参数错误�
       (pop-to-buffer buffer))
     buffer))
 
-;;;; ── 6. 菜单本体 ────────────────────────────────────────────────────────
+;;;; ── 5. 菜单本体 ────────────────────────────────────────────────────────
 
 ;;; ── autoload：为什么写成显式 `(autoload …)' 而不用 cookie + 宏 ※
 
@@ -312,13 +276,13 @@ DPI 取不到正整数时原样返回字符串：宁可让 CLI 报参数错误�
    ("-l" eimg-menu--lang)
    ("-D" eimg-menu--dpi)]
   ["采集"
-   ("s" "截图并识别" eimg-ocr-capture-command)
-   ("o" "框选区域识别" eimg-menu-run-region)
+   ("s" "截图" eimg-capture)
+   ("o" "截图并识别" eimg-menu-run-region)
    ("h" "历史截图识别" eimg-menu-run-history)]
   ["文件"
    ("f" "选择文件识别" eimg-menu-run-file)
-   ("p" "插入图片链接" eimg-ocr-insert-path)
-   ("b" "插入内联图片" eimg-ocr-insert-display)]
+   ("p" "插入图片链接" eimg-insert-path)
+   ("b" "插入内联图片" eimg-insert-display)]
   ["系统"
    ("?" "列出后端" eimg-ocr-list-backends)
    ("r" "查看结果" eimg-ocr-show-result-buffer)

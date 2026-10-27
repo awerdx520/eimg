@@ -1,8 +1,12 @@
 # 技术债
 
-## 截图能力尚未迁移
+## 截图能力尚未迁移 [已解决 2026-10-27，见 decisions D10]
 截图采集、选择预览、插入、embark 集成仍在 thomas-emacs 的 `site-lisp/thomas-screenshot.el`；
 eimg 侧通过软依赖调用，计划迁移后删除原文件。
+
+> 已解决：四个模块已迁入本仓（`eimg-capture.el` / `eimg-select.el` / `eimg-insert.el` /
+> `eimg-embark.el`），跨仓软依赖与两个转调桥接命令一并删除。以上正文保留作为迁移前的
+> 现状记录。
 
 ## tesseract 语言数据需显式装一次（CLI 已默认使用 eimg 安装目录）
 系统 tesseract 5.5.3 默认只有 afr/osd；中英文需 `bin/eimg-ocr-setup --tessdata` 把 chi_sim+eng
@@ -68,7 +72,7 @@ x 递减）；当前实现刻意只做最保守的一维聚类，宁可排错也
 新增任何依赖进程事件串的分支时，必须同时断言在非英文 locale 下的行为（或用
 `process-status` 这类语言无关来源）。
 
-## `+thomas/screenshot` 的返回值契约未经跨仓契约测试
+## `+thomas/screenshot` 的返回值契约未经跨仓契约测试 [已解决 2026-10-27，见 decisions D10]
 `eimg-ocr-region` 通过软依赖调用 thomas-emacs 的 `+thomas/screenshot`，靠它的**返回值**
 （成功分支最后一个表达式 `file`）拿截图路径。实测（`emacs -Q --batch` 打桩
 `call-process` + 历史写入后 `call-interactively`）确认当前返回绝对路径字符串，但这条契约
@@ -80,6 +84,11 @@ eimg 侧只会得到「截图函数没有返回文件路径」——功能静默
 迁移到 `eimg-capture` 之后，截图实现与 OCR 同仓，应把这条契约改成同仓 ERT 锁定
 （命令返回绝对路径 + 文件确实存在 + 走 `call-interactively` 路径），届时本条债务关闭。
 
+> 已解决：契约现在由同仓的 `test/eimg-ocr-test.el` 第 8 节锁定——四态（合法路径 / nil /
+> 不可读 / 命令自身 signal）+「`eimg-ocr-capture-function` 为 nil 时探测到
+> `eimg-capture`」+「`eimg-ocr.el` 的可执行代码不出现宿主符号」。
+> `eimg-capture-test-no-host-symbols` 另行锁定四个模块的源码边界。
+
 ## 交互入口在 daemon / 批处理下会阻塞（异步只覆盖「识别」这一段）
 
 OCR 本身全异步（`eimg-ocr--start` 立即返回，收尾由 sentinel 完成），但**取输入**与
@@ -87,7 +96,7 @@ OCR 本身全异步（`eimg-ocr--start` 立即返回，收尾由 sentinel 完成
 
 | 位置 | 同步点 | 无 attached frame / `noninteractive` 时的表现 |
 |---|---|---|
-| `eimg-ocr-region` / `eimg-ocr-capture-command` | `call-interactively` 调截图命令（外部工具选区域） | 等外部进程；无图形环境时 `eimg-ocr-region` 已先 `user-error`，但 `display-graphic-p` 为真却无可用 frame 时仍会卡在这里 |
+| `eimg-ocr-region` | `call-interactively` 调截图命令（外部工具选区域） | 等外部进程；无图形环境时 `eimg-ocr-region` 已先 `user-error`，但 `display-graphic-p` 为真却无可用 frame 时仍会卡在这里 |
 | `eimg-ocr-file` | `read-file-name` | 无 minibuffer 可交互 → 阻塞或直接失败 |
 | `eimg-ocr-history` | `completing-read` | 同上 |
 | `eimg-ocr-write-file` | 覆盖前 `y-or-n-p` | 同上（ERT 用例里靠 `cl-letf` 打桩绕过，未覆盖真实 daemon 路径） |

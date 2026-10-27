@@ -631,9 +631,10 @@ batch 环境本身就是「无图形」的真实场景，这里再显式绑一�
   (should-not (eimg-ocr-busy-p)))
 
 (ert-deftest eimg-ocr-test-region-without-capture-errors ()
-  "一个截图函数都没有时 `eimg-ocr-region' `user-error'，文案给出迁移说明。
-替换探测函数使其返回 nil（模拟「既无 eimg-capture 也无 +thomas/screenshot」），
-命令自身必须兜住，而不是 `funcall nil' 抛出难懂的 void-function。"
+  "一个截图函数都没有时 `eimg-ocr-region' `user-error'，文案指向正确的补救路径。
+替换探测函数使其返回 nil（模拟「`eimg-capture' 未加载且未显式配置」），命令自身
+必须兜住，而不是 `funcall nil' 抛出难懂的 void-function。文案要给**本包的**两个
+出口（require 加载 / 自定义变量），不提任何外部仓库。"
   (eimg-ocr-test--reset)
   (cl-letf (((symbol-function 'eimg-ocr--capture-function) (lambda () nil)))
     (eimg-ocr-test--with-graphic
@@ -642,7 +643,7 @@ batch 环境本身就是「无图形」的真实场景，这里再显式绑一�
                       (eimg-ocr-region)
                     (user-error (error-message-string err)))))
         (should (string-match-p "未找到截图函数" text))
-        (should (string-match-p "thomas-emacs" text)))))
+        (should (string-match-p "eimg-ocr-capture-function" text)))))
   (should-not (eimg-ocr-busy-p)))
 
 (ert-deftest eimg-ocr-test-region-copies-body-to-kill-ring ()
@@ -885,9 +886,10 @@ batch 环境本身就是「无图形」的真实场景，这里再显式绑一�
 ;;;; ── 8. 截图函数返回值契约 ────────────────────────────────────────────
 
 ;; 这一节锁定 `eimg-ocr--capture' 的**四态**：拿到路径 / 返回非字符串 /
-;; 返回不可读路径 / 命令自身 signal。为什么要单独成节：截图是软依赖（thomas-emacs
-;; 的 `+thomas/screenshot'），返回值契约没有任何跨仓测试兜住，一旦上游把成功分支的
-;; 最后一个表达式改掉，识别会静默退化成「什么也没发生」——这里把契约钉在 eimg 侧。
+;; 返回不可读路径 / 命令自身 signal。为什么要单独成节：截图与 OCR 现在是同仓的
+;; 两个模块，`eimg-ocr--capture' 的契约靠这一节钉住——一旦 `eimg-capture' 成功分支的
+;; 最后一个表达式被改掉，识别会静默退化成「什么也没发生」，而那时既没有报错也没有
+;; 结果，只能靠人回头翻代码。
 
 (defun eimg-ocr-test--stub-capture (value)
   "构造一个返回 VALUE 的**交互命令** lambda。
@@ -951,6 +953,53 @@ batch 环境本身就是「无图形」的真实场景，这里再显式绑一�
       (should (stringp text))
       (should (string-prefix-p "截图失败：" text))
       (should (string-match-p "用户取消了截图" text)))))
+
+(ert-deftest eimg-ocr-test-capture-function-defaults-to-eimg-capture ()
+  "`eimg-ocr-capture-function' 为 nil 时探测链落到 `eimg-capture'。
+打桩的是 `eimg-capture' 的 **symbol-function**（而不是只让它 `fboundp'）：这样
+一次覆盖「探测到哪个符号」与「调用它真能拿到路径」两件事，避免只测到一半——
+只断言返回符号名的话，探测到 `eimg-capture' 但调用路径不通仍会绿。
+
+保存 / 恢复原定义而不是直接用 `cl-letf'：本测试进程只 `(require 'eimg-ocr)'，
+`eimg-capture' 通常未定义，`cl-letf' 恢复时会把符号留成「fbound 但函数为 nil」，
+后续用例的探测会命中一个空函数而报出与本用例无关的错误。"
+  (let ((file (make-temp-file "eimg-capture-default-" nil ".png"))
+        (eimg-ocr-capture-function nil)
+        (original (and (fboundp 'eimg-capture) (symbol-function 'eimg-capture))))
+    (unwind-protect
+        (progn
+          (fset 'eimg-capture (lambda () (interactive) file))
+          (should (eq 'eimg-capture (eimg-ocr--capture-function)))
+          (should (equal file
+                         (eimg-ocr--capture (eimg-ocr--capture-function)))))
+      (if original
+          (fset 'eimg-capture original)
+        (fmakunbound 'eimg-capture))
+      (ignore-errors (delete-file file)))))
+
+(ert-deftest eimg-ocr-test-capture-contract-uses-eimg-capture ()
+  "`eimg-ocr.el' 的**可执行代码**只认 `eimg-capture'，不出现宿主仓库符号。
+扫描前剔除整行注释（`^[ \\t]*;;'）：作者行与「为什么不再依赖外部实现」这类说明
+允许存在，判据只针对会被求值的 form——`fboundp' / `require' / 符号引用，它们
+一旦指向不存在的库就是运行期 `void-function'，而 `make test' 只加载本仓库文件，
+根本看不到那个错误。
+
+`case-fold-search' 置 nil：与验收用的 `grep -c \"thomas\"' 同语义，避免在大小写
+不敏感匹配下把 `Thomas' 这类变体放过。"
+  (let* ((file (expand-file-name
+                "eimg-ocr.el"
+                (file-name-directory
+                 (file-truename (locate-library "eimg-ocr")))))
+         (raw (with-temp-buffer
+                (insert-file-contents file)
+                (buffer-string)))
+         (code (replace-regexp-in-string "^[ \t]*;;.*$" "" raw)))
+    ;; 扫描本身要有效：取不到源码时下面两条断言会「因为没锚点」而失败，
+    ;; 但失败信息说不清原因，故先断一次非空。
+    (should (> (length code) 1000))
+    (should (string-match-p "eimg-capture" code))
+    (let ((case-fold-search nil))
+      (should-not (string-match-p "thomas" code)))))
 
 ;;;; ── 9. 配置项（defcustom）与参数拼装链 ────────────────────────────────
 

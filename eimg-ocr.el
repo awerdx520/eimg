@@ -102,11 +102,11 @@
 
 (defcustom eimg-ocr-capture-function nil
   "截图函数；nil 表示按 `eimg-ocr--capture-function' 自动探测。
-截图能力本轮尚未迁移进 eimg，故运行期按 `eimg-capture' → `+thomas/screenshot'
-的顺序探测；迁移完成后把本值指向新函数（或让新函数占用 `eimg-capture' 这个名字），
-OCR 侧零改动。被指定的值必须是**交互命令**（`commandp`）：调用方走
-`call-interactively'，与用户手工按键执行的路径逐字一致——返回值契约是「命令执行
-完毕后的返回值即截图文件的绝对路径」，返回 nil / 非字符串 / 不可读路径都算失败。"
+截图能力由本包提供，故 nil 时探测链只有 `eimg-capture' 一环（`(require 'eimg)'
+后必然可用）；把本值指向别的函数即可替换默认采集实现。被指定的值必须是
+**交互命令**（`commandp`）：调用方走 `call-interactively'，与用户手工按键执行的
+路径逐字一致——返回值契约是「命令执行完毕后的返回值即截图文件的绝对路径」，
+返回 nil / 非字符串 / 不可读路径都算失败。"
   :type '(choice (const :tag "自动探测" nil) function)
   :group 'eimg)
 
@@ -634,8 +634,10 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
 ;; 两条约束贯穿本节：
 ;;   1. **命令立即返回**：`eimg-ocr--run' 只启动进程就返回，识别十几秒也不阻塞
 ;;      主线程；一切后续动作都在 sentinel 里做。
-;;   2. **截图是软依赖**：截图能力本轮尚未迁移进 eimg，故一个截图函数都没有时
-;;      明确 `user-error' 并把用户指回 thomas-emacs，而不是抛「void-function」。
+;;   2. **截图走同仓实现**：`eimg-capture' 由本包提供（`(require 'eimg)' 后必
+;;      存在）；只有在用户把 `eimg-ocr-capture-function' 指到未定义符号、或该
+;;      命令未被加载时才由 `eimg-ocr--capture-function' 明确 `user-error'，
+;;      而不是抛底层难懂的「void-function」。
 
 (defconst eimg-ocr-raw-buffer-name "*eimg-ocr-raw*"
   "解析失败时保存 CLI 原始 stdout 的 buffer 名。
@@ -653,7 +655,7 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
 这些针对识别结果的键位对着一份列表工作。")
 
 (defconst eimg-ocr--capture-missing-message
-  "未找到截图函数：截图能力尚未迁移到 eimg，暂时依赖 thomas-emacs 的 +thomas/screenshot"
+  "未找到截图函数：请确认 `eimg-capture' 已加载（(require 'eimg)）或自定义 `eimg-ocr-capture-function'"
   "一个截图函数都没有时的统一文案。
 写成常量而不是两处各写一遍：探测函数（`eimg-ocr--capture-function'）与命令入口
 （`eimg-ocr-region'，当探测被替换成返回 nil 时）都要给出同一句提示。")
@@ -665,13 +667,12 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
 
 (defun eimg-ocr--capture-function ()
   "返回当前可用的截图函数符号；一个都没有时 `user-error'。
-探测顺序：`eimg-ocr-capture-function'（显式指定）→ `eimg-capture' →
-`+thomas/screenshot'。后两者用 `fboundp' 判，不 require 任何宿主包——本文件必须
-能在 `emacs -Q' 里加载，把宿主配置的文件名写进 require 会直接断掉 `make test'。
+探测顺序：`eimg-ocr-capture-function'（显式指定）→ `eimg-capture'（本包的采集
+命令，`(require 'eimg)' 后必然可用）。两者都用 `fboundp' 判，不 require 任何库
+——本文件必须能在 `emacs -Q' 里加载。
 临时把本函数替换成返回 nil 是测试用的注入点（`eimg-ocr-region' 会因此失败）。"
   (let ((function (or eimg-ocr-capture-function
-                      (and (fboundp 'eimg-capture) 'eimg-capture)
-                      (and (fboundp '+thomas/screenshot) '+thomas/screenshot))))
+                      (and (fboundp 'eimg-capture) 'eimg-capture))))
     (unless function
       (user-error "%s" eimg-ocr--capture-missing-message))
     function))
@@ -680,7 +681,7 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
   "调用截图命令 FUNCTION，返回它产出的截图文件绝对路径。
 用 `call-interactively' 而不是 `funcall'：截图函数是**交互命令**，其对外契约是
 「命令执行完毕后的返回值就是文件路径」。实测（emacs -Q --batch，打桩
-`call-process' 与历史写入后 `(call-interactively '+thomas/screenshot)'）返回
+`call-process' 与历史写入后 `(call-interactively 'eimg-capture)'）返回
 `string'、绝对路径、存在、与命令内部生成的路径逐字相同；成功分支的最后一个
 表达式就是 `file'。走 `call-interactively' 与用户手工执行是同一条路径，不会像
 `funcall' 那样漏掉 `(interactive ...)' 里做的参数准备。
