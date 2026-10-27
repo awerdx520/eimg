@@ -1,0 +1,91 @@
+#+title: eimg
+#+author: thomas
+#+startup: overview
+
+* eimg — 截图与 OCR 一体化工具包
+
+状态： *0.1.0 开发中* （首轮：OCR；截图能力迁移在后续计划）
+
+本仓库目前只有骨架（版本常量 + 构建入口 + openspec 工件），业务实现由后续任务补齐。
+下文的能力清单、CLI 参数与键位均为 *计划中的契约* ，尚未落地。
+
+* 能力清单
+
+| 已有（0.1.0 已落地）   | 计划（尚未实现）                                          |
+|------------------------+-----------------------------------------------------------|
+| 开发中（骨架期无功能） | 统一 CLI 契约 =bin/eimg-ocr= （参数、退出码、JSON 输出）  |
+| 开发中                 | 多后端：rapidocr / tesseract， =auto= 按可用性探测        |
+| 开发中                 | Emacs OCR 闭环：框选截图 → 识别 → 结果 buffer → 插入/复制 |
+| 开发中                 | transient 菜单 =eimg-menu= （采集 / 文件 / 系统三组）     |
+
+* 安装
+
+本轮尚未提供安装脚本；以下是计划中的入口， *首次安装需显式运行，配置不会自动安装*
+（ =init= 与任何 hook 不下载、不安装任何东西）：
+
+| 命令                                     | 用途                                             |
+|------------------------------------------+--------------------------------------------------|
+| =bin/eimg-ocr-setup --check=             | 只读体检：报告后端可用性、缺什么、装到哪         |
+| =bin/eimg-ocr-setup --reuse-pdf-toc-ocr= | 复用 pdf-toc-ocr 已有的 venv（含 rapidocr 依赖） |
+| =bin/eimg-ocr-setup --rapidocr=          | 新建 venv 并安装 rapidocr（onnxruntime 等）      |
+| =bin/eimg-ocr-setup --tessdata=          | 补齐 tesseract 的 chi_sim + eng 语言数据         |
+
+* 用法（CLI 契约占位）
+
+| 参数              | 取值（计划）                      | 说明                               |
+|-------------------+-----------------------------------+------------------------------------|
+| =--backend=       | =auto= / =rapidocr= / =tesseract= | 后端选择； =auto= 按可用性探测     |
+| =--lang=          | 如 =chi_sim+eng=                  | 识别语言（tesseract 语法）         |
+| =--format=        | =text= / =org= / =json=           | 输出形态； =org= 供 Emacs 直接插入 |
+| =--pdf-pages=     | 如 =1-5=                          | PDF 只识别指定页（渲染后 OCR）     |
+| =--dpi=           | 整数，如 =300=                    | PDF 渲染精度，影响速度与准确率     |
+| =--list-backends= | （无值）                          | 列出后端及可用状态后退出           |
+
+退出码（计划）： =0= 成功 / =2= 参数错误 / =3= 后端不可用 / =4= 识别失败 / =5= 输入不可读。
+
+* Emacs 键位（占位，尚未绑定）
+
+| 键位        | 计划命令           | 作用                    |
+|-------------+--------------------+-------------------------|
+| =SPC i m o= | =eimg-ocr-capture= | 框选截图并 OCR          |
+| =SPC i m O= | =eimg-ocr-file=    | 选图片文件 OCR          |
+| =SPC i m t= | =eimg-ocr-pdf=     | PDF 逐页 OCR            |
+| =C-c m o=   | =eimg-ocr-capture= | 同上，insert state 直达 |
+| =C-c m f=   | =eimg-ocr-file=    | 同上，insert state 直达 |
+| =C-c m m=   | =eimg-menu=        | transient 菜单入口      |
+
+* 目录结构
+
+#+begin_example
+eimg/
+├── README.org
+├── LICENSE
+├── .gitignore
+├── Makefile
+├── eimg.el
+├── bin/                 (OCR CLI 与安装脚本，待实现)
+├── test/                (ERT 用例，待实现)
+└── openspec/
+    ├── active/          (进行中的计划)
+    ├── completed/       (已归档计划)
+    ├── decisions.md     (决策日志)
+    └── tech-debt.md     (技术债)
+#+end_example
+
+* 验证入口
+
+| 命令                | 内容                                               |
+|---------------------+----------------------------------------------------|
+| =make check-parens= | L1：逐文件 =check-parens= （ =emacs -Q --batch= ） |
+| =make test=         | L2：加载 =test/*-test.el= 并跑 ERT                 |
+| =make py-check=     | =bin/ 下可执行 Python 脚本的 =py_compile=          |
+| =make full-check=   | =check-parens= + =test= （不含 =py-check= ）       |
+
+* 已知边界
+
+- *tesseract* 需自行补语言数据：系统默认只有 =afr= / =osd= ，中英文要跑 =bin/eimg-ocr-setup --tessdata= 。
+- *rapidocr* 需 Python 环境（onnxruntime + numpy + pillow）：首轮复用已有 venv，或用 =--rapidocr= 新建。
+
+* 远端
+
+远端仓库 =git@github.com:awerdx520/eimg.git= 尚未创建，本轮仅本地 =git init= （remote 后置）。
