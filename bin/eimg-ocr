@@ -602,6 +602,82 @@ def make_page(number: int, blocks=None, source: str | None = None) -> dict:
     return page
 
 
+def sort_reading_order(blocks: list[dict]) -> list[dict]:
+    """把 blocks 排成阅读顺序：先行聚类（按 y 中心 + 行高容差），行内按 x0 升序。
+
+    为什么不能只按 `box[1]`（上沿）排：同一视觉行里的两块高度往往不同——实测
+    `test/fixtures/hello.png` 的「世界」y0=136、「Hello」y0=148（左块上沿更低），
+    只按上沿排会把同一行拆成两行、并把左右顺序排反。只有先按 **y 中心**把块
+    聚成行、行内再按 x0 排，才与人的阅读顺序一致。
+
+    容差取「所有块高度的中位数」的一半：中位数对个别超大块（整段贴图 / 竖排
+    标题）不敏感，比均值稳；而固定像素容差一换 dpi 就失效。
+
+    全部比较都是**稳定**排序（`sorted` 稳定 + 键只含一个维度），同键保持原序。
+    无坐标的块（`box` 缺失 / 长度不足 4 / 全为 0）不参与聚类：它们排在**最后**
+    且保持原序；若一页里没有任何带坐标的块（某些后端的 `recognize_region` 会给
+    `[0, 0, 0, 0]`），整页原样返回——没有坐标时任何排序都只是瞎猜。
+    """
+    items = list(blocks or [])
+    if len(items) < 2:
+        return items
+
+    positioned: list[tuple[dict, list[float]]] = []
+    unpositioned: list[dict] = []
+    for block in items:
+        box = block.get("box") if isinstance(block, dict) else None
+        coords: list[float] | None = None
+        if isinstance(box, (list, tuple)) and len(box) >= 4:
+            try:
+                coords = [float(value) for value in box[:4]]
+            except (TypeError, ValueError):
+                coords = None
+        # 全 0 的框与缺失等价：都定不了序，走同一条退化路径。
+        if coords is None or not any(coords):
+            unpositioned.append(block)
+            continue
+        positioned.append((block, coords))
+
+    if not positioned:
+        return items
+
+    heights = sorted(coords[3] - coords[1] for _, coords in positioned)
+    middle = len(heights) // 2
+    if len(heights) % 2:
+        median_height = heights[middle]
+    else:
+        median_height = (heights[middle - 1] + heights[middle]) / 2.0
+    tolerance = 0.5 * median_height
+
+    # 按 y 中心升序扫描；y 中心相同时靠稳定排序保持后端原序。
+    ordered = sorted(positioned, key=lambda entry: (entry[1][1] + entry[1][3]) / 2.0)
+
+    # 贪心聚类：与「当前行的 y 区间中心」相差不超过半个中位行高即归入当前行，
+    # 并把这行的 y 区间扩到已并入块的并集（行高参考随内容自适应）。
+    rows: list[dict] = []
+    for block, coords in ordered:
+        y_center = (coords[1] + coords[3]) / 2.0
+        if rows:
+            row = rows[-1]
+            row_center = (row["top"] + row["bottom"]) / 2.0
+            if abs(y_center - row_center) <= tolerance:
+                row["top"] = min(row["top"], coords[1])
+                row["bottom"] = max(row["bottom"], coords[3])
+                row["items"].append((coords[0], block))
+                continue
+        rows.append(
+            {"top": coords[1], "bottom": coords[3], "items": [(coords[0], block)]}
+        )
+
+    rows.sort(key=lambda row: row["top"])
+    result: list[dict] = []
+    for row in rows:
+        for _, block in sorted(row["items"], key=lambda item: item[0]):
+            result.append(block)
+    result.extend(unpositioned)
+    return result
+
+
 def page_text(page: dict) -> str:
     """单页纯文本：块之间换行。"""
     return "\n".join(
@@ -1228,23 +1304,26 @@ def rasterize_pdf(
 
 
 def recognize_image(path: Path, backend: dict, args) -> list[dict]:
-    """识别单张图片，返回 blocks 列表（不含页码包装）。"""
+    """识别单张图片，返回 blocks 列表（不含页码包装，**已按阅读顺序排好**）。"""
     kind = TYPE_DESCRIPTIONS.get(path.suffix.lower().lstrip("."), "文件")
     name = backend.get("name")
 
     if name == "rapidocr":
         # rapidocr 可用时 reason 就是「能 import rapidocr 的解释器路径」：探测阶段
         # 已确认它存在且可执行，这里直接拿来起子进程。
-        return run_rapidocr(path, backend.get("reason") or "")
-
-    if name == "tesseract":
-        return run_tesseract(
+        blocks = run_rapidocr(path, backend.get("reason") or "")
+    elif name == "tesseract":
+        blocks = run_tesseract(
             path,
             args.lang,
             tessdata_dir=getattr(args, "tessdata_dir", None),
         )
+    else:
+        raise fail(EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；未知后端 {name}）")
 
-    raise fail(EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；未知后端 {name}）")
+    # 后端的输出顺序是模型自己的顺序、不是阅读顺序（实测 rapidocr 对 hello.png
+    # 把右边的「世界」排在了「Hello」前面），统一在这里归一。
+    return sort_reading_order(blocks)
 
 
 def recognize_pdf(path: Path, backend: dict, args) -> list[dict]:
@@ -1280,7 +1359,10 @@ def recognize_pdf(path: Path, backend: dict, args) -> list[dict]:
     try:
         rasterized = rasterize_pdf(path, dpi, requested, workdir, total)
         pages = [
-            make_page(number, recognize_image(image, backend, args))
+            # 图片路径已在 `recognize_image` 内排过序；这里再对每页显式排一次是
+            # 幂等兜底（同一份 block 集合必然收敛到同一顺序），让 PDF 路径的顺序
+            # 不依赖「recognize_image 内部做了什么」这一实现细节。
+            make_page(number, sort_reading_order(recognize_image(image, backend, args)))
             for number, image in rasterized
         ]
     finally:
