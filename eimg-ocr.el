@@ -1,4 +1,4 @@
-;;; eimg-ocr.el --- eimg 异步进程层：CLI 调用、四态收尾与进度状态  -*- lexical-binding: t; byte-compile-warnings: (not unresolved noruntime) -*-
+;;; eimg-ocr.el --- eimg 进程层与编排层：CLI 调用、四态收尾、进度状态与入口命令  -*- lexical-binding: t; byte-compile-warnings: (not unresolved noruntime) -*-
 
 ;; Author: thomas
 ;; Version: 0.1.0
@@ -8,12 +8,15 @@
 
 ;;; Commentary:
 
-;; 本文件分两层：
+;; 本文件分三层：
 ;;   - 第 1–6 节是**进程层**：把 `eimg-core-build-args' 拼出来的参数交给
 ;;     `bin/eimg-ocr'，异步收尾，并把「进行中 / 已完成 / 失败 / 被取消 / 超时」
 ;;     这些状态交给调用方。
 ;;   - 第 7 节是**呈现层**：`eimg-ocr-mode' 结果 buffer、buffer 局部模式行与六条
 ;;     键位。它只消费进程层与 `eimg-core' 的输出，自己不启动进程。
+;;   - 第 8 节是**编排层**：`eimg-ocr--run' 把「拼参数 → 起进程 → 四态收尾」收成
+;;     一份，三个入口命令（region / file / history）、后端查询与结果 buffer 的 `g'
+;;     全部复用它。
 ;;
 ;; 三条设计约束，改动时不要打破：
 ;;   1. **纯异步**：`eimg-ocr--start' 立即返回进程对象，主线程从不为子进程让路；
@@ -57,6 +60,25 @@
   :type 'natnum
   :group 'eimg)
 
+(defcustom eimg-ocr-capture-function nil
+  "截图函数；nil 表示按 `eimg-ocr--capture-function' 自动探测。
+截图能力本轮尚未迁移进 eimg，故运行期按 `eimg-capture' → `+thomas/screenshot'
+的顺序探测；迁移完成后把本值指向新函数（或让新函数占用 `eimg-capture' 这个名字），
+OCR 侧零改动。被指定的函数必须返回**截图文件的绝对路径**（返回 nil 视为失败）。"
+  :type '(choice (const :tag "自动探测" nil) function)
+  :group 'eimg)
+
+(defcustom eimg-ocr-images-dir nil
+  "历史截图的目录；nil 表示按 `eimg-ocr--history-directory' 自动推导。
+`eimg-ocr-file' 的默认目录与 `eimg-ocr-history' 的扫描目录都用它。"
+  :type '(choice (const :tag "自动推导" nil) directory)
+  :group 'eimg)
+
+(defcustom eimg-ocr-history-size 10
+  "`eimg-ocr-history' 最多列出多少个最近的图片文件（按修改时间降序）。"
+  :type 'natnum
+  :group 'eimg)
+
 (defconst eimg-ocr--timeout-exit-code 124
   "超时使用的伪退出码。
 沿用 coreutils `timeout' 的约定值 124：`bin/eimg-ocr' 自身不超时，因此这个码
@@ -92,6 +114,11 @@
   "最近一次完成的摘要文本（如 \" 完成（2 页，1.30s） \"）；空闲时 nil。
 它由 `eimg-ocr--set-progress' 清空、由渲染入口写入，供模式行在任务结束后
 继续显示结果概要（进度清空后模式行不该变成一片空白）。")
+
+(defvar eimg-ocr--last-capture nil
+  "最近一次截图函数返回的文件路径；nil 表示本会话还没截过图。
+`eimg-ocr--history-directory' 在 `eimg-ocr-images-dir' 为 nil 时用它反推目录——
+用户刚截了一张图，接着想看历史时最想知道的就是「刚才那些图在哪」。")
 
 ;;;; ── 2. CLI 路径定位 ──────────────────────────────────────────────────
 
@@ -491,45 +518,366 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
     (message "eimg：已写入 %s" file)))
 
 (defun eimg-ocr-rerun ()
-  "用最近一次的 CLI 参数重跑 OCR，结果仍写回本 buffer。
-没有历史参数时 `user-error'：本命令只负责「重跑」，不负责猜参数（画哪块、用哪个
-后端都属于上层交互命令）。收尾沿用四态语义——失败只提示、不覆盖已有结果，
-免得一次误重跑把上一份识别结果冲掉。"
+  "用最近一次的配置重跑 OCR，结果仍写回本 buffer。
+没有历史配置时 `user-error'：本命令只负责「重跑」，不负责猜参数（画哪块、用哪个
+后端都属于上层交互命令的职责）。
+收尾复用 `eimg-ocr--run'：四态语义、解析失败留原始输出、失败不覆盖已有结果，
+这些都与首次识别**同一份代码**——两份相似的收尾最容易长歪成「一处提示一处静默」。
+重跑要的是**配置 plist** 而不是 argv（argv 由 `eimg-ocr--run' 现拼），配置存在
+`eimg-ocr--last-meta' 的 `:config' 项里，由 `eimg-ocr--run' 写入。"
   (interactive)
-  (unless eimg-ocr--last-args
-    (user-error "本 buffer 还没有 OCR 结果：先跑一次识别再重跑"))
-  (let ((args eimg-ocr--last-args)
-        (meta eimg-ocr--last-meta)
-        (origin eimg-ocr--last-origin)
-        (started (current-time)))
+  (let ((config (plist-get eimg-ocr--last-meta :config))
+        (origin eimg-ocr--last-origin))
+    (unless config
+      (user-error "本 buffer 还没有 OCR 结果：先跑一次识别再重跑"))
+    ;; 回到来源 buffer 里启动：`eimg-ocr--run' 把「当前 buffer」记为回插目标，
+    ;; 重跑时当前 buffer 是结果 buffer 自己，直接调用会让 `i' 指向错误的目标。
+    (with-current-buffer (if (buffer-live-p origin) origin (current-buffer))
+      (eimg-ocr--run config))))
+
+;;;; ── 8. 统一编排与三个入口命令 ────────────────────────────────────────
+
+;; 三个入口命令（`eimg-ocr-region' / `eimg-ocr-file' / `eimg-ocr-history'）与结果
+;; buffer 里的 `g'（`eimg-ocr-rerun'）走**同一条**路径：拼参数 → 起进程 → 四态
+;; 收尾。收尾代码只留一份，避免长出「一处失败给提示、另一处失败静默」的分裂。
+;;
+;; 两条约束贯穿本节：
+;;   1. **命令立即返回**：`eimg-ocr--run' 只启动进程就返回，识别十几秒也不阻塞
+;;      主线程；一切后续动作都在 sentinel 里做。
+;;   2. **截图是软依赖**：截图能力本轮尚未迁移进 eimg，故一个截图函数都没有时
+;;      明确 `user-error' 并把用户指回 thomas-emacs，而不是抛「void-function」。
+
+(defconst eimg-ocr-raw-buffer-name "*eimg-ocr-raw*"
+  "解析失败时保存 CLI 原始 stdout 的 buffer 名。
+解析失败意味着「输出与约定不符」，此时唯一有用的证据就是原文——不落盘就只剩
+一句「无法解析」，连是 CLI 版本不对还是后端吐了半截都判不出来。")
+
+(defconst eimg-ocr--raw-limit 500
+  "`eimg-ocr-raw-buffer-name' 里保存原始输出的字符上限。
+只留前 500 字符：足够看出输出形态（是空、是日志、还是被截断的 JSON），又不至于
+把整份日志塞进 batch 环境的 *Messages*。")
+
+(defconst eimg-ocr-backends-buffer-name "*eimg-ocr-backends*"
+  "`eimg-ocr-list-backends' 的输出 buffer 名。
+与结果 buffer 分开：后端列表没有「页」「正文」，混进 `*eimg-ocr*' 会让 `y' / `w'
+这些针对识别结果的键位对着一份列表工作。")
+
+(defconst eimg-ocr--capture-missing-message
+  "未找到截图函数：截图能力尚未迁移到 eimg，暂时依赖 thomas-emacs 的 +thomas/screenshot"
+  "一个截图函数都没有时的统一文案。
+写成常量而不是两处各写一遍：探测函数（`eimg-ocr--capture-function'）与命令入口
+（`eimg-ocr-region'，当探测被替换成返回 nil 时）都要给出同一句提示。")
+
+(defconst eimg-ocr--image-extensions
+  '("png" "jpg" "jpeg" "webp" "bmp" "tif" "tiff" "gif" "pdf")
+  "`eimg-ocr-file' 与 `eimg-ocr-history' 认可的输入扩展名（小写，无点）。
+与 `bin/eimg-ocr' 支持的输入格式保持一致；PDF 也在内，因为 CLI 会自己渲染分页。")
+
+(defun eimg-ocr--capture-function ()
+  "返回当前可用的截图函数符号；一个都没有时 `user-error'。
+探测顺序：`eimg-ocr-capture-function'（显式指定）→ `eimg-capture' →
+`+thomas/screenshot'。后两者用 `fboundp' 判，不 require 任何宿主包——本文件必须
+能在 `emacs -Q' 里加载，把宿主配置的文件名写进 require 会直接断掉 `make test'。
+临时把本函数替换成返回 nil 是测试用的注入点（`eimg-ocr-region' 会因此失败）。"
+  (let ((function (or eimg-ocr-capture-function
+                      (and (fboundp 'eimg-capture) 'eimg-capture)
+                      (and (fboundp '+thomas/screenshot) '+thomas/screenshot))))
+    (unless function
+      (user-error "%s" eimg-ocr--capture-missing-message))
+    function))
+
+(defun eimg-ocr--supported-file-p (file)
+  "FILE 的扩展名是否在 `eimg-ocr--image-extensions' 里。
+只比扩展名、不碰文件系统：调用方（选择 / 列举）已经拿到了候选路径，再问一次
+`file-exists-p' 只会让「选了个尚不存在但格式正确的名字」被误判。"
+  (and (stringp file)
+       (member (downcase (or (file-name-extension file) ""))
+               eimg-ocr--image-extensions)))
+
+(defun eimg-ocr--config-with (config key value)
+  "返回把 KEY 设为 VALUE 的 CONFIG 副本（不改动原 plist）。
+不用 `plist-put'：它会就地改调用方传进来的列表，而调用方的 plist 常常是 defcustom
+默认值的 `list' 字面量或调用者复用的变量，就地改等于悄悄改了别人。"
+  (let (result)
+    (while config
+      (unless (eq (car config) key)
+        (setq result (append result (list (car config) (cadr config)))))
+      (setq config (cddr config)))
+    (append result (list key value))))
+
+(defun eimg-ocr--merge-config (defaults overrides)
+  "把 OVERRIDES 合进 DEFAULTS（同名键以 OVERRIDES 为准），返回新 plist。
+只做一层合并：ARGS 来自 transient infix（T5d），它要「只覆盖我关心的那几个项」，
+深层合并对 plist 没有意义。"
+  (let ((result defaults))
+    (while overrides
+      (setq result (eimg-ocr--config-with result (car overrides) (cadr overrides))
+            overrides (cddr overrides)))
+    result))
+
+(defun eimg-ocr--config-source (config)
+  "从配置 CONFIG 里取第一个输入文件路径；没有时返回 nil。
+`--run' 用它填结果头行的「来源」——头行写的是人看的来源，不是 argv 里的位置。"
+  (or (plist-get config :file)
+      (car (eimg-core--as-list (plist-get config :files)))))
+
+(defun eimg-ocr--failure-text (code stderr)
+  "把退出码 CODE 与 STDERR 拼成「文案 + 排障提示」的完整错误文本。
+提示单独一行：文案说「是什么」，提示说「怎么办」，挤在一行里读起来像重复。
+未登记的码没有提示，此时只给文案（`eimg-core-exit-message' 已含 stderr 末行）。"
+  (let ((text (eimg-core-exit-message code stderr))
+        (hint (eimg-core-exit-hint code)))
+    (if hint (format "%s\n%s" text hint) text)))
+
+(defun eimg-ocr--safe-call (function &rest args)
+  "在 sentinel 上下文里调用 FUNCTION（可空），错误只 `message'，不上抛。
+sentinel 里 signal 会被 Emacs 打成 \"error in process sentinel\" 塞进 *Messages*，
+既不可读，也会让排在同一批次后面的收尾动作被跳过。"
+  (when function
+    (condition-case err
+        (apply function args)
+      (error
+       (message "eimg-ocr：回调失败：%s" (error-message-string err))))))
+
+(defun eimg-ocr--remember-raw (text)
+  "把 TEXT 的前 `eimg-ocr--raw-limit' 个字符写进 `eimg-ocr-raw-buffer-name'。
+先 `erase-buffer' 再写：保留「最近一次」失败现场比累积多份更有用（旧的那份已经
+被上一条错误信息引用过了）。"
+  (let* ((raw (cond ((not (stringp text)) "")
+                    ((> (length text) eimg-ocr--raw-limit)
+                     (substring text 0 eimg-ocr--raw-limit))
+                    (t text)))
+         (buffer (get-buffer-create eimg-ocr-raw-buffer-name)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert raw)
+        (goto-char (point-min))
+        (set-buffer-modified-p nil)))
+    buffer))
+
+(defun eimg-ocr--run (args &optional on-success on-failure)
+  "用配置 ARGS 跑一次 OCR 并统一四态收尾；**立即返回**（纯异步）。
+ARGS 是**配置 plist**（`eimg-core-build-args' 的输入），不是 argv——argv 由本函数
+现拼，调用方不必关心选项顺序，也不必重复一遍「哪些 nil 项要跳过」的规则。
+
+ON-SUCCESS 在结果 buffer 渲染完成后、于**来源 buffer 的上下文里**以 PAGES 调用
+一次（来源 buffer 已死时退化为当前 buffer）。
+ON-FAILURE 仅在失败态以拼好的错误文案调用一次（超时也算失败）。
+两者都在 sentinel 里执行，异常只 `message' 不上抛——见 `eimg-ocr--safe-call'。
+
+四态：
+  finished  → `eimg-core-parse-json' → `eimg-ocr--show-result'（写结果 buffer）
+  failed    → `eimg-core-exit-message' + `eimg-core-exit-hint' 拼成可读文案，一律
+              `message'。为什么不是 `user-error'：本函数在 sentinel 里跑，signal
+              会被 Emacs 吞成 \"error in process sentinel\"，用户看不到；但绝不静默
+              ——退出码 2/3/4/5 与超时都有文案与排障提示。
+  cancelled → 静默收尾，只 `message' \"已取消\"（用户自己按的取消，不该报错）
+  解析失败  → `message' 说明「输出无法解析」，并把原始 stdout 前 500 字符存进
+              `eimg-ocr-raw-buffer-name'；**不覆盖**已有结果 buffer。
+"
+  (let* ((argv (eimg-core-build-args args))
+         (source (eimg-ocr--config-source args))
+         (origin (current-buffer))
+         (started (current-time)))
     (eimg-ocr--start
-     args
+     argv
      (lambda (status stdout stderr &optional code)
        (pcase status
          ('finished
           (condition-case err
               (let ((pages (eimg-core-parse-json stdout)))
-                ;; 回到来源 buffer 里调渲染：`eimg-ocr--show-result' 把
-                ;; 「当前 buffer」当成回插目标，重跑时当前 buffer 是结果 buffer
-                ;; 自己，直接调用会让 `i' 指向错误的目标。
                 (with-current-buffer (if (buffer-live-p origin)
                                          origin
                                        (current-buffer))
                   (eimg-ocr--show-result
-                   pages args
-                   (list :backend (plist-get meta :backend)
-                         :elapsed (float-time (time-subtract (current-time) started))
-                         :source (plist-get meta :source)))))
+                   pages argv
+                   (list :backend (plist-get args :backend)
+                         :source source
+                         ;; 配置本身也记下来：`eimg-ocr-rerun' 要重跑就得有配置，
+                         ;; argv 是从它推出来的，反过来推不回去（选项顺序固定，但
+                         ;; 无法区分「未指定」与「指定成默认值」）。
+                         :config args
+                         :elapsed (float-time (time-subtract (current-time) started))))
+                  (eimg-ocr--safe-call on-success pages)))
             (eimg-core-parse-error
              (eimg-ocr--clear-progress)
-             (message "eimg：OCR 结果解析失败：%s" (error-message-string err)))))
+             (eimg-ocr--remember-raw stdout)
+             (message "eimg-ocr 输出无法解析：%s（原始输出前 %d 字符已存入 %s）"
+                      (error-message-string err)
+                      eimg-ocr--raw-limit
+                      eimg-ocr-raw-buffer-name))))
          ('failed
           (eimg-ocr--clear-progress)
-          (message "eimg：OCR 失败：%s" (eimg-core-exit-message code stderr)))
+          (let ((text (eimg-ocr--failure-text code stderr)))
+            (eimg-ocr--safe-call on-failure text)
+            (message "eimg-ocr：%s" text)))
          ('cancelled
           (eimg-ocr--clear-progress)
-          (message "eimg：OCR 已取消")))))
+          (message "eimg-ocr：已取消")))))
     (eimg-ocr--set-progress "识别中")))
+
+(defun eimg-ocr--deliver-body (origin insert)
+  "把最近一次识别结果的正文放进 `kill-ring'；INSERT 非 nil 时同时插入 ORIGIN。
+正文取自已渲染的结果 buffer（`eimg-ocr--collect-body' 去头行）：这样复制 / 插入
+与用户在结果 buffer 里按 `y' / `i' 得到的内容**逐字相同**，不会因为两套渲染路径
+而在「有没有 `** 第 N 页'」这种细节上分叉。"
+  (let ((body (eimg-ocr--collect-body (get-buffer eimg-ocr-buffer-name))))
+    (when (string-empty-p body)
+      (user-error "识别结果为空"))
+    (kill-new body)
+    (when insert
+      (with-current-buffer origin
+        (insert body)
+        ;; 正文自身无末尾换行；补一个，避免插在正文中间时把后文粘上来。
+        (unless (string-suffix-p "\n" body)
+          (insert "\n"))))
+    (message "eimg：已复制 %d 字符%s"
+             (length body)
+             (if insert (format "并插入 %s" (buffer-name origin)) ""))))
+
+(defun eimg-ocr-region (&optional args)
+  "框选屏幕区域并识别，正文进 `kill-ring'；`C-u' 时同时插入当前 buffer。
+ARGS 是覆盖默认配置的 plist（供 T5d 的 transient infix 用，ARGS 优先），默认只强制
+`:format \"json\"'——结果 buffer 需要结构化输出才能分页渲染。
+
+无图形环境直接 `user-error'：框选依赖屏幕坐标与图形化的选择器，在终端 / 批处理里
+不可能工作，硬跑到截图函数只会得到一句底层的、更难懂的报错。"
+  (interactive)
+  (unless (display-graphic-p)
+    (user-error "eimg-ocr-region 需要图形环境：当前环境没有可框选的屏幕"))
+  (let* ((insert-p (and current-prefix-arg t))
+         (origin (current-buffer))
+         (capture (or (eimg-ocr--capture-function)
+                      (user-error "%s" eimg-ocr--capture-missing-message)))
+         (path (condition-case err
+                   (funcall capture)
+                 (error (user-error "截图失败：%s" (error-message-string err))))))
+    (unless (and (stringp path) (file-exists-p path))
+      (user-error "截图失败：截图函数没有返回可读的文件%s"
+                  (if (stringp path) (format "（%s）" path) "")))
+    (setq eimg-ocr--last-capture path)
+    (eimg-ocr--run
+     (eimg-ocr--config-with
+      (eimg-ocr--merge-config (list :format "json") args)
+      :file path)
+     (lambda (_pages) (eimg-ocr--deliver-body origin insert-p)))))
+
+(defun eimg-ocr-file (&optional args)
+  "选一个图片或 PDF 文件做 OCR，结果进 `eimg-ocr-buffer-name'。
+ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先）。
+默认目录取 `eimg-ocr-images-dir'，未配置时用 `default-directory'。
+选择器用 `read-file-name' 而不是 `read-file-name' 之外的补全框架：本文件必须保持
+顶层零第三方依赖，且 shell 与 Dired 里 `default-directory' 天然就是用户期望的起点。"
+  (interactive)
+  (let* ((directory (or eimg-ocr-images-dir default-directory))
+         (file (read-file-name
+                "选择图片或 PDF: " directory nil t nil
+                (lambda (name)
+                  (or (file-directory-p name)
+                      (eimg-ocr--supported-file-p name))))))
+    (unless (eimg-ocr--supported-file-p file)
+      (user-error "不支持的输入文件：%s（只支持 %s）"
+                  file (string-join eimg-ocr--image-extensions "/")))
+    (eimg-ocr--run
+     (eimg-ocr--config-with
+      (eimg-ocr--merge-config (list :format "json") args)
+      :file file))))
+
+(defun eimg-ocr--history-directory ()
+  "返回历史截图的扫描目录；目录不存在时 `user-error'。
+优先级：`eimg-ocr-images-dir' → 最近一次截图所在目录 → `default-directory'。
+第二级不是可有可无的兜底：截图目录配置留空时，用户刚截的图所在目录就是他能想到
+的「历史」；退到 `default-directory' 只在本次会话还没截过图时发生。"
+  (let ((captured eimg-ocr--last-capture))
+    (let ((directory (or eimg-ocr-images-dir
+                         (and (stringp captured) (file-name-directory captured))
+                         default-directory)))
+      (unless (and (stringp directory) (file-directory-p directory))
+        (user-error "历史截图目录不存在：%s" directory))
+      directory)))
+
+(defun eimg-ocr--recent-images (directory limit)
+  "返回 DIRECTORY 下最近的 LIMIT 个图片文件（绝对路径，按修改时间降序）。
+只认 `eimg-ocr--image-extensions' 里的扩展名：历史目录里常混着 `.json' / `.txt'
+的旁路文件，把它们列进候选只会让用户选到一个必然失败的输入。"
+  (let (files)
+    (dolist (name (ignore-errors (directory-files directory t "\\`[^.]" t)))
+      (when (and (file-regular-p name)
+                 (eimg-ocr--supported-file-p name))
+        (push name files)))
+    (setq files (sort files
+                      (lambda (a b)
+                        (time-less-p
+                         (file-attribute-modification-time (file-attributes b))
+                         (file-attribute-modification-time (file-attributes a))))))
+    (cl-subseq files 0 (min limit (length files)))))
+
+(defun eimg-ocr-history (&optional args)
+  "从最近的截图里挑一张做 OCR，结果进 `eimg-ocr-buffer-name'。
+ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先）。
+没有候选时 `user-error' 而不是 `completing-read' 一个空表：空表在部分补全框架下
+会静默返回空串，然后调用方拿着空文件名去起进程，报错点就飘到 CLI 那一侧了。"
+  (interactive)
+  (let* ((directory (eimg-ocr--history-directory))
+         (files (eimg-ocr--recent-images directory eimg-ocr-history-size)))
+    (unless files
+      (user-error "没有可用的历史截图：%s 下没有图片文件" directory))
+    (let ((file (completing-read "历史截图: " files nil t)))
+      (eimg-ocr--run
+       (eimg-ocr--config-with
+        (eimg-ocr--merge-config (list :format "json") args)
+        :file file)
+       nil))))
+
+(define-derived-mode eimg-ocr-backends-mode special-mode "eimg-OCR 后端"
+  "后端列表 buffer 的主模式（只读，`q' 关闭）。
+`truncate-lines' 与结果 buffer 同理：后端探测输出里可能有很长的路径 / 版本串。"
+  (setq-local truncate-lines t))
+
+(defun eimg-ocr--show-backends (text)
+  "把 CLI `--list-backends' 的输出 TEXT 写进后端 buffer，并 `message' 一行摘要。
+输出原样保存（不做表格化）：CLI 的这份输出是给人扫一眼的，二次排版只会引入
+「哪个字段是后端名」的猜测。"
+  (eimg-ocr--clear-progress)
+  (let ((buffer (get-buffer-create eimg-ocr-backends-buffer-name))
+        (lines 0))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (if (string-empty-p (string-trim text)) "(空输出)\n" text))
+        (unless (string-suffix-p "\n" (buffer-string))
+          (insert "\n"))
+        ;; 先写完文本再开 mode：`special-mode' 会把 buffer 置只读，反序会 write error。
+        (eimg-ocr-backends-mode)
+        (goto-char (point-min))
+        (set-buffer-modified-p nil)
+        (setq lines (count-lines (point-min) (point-max)))))
+    (message "eimg：后端列表已写入 %s（%d 行）"
+             eimg-ocr-backends-buffer-name lines)
+    buffer))
+
+(defun eimg-ocr-list-backends ()
+  "列出 OCR 后端及可用状态，输出写入 `eimg-ocr-backends-buffer-name'。
+用与 OCR **同一套**异步进程层，而不是 `call-process'：`call-process' 阻塞到子进程
+退出、期间 Emacs 不跑 timer，`eimg-ocr-timeout' 对它完全无效——后端探测一旦卡住
+（Python 侧 import torch 之类）就会锁死用户主线程。异步路径的超时由
+`eimg-ocr--on-timeout' 兜住，失败文案与 OCR 失败共用 `eimg-ocr--failure-text'。
+唯一保留的**同步**错误是「CLI 定位失败」这类前置检查：此时进程还没起，`user-error'
+能让调用者（含 transient 菜单）直接拿到可读报错。"
+  (interactive)
+  (eimg-ocr--start
+   (list "--list-backends")
+   (lambda (status stdout stderr &optional code)
+     (pcase status
+       ('finished (eimg-ocr--show-backends stdout))
+       ('failed
+        (eimg-ocr--clear-progress)
+        (message "eimg-ocr：查询后端失败：%s" (eimg-ocr--failure-text code stderr)))
+       ('cancelled
+        (eimg-ocr--clear-progress)
+        (message "eimg-ocr：已取消")))))
+  (eimg-ocr--set-progress "查询后端中"))
 
 (provide 'eimg-ocr)
 

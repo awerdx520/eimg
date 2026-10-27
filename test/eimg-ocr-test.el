@@ -53,6 +53,11 @@ BODY 可含多行；用 `make-temp-file' 保证多次调用互不覆盖。"
     (ignore-errors (cancel-timer eimg-ocr--timeout-timer)))
   (when (get-buffer eimg-ocr-buffer-name)
     (ignore-errors (kill-buffer (get-buffer eimg-ocr-buffer-name))))
+  ;; 原始输出与后端列表 buffer 同样是固定名单例：不关掉的话，「这次失败到底有没有
+  ;; 写原始输出 / 这次查询到底有没有出结果」会被上一个用例的内容假绿。
+  (dolist (name (list eimg-ocr-raw-buffer-name eimg-ocr-backends-buffer-name))
+    (when (get-buffer name)
+      (ignore-errors (kill-buffer (get-buffer name)))))
   (setq eimg-ocr--process nil
         eimg-ocr--started-at nil
         eimg-ocr--timeout-timer nil
@@ -60,7 +65,8 @@ BODY 可含多行；用 `make-temp-file' 保证多次调用互不覆盖。"
         eimg-ocr--last-args nil
         eimg-ocr--last-origin nil
         eimg-ocr--last-meta nil
-        eimg-ocr--last-summary nil))
+        eimg-ocr--last-summary nil
+        eimg-ocr--last-capture nil))
 
 (defmacro eimg-ocr-test--with-stub (file body &rest forms)
   "在 FORMS 执行期间把 BODY 写成 stub 脚本并绑定到 FILE；结束后删脚本。"
@@ -543,6 +549,331 @@ Emacs 会为同一进程在不同时机多次调用 sentinel：若没有守卫�
     ;; 结果 buffer 之外的 buffer 连 buffer 局部值都不该有
     (with-temp-buffer
       (should-not (local-variable-p 'mode-line-format)))))
+
+;;;; ── 7. 统一编排与三个入口命令 ────────────────────────────────────────
+
+(defconst eimg-ocr-test--json-payload
+  "{\"pages\":[{\"page\":1,\"source\":\"shot.png\",\"blocks\":[{\"text\":\"第一行\"},{\"text\":\"第二行\"}]}]}"
+  "stub CLI 输出的固定 JSON：单页两块。
+单页即可验证「正文带 `** 第 1 页' 头、说明头行不在正文里」这两条断言。")
+
+(defun eimg-ocr-test--json-command (&optional prefix)
+  "返回一段 sh 脚本片段：先执行 PREFIX（可空），再输出固定 JSON。
+用 heredoc 而不是 `printf '%s'`：JSON 里全是双引号，heredoc 不需要任何转义，
+也不会被 shell 当成格式串处理。"
+  (concat (or prefix "")
+          "cat <<'EIMGJSON'\n" eimg-ocr-test--json-payload "\nEIMGJSON\n"))
+
+(defmacro eimg-ocr-test--with-graphic (&rest forms)
+  "在 FORMS 执行期间让 `display-graphic-p' 恒返回 t。
+`eimg-ocr-region' 的前置检查在 batch 下必然失败，注入图形能力才能测到后续路径。"
+  (declare (indent 0))
+  `(cl-letf (((symbol-function 'display-graphic-p) (lambda (&optional _frame) t)))
+     ,@forms))
+
+(defmacro eimg-ocr-test--with-capture (captured &rest forms)
+  "在 FORMS 执行期间把截图探测替换成「返回 CAPTURED 路径的函数」。
+被替换的是 `eimg-ocr--capture-function'（探测层），而不是 `eimg-ocr-region' 里
+的调用点——探测层的返回约定（返回函数）才是 `eimg-ocr-region' 真正依赖的东西。"
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'eimg-ocr--capture-function)
+              (lambda () (lambda () ,captured))))
+     ,@forms))
+
+(defvar eimg-ocr-test--messages nil
+  "`eimg-ocr-test--collect-messages' 在动态作用域内收集到的 `message' 文本。
+必须是 `defvar'：只有被声明为 special 的变量才会在 let 内动态绑定，否则 lambda
+闭包里读到的仍是全局值（恒 nil），等待条件会永远不成立。")
+
+(defmacro eimg-ocr-test--collect-messages (&rest forms)
+  "在 FORMS 执行期间收集 `message' 文本（按调用顺序），返回字符串列表。
+FORMS 内部可以直接读 `eimg-ocr-test--messages' 判「消息到了没」——异步收尾靠它
+轮询，不必为了拿结果而把 `sleep-for' 固定住。"
+  (declare (indent 0))
+  `(let ((eimg-ocr-test--messages nil))
+     (cl-letf (((symbol-function 'message)
+                (lambda (format-string &rest args)
+                  (push (apply #'format format-string args)
+                        eimg-ocr-test--messages))))
+       ,@forms)
+     (nreverse eimg-ocr-test--messages)))
+
+(ert-deftest eimg-ocr-test-entry-commands-are-commands ()
+  "三个入口命令与后端查询都是交互命令，且都只接受 0–1 个可选参数。
+`ARGS' 可选参数是为 T5d 的 transient infix 预留的：命令必须能在**不带**参数时
+被 `M-x' / 键位直接调用，否则菜单之外就没有入口了。"
+  (dolist (command '(eimg-ocr-region eimg-ocr-file eimg-ocr-history))
+    (should (commandp command))
+    (should (equal '(0 . 1) (func-arity command))))
+  (should (commandp 'eimg-ocr-list-backends))
+  (should (equal '(0 . 0) (func-arity 'eimg-ocr-list-backends))))
+
+(ert-deftest eimg-ocr-test-region-requires-graphic ()
+  "无图形环境时 `eimg-ocr-region' 立刻 `user-error'，文案指明图形环境。
+batch 环境本身就是「无图形」的真实场景，这里再显式绑一次 `noninteractive' 只是
+把意图写在用例里，不依赖 `make test' 恰好在 batch 下跑。"
+  (eimg-ocr-test--reset)
+  (let ((noninteractive t))
+    (should-error (eimg-ocr-region) :type 'user-error)
+    (should (string-match-p
+             "图形环境"
+             (condition-case err
+                 (eimg-ocr-region)
+               (user-error (error-message-string err))))))
+  ;; 前置检查失败时不得留下活动进程。
+  (should-not (eimg-ocr-busy-p)))
+
+(ert-deftest eimg-ocr-test-region-without-capture-errors ()
+  "一个截图函数都没有时 `eimg-ocr-region' `user-error'，文案给出迁移说明。
+替换探测函数使其返回 nil（模拟「既无 eimg-capture 也无 +thomas/screenshot」），
+命令自身必须兜住，而不是 `funcall nil' 抛出难懂的 void-function。"
+  (eimg-ocr-test--reset)
+  (cl-letf (((symbol-function 'eimg-ocr--capture-function) (lambda () nil)))
+    (eimg-ocr-test--with-graphic
+      (should-error (eimg-ocr-region) :type 'user-error)
+      (let ((text (condition-case err
+                      (eimg-ocr-region)
+                    (user-error (error-message-string err)))))
+        (should (string-match-p "未找到截图函数" text))
+        (should (string-match-p "thomas-emacs" text)))))
+  (should-not (eimg-ocr-busy-p)))
+
+(ert-deftest eimg-ocr-test-region-copies-body-to-kill-ring ()
+  "region 成功后正文进 `kill-ring'：带 `** 第 1 页'、不带说明头行。
+`kill-ring' 动态绑定为 nil：`kill-new' 改的是全局变量，不隔离会污染后续用例。"
+  (eimg-ocr-test--reset)
+  (eimg-ocr-test--with-stub stub (eimg-ocr-test--json-command)
+    (let ((captured (make-temp-file "eimg-capture-" nil ".png"))
+          (kill-ring nil)
+          (eimg-ocr-cli-path stub))
+      (unwind-protect
+          (progn
+            (eimg-ocr-test--with-graphic
+              (eimg-ocr-test--with-capture captured
+                (with-temp-buffer
+                  (eimg-ocr-region)
+                  (should (eimg-ocr-test--wait (lambda () kill-ring))))))
+            (should (string-match-p "\\`\\*\\* 第 1 页" (car kill-ring)))
+            (should (string-match-p "第一行" (car kill-ring)))
+            (should-not (string-match-p "# eimg-ocr:" (car kill-ring)))
+            ;; 截图路径要记下来：`eimg-ocr-history' 靠它反推默认目录。
+            (should (equal captured eimg-ocr--last-capture)))
+        (ignore-errors (delete-file captured))))))
+
+(ert-deftest eimg-ocr-test-region-with-prefix-inserts ()
+  "`C-u' 变体：除复制外还插入当前 buffer。
+`current-prefix-arg' 在这里**必须**显式绑：`C-u' 的语义由它承载，直接函数调用
+拿不到前缀参数。"
+  (eimg-ocr-test--reset)
+  (eimg-ocr-test--with-stub stub (eimg-ocr-test--json-command)
+    (let ((captured (make-temp-file "eimg-capture-" nil ".png"))
+          (kill-ring nil)
+          (eimg-ocr-cli-path stub))
+      (unwind-protect
+          (progn
+            (eimg-ocr-test--with-graphic
+              (eimg-ocr-test--with-capture captured
+                (with-temp-buffer
+                  (let ((current-prefix-arg '(4)))
+                    (eimg-ocr-region))
+                  (should (eimg-ocr-test--wait
+                           (lambda () (string-match-p "第 1 页" (buffer-string)))))
+                  (should (string-match-p "\\*\\* 第 1 页" (buffer-string)))
+                  (should (string-match-p "第二行" (buffer-string)))
+                  ;; 插入的正文同样不含说明头行。
+                  (should-not (string-match-p "# eimg-ocr:" (buffer-string))))))
+            (should (string-match-p "第 1 页" (car kill-ring))))
+        (ignore-errors (delete-file captured))))))
+
+(ert-deftest eimg-ocr-test-file-renders-result ()
+  "`eimg-ocr-file' 选到图片后走统一编排，结果进结果 buffer。"
+  (eimg-ocr-test--reset)
+  (eimg-ocr-test--with-stub stub (eimg-ocr-test--json-command)
+    (let ((image (make-temp-file "eimg-file-" nil ".png"))
+          (eimg-ocr-cli-path stub))
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'read-file-name) (lambda (&rest _) image)))
+              (eimg-ocr-file))
+            (should (eimg-ocr-test--wait
+                     (lambda ()
+                       (and (get-buffer eimg-ocr-buffer-name)
+                            (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+                              (string-match-p "\\*\\* 第 1 页" (buffer-string)))))))
+            (should (equal image (plist-get eimg-ocr--last-meta :source))))
+        (ignore-errors (delete-file image))))))
+
+(ert-deftest eimg-ocr-test-file-rejects-unsupported-extension ()
+  "选中非图片 / 非 PDF 扩展名时 `user-error'，且不起进程。"
+  (eimg-ocr-test--reset)
+  (let ((text (make-temp-file "eimg-file-" nil ".txt")))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'read-file-name) (lambda (&rest _) text)))
+            (should-error (eimg-ocr-file) :type 'user-error)
+            (should (string-match-p
+                     "不支持的输入文件"
+                     (condition-case err
+                         (eimg-ocr-file)
+                       (user-error (error-message-string err))))))
+          (should-not (eimg-ocr-busy-p)))
+      (ignore-errors (delete-file text)))))
+
+(ert-deftest eimg-ocr-test-history-empty-directory-errors ()
+  "目录存在但没有图片时 `user-error'，不静默返回空候选。"
+  (eimg-ocr-test--reset)
+  (let ((directory (make-temp-file "eimg-history-" t)))
+    (unwind-protect
+        (let ((eimg-ocr-images-dir directory))
+          (should-error (eimg-ocr-history) :type 'user-error)
+          (should (string-match-p
+                   "没有可用的历史截图"
+                   (condition-case err
+                       (eimg-ocr-history)
+                     (user-error (error-message-string err))))))
+      (delete-directory directory t))))
+
+(ert-deftest eimg-ocr-test-history-picks-recent-file ()
+  "历史候选按修改时间降序，选中后走通并出结果。
+`completing-read' 打桩为「取候选表首项」：既验证排序（首项必须是最新的那张），
+又避免在 batch 下真的去读 minibuffer。"
+  (eimg-ocr-test--reset)
+  (eimg-ocr-test--with-stub stub (eimg-ocr-test--json-command)
+    (let* ((directory (make-temp-file "eimg-history-" t))
+           (older (expand-file-name "old.png" directory))
+           (newer (expand-file-name "new.png" directory))
+           ;; 目录里混一个非图片文件：它不该出现在候选里。
+           (decoy (expand-file-name "note.txt" directory))
+           (picked nil)
+           (eimg-ocr-cli-path stub))
+      (unwind-protect
+          (progn
+            (dolist (file (list older newer decoy))
+              (with-temp-file file (insert "x")))
+            (set-file-times older (time-subtract (current-time) 100))
+            (set-file-times newer (time-subtract (current-time) 10))
+            (set-file-times decoy (current-time))
+            (should (equal (list newer older)
+                           (eimg-ocr--recent-images directory 10)))
+            (let ((eimg-ocr-images-dir directory))
+              (cl-letf (((symbol-function 'completing-read)
+                         (lambda (_prompt collection &rest _)
+                           (setq picked (car collection))
+                           picked)))
+                (eimg-ocr-history)))
+            (should (equal newer picked))
+            (should (eimg-ocr-test--wait
+                     (lambda ()
+                       (and (get-buffer eimg-ocr-buffer-name)
+                            (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+                              (string-match-p "第 1 页" (buffer-string)))))))
+            (should (equal newer (plist-get eimg-ocr--last-meta :source))))
+        (delete-directory directory t)))))
+
+(ert-deftest eimg-ocr-test-run-failure-shows-message-and-hint ()
+  "退出码 3：`message' 文案含「输入不可读」与排障提示，且**不**写结果 buffer。
+失败走 `message' 而不是 `user-error'——本函数在 sentinel 里跑，signal 会被 Emacs
+吞成 \"error in process sentinel\"，用户看不到任何可读信息。"
+  (eimg-ocr-test--reset)
+  (eimg-ocr-test--with-stub stub "printf 'ValueError: cannot read image\\n' >&2\nexit 3"
+    ;; 必须用 `let*'：`messages' 的初始化表达式里就要跑命令，而 `let' 是并行绑定，
+    ;; 那样命令看到的 `eimg-ocr-cli-path' 仍是全局 nil → 直接去调真实 CLI。
+    (let* ((eimg-ocr-cli-path stub)
+           (messages (eimg-ocr-test--collect-messages
+                       (eimg-ocr--run (list :format "json" :file "/tmp/eimg-a.png"))
+                       (should (eimg-ocr-test--wait
+                                (lambda () eimg-ocr-test--messages))))))
+      (let ((text (mapconcat #'identity messages "\n")))
+        (should (string-match-p "输入不可读" text))
+        ;; 提示（`eimg-core-exit-hint'）必须在，不能只给标签不给出路。
+        (should (string-match-p "检查路径" text))
+        (should (string-match-p "cannot read image" text)))
+      (should-not (get-buffer eimg-ocr-buffer-name))
+      (should (null eimg-ocr--progress)))))
+
+(ert-deftest eimg-ocr-test-run-unparsable-json-keeps-raw ()
+  "输出不是合法 JSON 时：`message' 说明无法解析，原始输出进 `*eimg-ocr-raw*'。
+没有原始输出就只剩一句「无法解析」，看不出是 CLI 版本不对、后端吐了半截、还是
+输出里混进了日志。"
+  (eimg-ocr-test--reset)
+  (eimg-ocr-test--with-stub stub "printf 'Traceback: not json at all\\n'"
+    ;; 必须用 `let*'：`messages' 的初始化表达式里就要跑命令，而 `let' 是并行绑定，
+    ;; 那样命令看到的 `eimg-ocr-cli-path' 仍是全局 nil → 直接去调真实 CLI。
+    (let* ((eimg-ocr-cli-path stub)
+           (messages (eimg-ocr-test--collect-messages
+                       (eimg-ocr--run (list :format "json" :file "/tmp/eimg-a.png"))
+                       (should (eimg-ocr-test--wait
+                                (lambda () eimg-ocr-test--messages))))))
+      (should (string-match-p "无法解析" (mapconcat #'identity messages "\n")))
+      (let ((raw (get-buffer eimg-ocr-raw-buffer-name)))
+        (should raw)
+        (with-current-buffer raw
+          (should (string-match-p "not json at all" (buffer-string)))))
+      ;; 解析失败不得写出半份结果，也不得留下进度。
+      (should-not (get-buffer eimg-ocr-buffer-name))
+      (should (null eimg-ocr--progress)))))
+
+(ert-deftest eimg-ocr-test-rerun-reuses-run ()
+  "`g' 复用 `eimg-ocr--run'：重跑真的又起一次 CLI，结果仍写回同一个 buffer。
+用 stub 往计数文件追加行来判「跑了几次」——只看结果 buffer 无法区分「重跑成功」与
+「上次的内容还在」。"
+  (eimg-ocr-test--reset)
+  (let* ((counter (make-temp-file "eimg-rerun-counter-"))
+         (origin (generate-new-buffer " *eimg-rerun-origin*")))
+    (unwind-protect
+        (eimg-ocr-test--with-stub
+            stub (eimg-ocr-test--json-command
+                  (format "echo x >> '%s'\n" counter))
+          (let ((eimg-ocr-cli-path stub))
+            (with-current-buffer origin
+              (eimg-ocr--run (list :format "json" :file "first.png"))
+              (should (eimg-ocr-test--wait
+                       (lambda ()
+                         (and (get-buffer eimg-ocr-buffer-name)
+                              (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+                                (string-match-p "第 1 页" (buffer-string))))))))
+            ;; 配置必须被记下来，否则重跑无从下手。
+            (should (equal "first.png" (plist-get eimg-ocr--last-meta :source)))
+            (should (plist-get eimg-ocr--last-meta :config))
+            (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+              (eimg-ocr-rerun))
+            (should (eimg-ocr-test--wait
+                     (lambda ()
+                       (>= (with-temp-buffer
+                             (insert-file-contents counter)
+                             (length (split-string (buffer-string) "\n" t)))
+                           2))))
+            (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+              (should (string-match-p "\\*\\* 第 1 页" (buffer-string))))
+            ;; 重跑后回插目标仍是来源 buffer（不是结果 buffer 自己）。
+            (should (eq origin eimg-ocr--last-origin)))
+        (when (buffer-live-p origin) (kill-buffer origin))
+        (ignore-errors (delete-file counter))))))
+
+(ert-deftest eimg-ocr-test-list-backends-writes-buffer ()
+  "`eimg-ocr-list-backends' 把 CLI 输出原样写进只读的后端 buffer 并提示摘要。"
+  (eimg-ocr-test--reset)
+  (eimg-ocr-test--with-stub stub "printf 'rapidocr\\tavailable\\ntesseract\\tmissing\\n'"
+    ;; 必须用 `let*'：`messages' 的初始化表达式里就要跑命令，而 `let' 是并行绑定，
+    ;; 那样命令看到的 `eimg-ocr-cli-path' 仍是全局 nil → 直接去调真实 CLI。
+    (let* ((eimg-ocr-cli-path stub)
+           (messages (eimg-ocr-test--collect-messages
+                       (eimg-ocr-list-backends)
+                       (should (eimg-ocr-test--wait
+                                (lambda ()
+                                  (and (get-buffer eimg-ocr-backends-buffer-name)
+                                       (with-current-buffer
+                                           (get-buffer eimg-ocr-backends-buffer-name)
+                                         (string-match-p "tesseract" (buffer-string))))))))))
+      (with-current-buffer (get-buffer eimg-ocr-backends-buffer-name)
+        (should (derived-mode-p 'special-mode))
+        (should buffer-read-only)
+        (should (string-match-p "rapidocr\tavailable" (buffer-string)))
+        (should (string-match-p "tesseract\tmissing" (buffer-string))))
+      ;; 摘要一行给的是 buffer 名与行数，不是把整份输出塞进回显区。
+      (should (string-match-p "后端列表已写入"
+                              (car (last messages))))
+      (should (null eimg-ocr--progress)))))
 
 (provide 'eimg-ocr-test)
 
