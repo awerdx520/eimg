@@ -156,6 +156,18 @@ suffix 读到的值走同一段代码（`transient-prefix-value' → `transient-
   (should (member "chi_sim+eng"
                   (oref (eimg-transient-test--suffix "-l") choices))))
 
+(ert-deftest eimg-transient-test-backend-choices-include-ollama ()
+  "`-b' 的候选含 ollama，且顺序为 auto → rapidocr → ollama → tesseract。
+顺序有意义：`auto' 排第一（默认档），ollama 在 rapidocr 之后、tesseract 之前——这是
+拍板的后端优先级，菜单里的排列要与 `BACKEND_ORDER' 一致才好读。只断言「包含」会
+放过顺序回归，故逐项比对整条 choices；`argument' 槽仍是 `--backend='（argv 形态）。"
+  (let* ((object (eimg-transient-test--suffix "-b"))
+         (choices (oref object choices)))
+    (should object)
+    (should (member "ollama" choices))
+    (should (equal '("auto" "rapidocr" "ollama" "tesseract") choices))
+    (should (equal "--backend=" (oref object argument)))))
+
 ;;;; ── 2. infix 取值 → 配置 plist → argv ─────────────────────────────────
 
 (ert-deftest eimg-transient-test-menu-args-nil-when-unset ()

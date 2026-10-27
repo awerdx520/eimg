@@ -10,22 +10,22 @@ eimg 把「采集图像 → 识别文字 → 产出可用文本或链接」收�
 
 * 能力矩阵
 
-| 能力                                          | 状态 | 落地位置             |
-|-----------------------------------------------+------+----------------------|
-| CLI 多后端（rapidocr / tesseract / auto）     | 已有 | =bin/eimg-ocr=       |
-| PDF 栅格化与分页（ =--pdf-pages= / =--dpi= ） | 已有 | =bin/eimg-ocr=       |
-| 阅读顺序排序（单栏横排）                      | 已有 | =bin/eimg-ocr=       |
-| 后端安装与体检                                | 已有 | =bin/eimg-ocr-setup= |
-| 纯逻辑（参数拼装 / 退出码 / 解析 / 渲染）     | 已有 | =eimg-core.el=       |
-| 异步进程层与四态收尾                          | 已有 | =eimg-ocr.el=        |
-| 结果 buffer（复制 / 回插 / 存盘 / 重跑）      | 已有 | =eimg-ocr.el=        |
-| 三个入口命令（region / file / history）       | 已有 | =eimg-ocr.el=        |
-| 结果查看 / 打开截图目录 / 安装指引            | 已有 | =eimg-ocr.el=        |
-| transient 菜单 =eimg-menu=                    | 已有 | =eimg-transient.el=  |
-| 截图采集（ =eimg-capture= ，写历史）          | 已有 | =eimg-capture.el=    |
-| 选择预览（consult + posframe）                | 已有 | =eimg-select.el=     |
-| 图片插入（ =eimg-insert-*= ，四模式）         | 已有 | =eimg-insert.el=     |
-| embark 集成（ =eimg/image= 动作菜单）         | 已有 | =eimg-embark.el=     |
+| 能力                                               | 状态 | 落地位置             |
+|----------------------------------------------------+------+----------------------|
+| CLI 多后端（rapidocr / ollama / tesseract / auto） | 已有 | =bin/eimg-ocr=       |
+| PDF 栅格化与分页（ =--pdf-pages= / =--dpi= ）      | 已有 | =bin/eimg-ocr=       |
+| 阅读顺序排序（单栏横排）                           | 已有 | =bin/eimg-ocr=       |
+| 后端安装与体检                                     | 已有 | =bin/eimg-ocr-setup= |
+| 纯逻辑（参数拼装 / 退出码 / 解析 / 渲染）          | 已有 | =eimg-core.el=       |
+| 异步进程层与四态收尾                               | 已有 | =eimg-ocr.el=        |
+| 结果 buffer（复制 / 回插 / 存盘 / 重跑）           | 已有 | =eimg-ocr.el=        |
+| 三个入口命令（region / file / history）            | 已有 | =eimg-ocr.el=        |
+| 结果查看 / 打开截图目录 / 安装指引                 | 已有 | =eimg-ocr.el=        |
+| transient 菜单 =eimg-menu=                         | 已有 | =eimg-transient.el=  |
+| 截图采集（ =eimg-capture= ，写历史）               | 已有 | =eimg-capture.el=    |
+| 选择预览（consult + posframe）                     | 已有 | =eimg-select.el=     |
+| 图片插入（ =eimg-insert-*= ，四模式）              | 已有 | =eimg-insert.el=     |
+| embark 集成（ =eimg/image= 动作菜单）              | 已有 | =eimg-embark.el=     |
 
 * 安装
 
@@ -37,6 +37,10 @@ eimg 把「采集图像 → 识别文字 → 产出可用文本或链接」收�
 - 可选外部命令： =pdftoppm= 与 =pdfinfo= （poppler，PDF 栅格化 / 取总页数）、 =tesseract= 。
   缺 =pdftoppm= 时 PDF 输入无法识别；缺 =pdfinfo= 时页码越界可能静默截断
   （见「已知边界」）。
+- 可选 *ollama* 后端：需要本地 ollama 服务 + 一个**显式配置**的视觉模型（本包不代跑
+  ollama pull）。缺服务或缺模型即判该后端不可用， =auto= 会跳过它；可用性判据是 HTTP
+  可达而非 =which ollama= ——典型形态是 ollama 装在 Windows 原生侧、WSL 里没有该命令，
+  但经 mirrored 网络仍能连 =127.0.0.1:11434= 。
 
 ** 后端准备：四种方式与两条硬约束
 
@@ -75,16 +79,35 @@ eimg 把「采集图像 → 识别文字 → 产出可用文本或链接」收�
 
 ** 后端矩阵
 
-| 后端        | 依赖                                            | 中文精度                             | 备注                                                                                                        |
-|-------------+-------------------------------------------------+--------------------------------------+-------------------------------------------------------------------------------------------------------------|
-| =rapidocr=  | Python + onnxruntime + numpy + pillow           | 高（截图场景首选，故 =auto= 排第一） | 模型固定中英文， =--lang= 被忽略且不报错                                                                    |
-| =tesseract= | =tesseract= 可执行文件 + chi_sim / eng 语言数据 | 较低                                 | 缺语言数据时探测即判不可用；装了 =--tessdata= 后 CLI 默认使用 =~/.local/share/eimg/tessdata= ，无需额外配置 |
-| =auto=      | —                                              | —                                   | 探测顺序：rapidocr → tesseract，取第一个可用者                                                             |
+| 后端        | 依赖                                                                               | 中文精度                                                         | 备注                                                                                                        |
+|-------------+------------------------------------------------------------------------------------+------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------|
+| =rapidocr=  | Python + onnxruntime + numpy + pillow                                              | 高（截图场景首选，故 =auto= 排第一）                             | 模型固定中英文， =--lang= 被忽略且不报错                                                                    |
+| =ollama=    | 本地 ollama 服务 + 视觉模型（如 qwen2.5vl / minicpm-v / gemma3 / llama3.2-vision） | 视模型而定（复杂版式 / 表格强于几何引擎，但无 box/conf、速度慢） | 模型必须显式配置，未配置即判不可用；只支持 png / jpg / jpeg                                                 |
+| =tesseract= | =tesseract= 可执行文件 + chi_sim / eng 语言数据                                    | 较低                                                             | 缺语言数据时探测即判不可用；装了 =--tessdata= 后 CLI 默认使用 =~/.local/share/eimg/tessdata= ，无需额外配置 |
+| =auto=      | —                                                                                 | —                                                               | 探测顺序：rapidocr → ollama → tesseract，取第一个可用者                                                   |
 
 rapidocr 的解释器解析顺序（ =--python= 一旦给出就只用它，不再往下探测）：
 =--python= → =EIMG_OCR_PYTHON= 环境变量 → =config.json= 的 =python= 键 → =PATH= 上的
 =python3= → 已知 venv（ =pdf-toc-ocr= 的 =~/.venv/bin/python= ）。路径无效即视为 rapidocr
 不可用，不会抛 traceback。
+
+ollama 后端的模型与服务地址解析顺序：模型 =--ollama-model= → =config.json= 的 =ollama_model=
+（ *无内置默认，未配置即不可用* ， =auto= 直接跳过它）；地址 =--ollama-url= → =config.json=
+的 =ollama_url= → 内置 =http://127.0.0.1:11434= 。可用性判据是「HTTP 可达 + 模型已安装且
+声明支持视觉」（探测 =POST /api/show= 的 =capabilities= ）， **不是** =which ollama= ——典型
+形态是 ollama 装在 Windows 原生侧、WSL 里根本没有该命令，但经 mirrored 网络仍能访问
+=127.0.0.1:11434= 。
+
+** ollama 后端的安全边界
+
+- =--ollama-url= 只接受 =http= / =https= ，且拒绝 =user:pass@= 形式（凭据会进日志与 buffer，
+  改用代理侧认证）。
+- 重定向一律拒绝：服务端 302/307 不会被跟随（防止把图片或请求引向别的主机）。
+- 响应体上限 16 MB、单张图片上限 32 MB；超限按识别失败 / 输入不可读处理。
+- 回环端口不等于可信：ollama 未运行时同机其它进程可抢占 11434 冒充服务，被 OCR 的图片
+  会发给它。ollama 自身无认证，别把 =--ollama-url= 指向不受信任的主机。
+- 识别结果文本来自网络对端； =eimg-ocr-report-style= 为 =org= 时结果 buffer 里可能出现
+  =#+= 之类行，导出前自己确认（本包只做纯文本插入，不 =eval= 任何内容）。
 
 配置与数据目录： =~/.local/share/eimg/= （遵循 =XDG_DATA_HOME= ），内含 =config.json= 、
 =venv/= 、 =tessdata/= 。 =--check= 会逐项打印它们的现状。
@@ -184,16 +207,18 @@ embark 时本模块仍能加载。multitarget（多选）时每个目标各插�
 
 ** 参数表
 
-| 参数              | 取值                              | 默认          | 说明                                                                    |
-|-------------------+-----------------------------------+---------------+-------------------------------------------------------------------------|
-| =--backend=       | =rapidocr= / =tesseract= / =auto= | =auto=        | 后端选择； =auto= 按 rapidocr → tesseract 取第一个可用者               |
-| =--lang=          | tesseract 语法，如 =chi_sim+eng=  | =chi_sim+eng= | 识别语言；rapidocr 忽略此参数（传了也不报错）                           |
-| =--format=        | =text= / =json= / =lines=         | =text=        | =text= 按页输出、页间 =\\f= 分隔； =lines= 每行一条文本； =json= 结构化 |
-| =--pdf-pages=     | 如 =1-5= 或 =3=                   | 全部页        | PDF 只识别指定页；页码越界退出码 3。对图片无意义，会被忽略              |
-| =--dpi=           | 整数，如 =300=                    | =200=         | PDF 栅格化精度                                                          |
-| =--python=        | 路径                              | 自动探测      | rapidocr 解释器；给了就只用它，无效即判 rapidocr 不可用                 |
-| =--tessdata-dir=  | 路径                              | 自动          | 语言数据目录；不给时先系统默认、再 =~/.local/share/eimg/tessdata=       |
-| =--list-backends= | （无值）                          | —            | 列出后端可用性后退出；查询动作，无论有无可用后端都返回 0                |
+| 参数              | 取值                                         | 默认                     | 说明                                                                    |
+|-------------------+----------------------------------------------+--------------------------+-------------------------------------------------------------------------|
+| =--backend=       | =rapidocr= / =ollama= / =tesseract= / =auto= | =auto=                   | 后端选择； =auto= 按 rapidocr → ollama → tesseract 取第一个可用者     |
+| =--lang=          | tesseract 语法，如 =chi_sim+eng=             | =chi_sim+eng=            | 识别语言；rapidocr 忽略此参数（传了也不报错）                           |
+| =--format=        | =text= / =json= / =lines=                    | =text=                   | =text= 按页输出、页间 =\\f= 分隔； =lines= 每行一条文本； =json= 结构化 |
+| =--pdf-pages=     | 如 =1-5= 或 =3=                              | 全部页                   | PDF 只识别指定页；页码越界退出码 3。对图片无意义，会被忽略              |
+| =--dpi=           | 整数，如 =300=                               | =200=                    | PDF 栅格化精度                                                          |
+| =--python=        | 路径                                         | 自动探测                 | rapidocr 解释器；给了就只用它，无效即判 rapidocr 不可用                 |
+| =--tessdata-dir=  | 路径                                         | 自动                     | 语言数据目录；不给时先系统默认、再 =~/.local/share/eimg/tessdata=       |
+| =--ollama-model=  | 模型名，如 =qwen2.5vl:7b=                    | 未配置                   | ollama 视觉模型； *无内置默认* ，未配置即判 ollama 不可用               |
+| =--ollama-url=    | URL，如 =http://10.0.0.5:11434=              | =http://127.0.0.1:11434= | ollama 服务地址； =config.json= 的 =ollama_url= 优先于该默认            |
+| =--list-backends= | （无值）                                     | —                       | 列出后端可用性后退出；查询动作，无论有无可用后端都返回 0                |
 
 位置参数 =FILE ...= 可给多个，支持扩展名： =png= / =jpg= / =jpeg= / =webp= / =bmp= /
 =tif= / =tiff= / =gif= / =pdf= 。
@@ -216,6 +241,9 @@ bin/eimg-ocr --pdf-pages 2-5 --dpi 300 --format json report.pdf
 # 5. 指定后端与显式解释器，并一次识别多张图
 bin/eimg-ocr --backend rapidocr \
   --python ~/.local/share/eimg/venv/bin/python a.png b.png
+
+# 6. 用本地 ollama 的视觉模型识别（模型必须显式指定）
+bin/eimg-ocr --backend ollama --ollama-model qwen2.5vl:7b shot.png
 #+end_src
 
 =--format json= 的形态：顶层 ={"backend": "...", "pages": [...]}= ，每页
@@ -228,7 +256,7 @@ bin/eimg-ocr --backend rapidocr \
 | 码  | 含义                                                                                           | stderr 关键子串         |
 |-----+------------------------------------------------------------------------------------------------+-------------------------|
 | =0= | 成功（含 =--list-backends= 的查询结果）                                                        | —                      |
-| =2= | 无可用 OCR 后端                                                                                | =未找到可用的 OCR 后端= |
+| =2= | 无可用 OCR 后端（ollama 需显式配置模型： =--ollama-model= / =config.json= 的 =ollama_model= ） | =未找到可用的 OCR 后端= |
 | =3= | 输入不可读 / 不存在 / 不支持格式 / 页码越界 / PDF 无法栅格化（缺 =pdftoppm= 、文件损坏或加密） | =无法读取输入=          |
 | =4= | 识别失败（含后端超时）                                                                         | =识别失败=              |
 | =5= | 参数错误                                                                                       | =参数错误=              |
@@ -273,21 +301,21 @@ bin/eimg-ocr --backend rapidocr \
 
 ** transient 菜单（ =eimg-menu= ）
 
-| 组       | 键位 | 动作                                                    |
-|----------+------+---------------------------------------------------------|
-| 识别选项 | =-b= | 后端（ =auto= / =rapidocr= / =tesseract= ），会话内覆盖 |
-|          | =-l= | 语言（ =chi_sim+eng= / =eng= ），会话内覆盖             |
-|          | =-D= | DPI（ =200= / =300= ），会话内覆盖                      |
-| 采集     | =s=  | 截图（ =eimg-capture= ：存盘 + 写历史，不识别）         |
-|          | =o=  | 截图并识别（框选区域）                                  |
-|          | =h=  | 历史截图识别                                            |
-| 文件     | =f=  | 选择文件识别                                            |
-|          | =p=  | 插入图片链接（ =eimg-insert-path= ）                    |
-|          | =b=  | 插入内联图片（ =eimg-insert-display= ）                 |
-| 系统     | =?=  | 列出后端                                                |
-|          | =r=  | 查看结果                                                |
-|          | =d=  | 打开截图目录                                            |
-|          | =S=  | 安装指引                                                |
+| 组       | 键位 | 动作                                                               |
+|----------+------+--------------------------------------------------------------------|
+| 识别选项 | =-b= | 后端（ =auto= / =rapidocr= / =ollama= / =tesseract= ），会话内覆盖 |
+|          | =-l= | 语言（ =chi_sim+eng= / =eng= ），会话内覆盖                        |
+|          | =-D= | DPI（ =200= / =300= ），会话内覆盖                                 |
+| 采集     | =s=  | 截图（ =eimg-capture= ：存盘 + 写历史，不识别）                    |
+|          | =o=  | 截图并识别（框选区域）                                             |
+|          | =h=  | 历史截图识别                                                       |
+| 文件     | =f=  | 选择文件识别                                                       |
+|          | =p=  | 插入图片链接（ =eimg-insert-path= ）                               |
+|          | =b=  | 插入内联图片（ =eimg-insert-display= ）                            |
+| 系统     | =?=  | 列出后端                                                           |
+|          | =r=  | 查看结果                                                           |
+|          | =d=  | 打开截图目录                                                       |
+|          | =S=  | 安装指引                                                           |
 
 三个 infix *只对本次调用生效* ，不改任何 defcustom（优先级链：菜单 ARGS > defcustom >
 CLI 默认）。 =transient= 不随 =eimg.el= 加载：不按菜单的人不为它付启动成本。
@@ -297,7 +325,7 @@ CLI 默认）。 =transient= 不随 =eimg.el= 加载：不按菜单的人不为�
 =--list-backends= 的原始输出，只读， =q= 关闭。与结果 buffer 分开：它没有「页」「正文」，
 混进 =*eimg-ocr*= 会让 =y= / =w= 对着一份列表工作。
 
-* 配置项（19 个 defcustom：11 个在 =eimg-ocr.el= ，8 个在截图三模块）
+* 配置项（21 个 defcustom：13 个在 =eimg-ocr.el= ，8 个在截图三模块）
 
 | 配置项                          | 默认值              | 用途                                                                           |
 |---------------------------------+---------------------+--------------------------------------------------------------------------------|
@@ -307,6 +335,8 @@ CLI 默认）。 =transient= 不随 =eimg.el= 加载：不按菜单的人不为�
 | =eimg-ocr-pdf-dpi=              | =200=               | PDF 栅格化 DPI； =nil= 表示不写该选项                                          |
 | =eimg-ocr-python=               | =nil=               | rapidocr 解释器； =nil= 交给 CLI 探测                                          |
 | =eimg-ocr-tessdata-dir=         | =nil=               | tesseract 语言数据目录； =nil= 交给 CLI（含 eimg 安装目录兜底）                |
+| =eimg-ocr-ollama-model=         | =nil=               | ollama 视觉模型名； =nil= 表示不传 =--ollama-model= （ollama 即判不可用）      |
+| =eimg-ocr-ollama-url=           | =nil=               | ollama 服务地址； =nil= 表示不传 =--ollama-url= （CLI 用内置默认）             |
 | =eimg-ocr-timeout=              | =300=               | 单次 OCR 整体超时秒数（含全部分页）；超时按失败处理，伪退出码 124              |
 | =eimg-ocr-capture-function=     | =nil=               | 截图函数（必须是交互命令）； =nil= 探测 =eimg-capture=                         |
 | =eimg-ocr-images-dir=           | =nil=               | OCR 的图片目录： =eimg-ocr-file= 默认目录 + =eimg-ocr-history= 扫描目录        |
@@ -358,7 +388,7 @@ CLI 默认）。 =transient= 不随 =eimg.el= 加载：不按菜单的人不为�
 | 命令                | 内容                                                               |
 |---------------------+--------------------------------------------------------------------|
 | =make check-parens= | L1：逐文件 =check-parens= （每个文件一个 =emacs -Q --batch= 进程） |
-| =make test=         | L2：加载 =test/*-test.el= 跑 ERT（当前 123 条）                    |
+| =make test=         | L2：加载 =test/*-test.el= 跑 ERT（当前 146 条）                    |
 | =make py-check=     | =bin/= 下可执行 Python 脚本的 =py_compile= （无 python3 则跳过）   |
 | =make full-check=   | =check-parens= + =test= （不含 =py-check= ）                       |
 | =make clean=        | 清 =.elc= / 原生编译缓存 / =__pycache__= / 测试临时目录            |

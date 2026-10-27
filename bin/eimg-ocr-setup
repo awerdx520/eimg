@@ -270,7 +270,16 @@ def confirm(question: str) -> None:
 def run_check(args) -> int:
     """只读：跑后端探测 + 报告配置文件与安装位置现状，不建任何文件/目录。"""
     cli = load_cli()
-    backends = cli.probe_backends(python=args.python, tessdata_dir=args.tessdata_dir)
+    # 本脚本的 argparse 没有 `--ollama-model` / `--ollama-url`（`args` 上根本没有这
+    # 两个属性，写 `args.ollama_model` 会 AttributeError），故传**字面量 None**：
+    # `probe_backends` 内部再走 `_ollama_model(None)` / `_ollama_url(None)`，从
+    # config.json 的 ollama_model / ollama_url 取，缺省 URL 用 CLI 内置默认。
+    backends = cli.probe_backends(
+        python=args.python,
+        tessdata_dir=args.tessdata_dir,
+        ollama_model=None,
+        ollama_url=None,
+    )
     note(f"数据目录: {data_dir()}")
     for entry in backends:
         note(cli.format_backend_line(entry))
@@ -297,6 +306,13 @@ def run_check(args) -> int:
     note(
         f"tessdata 目录: {tessdata}"
         f"（语言数据: {', '.join(langs) if langs else '无'}）"
+    )
+    # 只给指引，不代做：本脚本的安装动作都必须是用户显式触发的（D4），而
+    # `ollama pull` 要下数 GB 权重、还得用户自己挑视觉模型，不适合塞进任何一个
+    # 现有的 `--rapidocr` / `--tessdata` 动作里。
+    note(
+        "ollama 后端：需 ollama pull 一个视觉模型，并在 config.json 写 ollama_model"
+        "（或用 bin/eimg-ocr --ollama-model 临时指定）"
     )
     return EXIT_OK
 

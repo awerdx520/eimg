@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""eimg-ocr —— eimg 统一 OCR CLI（rapidocr / tesseract 识别 + PDF 分页已接入）。
+"""eimg-ocr —— eimg 统一 OCR CLI（rapidocr / ollama / tesseract 识别 + PDF 分页已接入）。
 
 当前能力：参数解析、退出码框架、后端探测、输入校验、输出序列化、
-**图片经 rapidocr 或 tesseract 识别**、**PDF 经 pdftoppm 栅格化后按页识别**
-（`--pdf-pages` 选中单页或区间，`--dpi` 控制栅格化精度）。
+**图片经 rapidocr、tesseract 或 ollama 视觉模型识别**、**PDF 经 pdftoppm 栅格化后
+按页识别**（`--pdf-pages` 选中单页或区间，`--dpi` 控制栅格化精度）。
 
 设计约束（不要在本文件里打破）：
 
 1. 只依赖 Python 标准库（argparse / subprocess / json / os / sys / shutil /
-   pathlib / tempfile）。这样 `bin/eimg-ocr-setup` 可以在任何系统 python 下
-   复用探测逻辑，不必先装依赖。
+   pathlib / tempfile / base64 / urllib）。这样 `bin/eimg-ocr-setup` 可以在任何
+   系统 python 下复用探测逻辑，不必先装依赖。
+   **ollama 后端新增的 `urllib.request` / `urllib.error` / `base64` 仍是标准库，
+   stdlib-only 约定未破**（因此也不允许为了 HTTP 便利去引 requests / httpx）。
 2. **模块顶层零 I/O、零副作用**：`bin/eimg-ocr-setup`（后续任务）会从本文件里
    取 `probe_backends` 复用，`import` 那一刻不能跑任何探测、不能读配置文件、
    不能起子进程。因此路径常量一律写成字面量，路径展开放在函数内部延迟做。
@@ -40,18 +42,33 @@
    按页号回填文件名（`report.pdf` 第 3 页），用下标会让选区页码整体偏移。
 8. **栅格化临时目录必须 finally 清理**：一份 200 dpi 的 10 页 PDF 拆出的 PNG 有
    十几 MB，失败路径（超时 / Ctrl-C / 后端报错）漏删会持续堆积在 /tmp。
+9. **ollama 后端的 HTTP 必须绕代理、且探测永不 raise**：本机 `no_proxy` 未设置，
+   裸用 `urlopen` 会把 `127.0.0.1:11434` 的请求交给 `http_proxy`（表现为「服务在跑
+   却报不可达」），故一律 `build_opener(ProxyHandler({}))`。探测阶段的任何异常
+   （连不上 / 超时 / 坏 JSON）都转成 `available=false` + 人读 `reason`，绝不冒泡到
+   `main`——`--list-backends` 与 `eimg-ocr-setup --check` 走的就是这条路径。
+   同一条路径上还有三条硬边界：**不跟随重定向**（`_NoRedirect`；跟过去等于把带
+   图片的请求体发给任意 `Location`）、**地址只收 http/https 且拒绝 `user:pass@`**
+   （`_validate_ollama_url`；凭据会进日志）、**响应体与图片各有大小上限**
+   （`_read_capped` / `OLLAMA_MAX_IMAGE`；对端不可信时不能无限读）。
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import http.client
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 PROG = "eimg-ocr"
@@ -66,16 +83,33 @@ EXIT_BAD_ARGS = 5      # 参数错误（含「参数错误」）
 DEFAULT_LANG = "chi_sim+eng"
 DEFAULT_DPI = 200
 
+# ollama 服务的默认地址。取 ollama 自己的默认监听（`127.0.0.1:11434`）：本机
+# WSL2 是 mirrored 网络，Windows 侧服务经 `127.0.0.1` 直通可达，不必换成宿主 IP。
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+
 # 所有临时目录统一用这个前缀（栅格化产物 / rapidocr 脚本与结果文件），
 # 便于 `ls -d /tmp/eimg-ocr-*` 做泄漏排查，也便于测试断言清理干净。
 TEMP_PREFIX = "eimg-ocr-"
 
-# 顺序即 `auto` 后端的优先级顺序（rapidocr 对中文截图质量更好，故排在前）。
-BACKEND_ORDER = ("rapidocr", "tesseract")
+# 顺序即 `auto` 后端的优先级顺序：rapidocr 对中文截图质量更好、且本机已装，故排第一；
+# ollama 视觉模型质量高于 tesseract 但需显式配置模型，故居中；tesseract 兜底。
+BACKEND_ORDER = ("rapidocr", "ollama", "tesseract")
 
 # 输入格式白名单：只放图片与 PDF，不做「任意扩展名都试一下」的猜测。
 SUPPORTED_SUFFIXES = (
     ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".pdf",
+)
+
+# ollama 分支的扩展名白名单（比 SUPPORTED_SUFFIXES 窄）。理由：CLI 无 PIL 无法
+# 转码，而 ollama 对 tiff / gif / webp 的解码支持不确定（未实测）；明确拒绝比让它
+# 静默失败或返回乱码好。PDF 栅格化产物恒为 png，故 PDF 路径不受影响。
+OLLAMA_SUFFIXES = (".png", ".jpg", ".jpeg")
+
+# 识别提示词：显式要求「只输出文字」，因为 VLM 默认爱加解释性前缀、编号或代码块。
+# 后续的围栏剥离与空行丢弃只是兜底，不能替代这条约束。
+OLLAMA_PROMPT = (
+    "识别这张图片中的所有文字，按阅读顺序逐行输出。只输出文字本身，不要任何解释、"
+    "不要 Markdown 代码块、不要行号或标注。没有文字时输出空字符串。"
 )
 
 # 计划 D4 定的已知 venv：pdf-toc-ocr 里已经装好 rapidocr，首轮复用它避免重复下载。
@@ -100,6 +134,30 @@ RAPIDOCR_TIMEOUT = 180
 # 加载、大图（A4 300dpi）与慢盘会到数秒级。120 秒给这些留足余量，同时仍是
 # 「卡住」与「慢」的可靠分界（超时按退出码 4 处理，不无限挂起）。
 TESSERACT_TIMEOUT = 120
+
+# ollama 探测超时（`/api/show` / `/api/tags`）。这两个接口只查模型元数据，服务在跑时
+# 本机实测毫秒级；服务没起来是毫秒级 ECONNREFUSED。3 秒只为兜住「防火墙丢包 / 服务
+# 半死」——探测挂在 `--list-backends` 与 `eimg-ocr-setup --check` 的关键路径上，
+# 不能让一次探测把体检拖成分钟级。
+OLLAMA_PROBE_TIMEOUT = 3
+
+# 单张图 ollama 识别超时。VLM 首次推理要把权重读进显存 / 内存（数 GB 级）、首次跑
+# 还可能触发模型加载，比 rapidocr / tesseract 慢一到两个数量级；本机无视觉模型可
+# 实测（计划明确本轮不下载），故按「宁可等」取 300 秒，同时仍是「卡住」与「慢」的
+# 分界（超时按退出码 4 处理，不无限挂起）。
+OLLAMA_TIMEOUT = 300
+
+# ollama 响应体上限（16 MB）。ollama 的 JSON 响应是纯文本 + 元数据，本机实测
+# `/api/show` 数 KB、`/api/chat` 单页文本几十 KB，远小于此；上限只用于兜住
+# 「异常 / 恶意对端」——没有上限时对方一个无限流就能把本进程内存吃干并让
+# `--list-backends` 挂死（`OLLAMA_PROBE_TIMEOUT` 只约束单次 socket 操作，
+# 挡不住慢速滴流）。超出按识别失败处理。
+OLLAMA_MAX_RESPONSE = 16 * 1024 * 1024
+
+# 单张图片大小上限（32 MB）。图片要整份 base64 进请求体，base64 又把体积放大 4/3；
+# 32 MB 已远超实际截图（1920x1080 PNG 约 1–3 MB），上限只防「误传大文件」——
+# 明确拒绝比让它读满内存、再被对端 413 更可预期。
+OLLAMA_MAX_IMAGE = 32 * 1024 * 1024
 
 # `pdfinfo` 取页数超时。它只读 xref 表，本机实测毫秒级；5 秒已是「异常」的判据。
 # 超时按「拿不到页数」处理（返回 None，走 pdftoppm 兜底判据），不算识别失败——
@@ -222,7 +280,7 @@ def build_parser() -> EimgArgumentParser:
         "--backend",
         choices=BACKEND_ORDER + ("auto",),
         default="auto",
-        help="后端选择（默认 auto：按 rapidocr → tesseract 顺序取第一个可用者）",
+        help="后端选择（默认 auto：按 rapidocr → ollama → tesseract 顺序取第一个可用者）",
     )
     parser.add_argument(
         "--lang",
@@ -283,6 +341,25 @@ def build_parser() -> EimgArgumentParser:
         action="store_true",
         help="列出后端可用性后退出（查询动作，无论是否有可用后端都返回 0）",
     )
+    parser.add_argument(
+        "--ollama-model",
+        default=None,
+        metavar="NAME",
+        help=(
+            "ollama 视觉模型名（如 qwen2.5-vl:7b）；「未配置即判 ollama 不可用」——"
+            "本 CLI 不自动挑 vision 模型、也不写死默认模型名。也可写在 config.json 的 "
+            "ollama_model 键里，此处显式给出则以这里为准"
+        ),
+    )
+    parser.add_argument(
+        "--ollama-url",
+        default=None,
+        metavar="URL",
+        help=(
+            f"ollama 服务地址（默认 {DEFAULT_OLLAMA_URL}；也可写在 config.json 的 "
+            "ollama_url 键里，此处显式给出则以这里为准）"
+        ),
+    )
     return parser
 
 
@@ -339,8 +416,13 @@ def resolve_tessdata_dir(explicit: str | None) -> tuple[str | None, str]:
     return str(installed), f"默认使用 eimg 安装目录: {installed}"
 
 
-def _config_python() -> str | None:
-    """读配置文件里的 `python` 键。文件缺失 / 损坏一律静默跳过（返回 None）。"""
+def _config_get(key: str) -> str | None:
+    """读配置文件里的字符串键。文件缺失 / 坏 JSON / 非对象 / 键不可用一律返回 None。
+
+    这是配置链「config.json 层」的唯一读取入口：所有键共用同一套容错（读不到就当
+    没配，绝不因为一个坏文件让 CLI 崩掉——`bin/eimg-ocr-setup` 写配置是原子替换，
+    但用户手工改坏 JSON 的概率不为零）。
+    """
     path = _config_path()
     try:
         raw = path.read_text(encoding="utf-8")
@@ -352,10 +434,92 @@ def _config_python() -> str | None:
         return None
     if not isinstance(data, dict):
         return None
-    value = data.get("python")
+    value = data.get(key)
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _config_python() -> str | None:
+    """读配置文件里的 `python` 键（`_config_get` 的薄包装，行为与旧实现完全一致）。"""
+    return _config_get("python")
+
+
+def _config_ollama_model() -> str | None:
+    """读配置文件里的 `ollama_model` 键（读取规则与 `python` 键同构）。"""
+    return _config_get("ollama_model")
+
+
+def _config_ollama_url() -> str | None:
+    """读配置文件里的 `ollama_url` 键（读取规则与 `python` 键同构）。"""
+    return _config_get("ollama_url")
+
+
+def _ollama_model(explicit: str | None) -> str | None:
+    """模型名解析链：显式值（CLI / elisp ARGS）> config.json `ollama_model` > 无。
+
+    **没有内置默认模型**（用户拍板「模型必须显式指定」）：返回 None 即表示
+    ollama 后端不可用，由 `_probe_ollama` 给出配置指引。
+    """
+    return explicit or _config_ollama_model()
+
+
+def _ollama_url(explicit: str | None) -> str:
+    """服务地址解析链：显式值 > config.json `ollama_url` > `DEFAULT_OLLAMA_URL`。
+
+    返回值**已过 `_validate_ollama_url` 校验**：三条来源（CLI / config.json / 内置
+    默认）在这里汇成唯一出口，所有使用点拿到的都是校验过的地址，不必各自再判一次。
+    校验失败抛退出码 5，由调用方决定是「报参数错误」还是「折成后端不可用」。
+    """
+    return _validate_ollama_url(explicit or _config_ollama_url() or DEFAULT_OLLAMA_URL)
+
+
+def _validate_ollama_url(url: str) -> str:
+    """校验 ollama 服务地址，返回去掉尾部斜杠的规整形态；不合规抛退出码 5。
+
+    三条规则，都在「请求发出去之前」拦：
+
+    1. scheme 只许 `http` / `https`：`file://` / `ftp://` 交给 `urllib` 会变成完全
+       不同的行为（读本地文件、走 FTP 驱动），不该由用户随手敲的一个地址开启。
+    2. 拒绝 `user:pass@`：这类地址一旦出现在 `reason` / stderr / `*eimg-ocr-backends*`
+       buffer 里就是明文密码外泄（`_mask_url` 只是兜底，不是许可证）。ollama 自身
+       也不做 HTTP 认证，凭据只能由前置代理校验，那也不该写在这里。
+    3. 主机名必须存在且不含空白字符：`http://1 27.0.0.1:11434` 这种笔误在
+       `urlsplit` 层是「合法」的（空格原样留在 netloc 里），交给 `urllib` 只会得到
+       一条含糊的 `URLError`（表现为「服务不可达」，退出码 2），与「参数写错了」
+       是两回事，用户排查方向会被带偏。
+
+    `rstrip("/")` 是必须的：后续一律用 `f"{url}/api/show"` 拼路径，不去尾斜杠会
+    拼出 `//api/show`（多数服务容忍，但反代 / 代理规则未必）。
+    """
+    text = (url or "").strip()
+    try:
+        parts = urllib.parse.urlsplit(text)
+    except ValueError:
+        raise fail(EXIT_BAD_ARGS, f"参数错误: --ollama-url 不是合法 URL（收到 {text!r}）")
+
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise fail(
+            EXIT_BAD_ARGS,
+            f"参数错误: --ollama-url 只支持 http/https（收到 {scheme or '空 scheme'}://）",
+        )
+
+    # 注意：这条文案里**绝不能**回显原地址——它的 userinfo 正是密码。
+    if parts.username or parts.password:
+        raise fail(
+            EXIT_BAD_ARGS,
+            "参数错误: --ollama-url 不支持 user:pass@ 形式"
+            "（凭据会进日志，请改用代理侧认证）",
+        )
+
+    host = parts.hostname or ""
+    if not host or any(ch.isspace() for ch in host):
+        raise fail(
+            EXIT_BAD_ARGS,
+            f"参数错误: --ollama-url 主机名非法（收到 {_mask_url(text)!r}）",
+        )
+    return text.rstrip("/")
 
 
 def _python_candidates(explicit: str | None) -> list[tuple[str, str]]:
@@ -559,15 +723,313 @@ def _probe_tesseract(lang: list[str] | str, tessdata_dir: str | None) -> dict:
     }
 
 
+def _ollama_timed_out(exc: BaseException) -> bool:
+    """判断异常是否为超时。
+
+    要沿 `reason` 看一层：`urlopen` 在连接 / 发送阶段把 `socket.timeout` 包成
+    `URLError(reason=timeout)`，而读取响应体阶段是直接抛 `TimeoutError`（`OSError`
+    子类）。只看顶层类型会把「连接超时」误报成「连不上服务」。
+    """
+    candidate: object = exc
+    for _ in range(2):
+        if isinstance(candidate, (TimeoutError, socket.timeout)):
+            return True
+        candidate = getattr(candidate, "reason", None)
+    return False
+
+
+def _ollama_error_text(exc: BaseException) -> str:
+    """把网络异常压成一行短原因——`reason` 要能塞进 `--list-backends` 的单行输出。"""
+    reason = getattr(exc, "reason", None)
+    text = str(reason if reason is not None else exc).strip()
+    return _last_line(text) or exc.__class__.__name__
+
+
+def _mask_url(url: str) -> str:
+    """把 URL 里的 userinfo 抹成 `***`，其余原样。
+
+    reason / stderr 会进 `*eimg-ocr-backends*` buffer 与用户贴出的排障日志，
+    形如 `http://user:pass@host` 的地址必须脱敏，否则密码明文外泄。
+
+    `_validate_ollama_url` 已经在入口拒掉带 userinfo 的地址，这里是**兜底**：
+    兜底之所以不能省，是因为来源不止一条（config.json、`import` 本模块的
+    `bin/eimg-ocr-setup`、将来可能的其它入口），漏一处就是一次密码进日志。
+    正则只吃 `//` 之后到 `@` 之间、不含 `/` 与空白的段，故正常无 `@` 的 URL
+    逐字不变（`http://127.0.0.1:11434` 不会被改动）。
+    """
+    return re.sub(r"(?<=//)[^/@\s]*@", "***@", url or "")
+
+
+class _OllamaRedirect(Exception):
+    """服务端返回了重定向——内部信号，由调用方翻成人读文案。
+
+    为什么不用 `fail(...)` 直接抛：`_ollama_http` 同时服务「探测」与「识别」两条
+    路径，探测路径要求**永不 raise**（否则 `--list-backends` 会变成退出码 4），
+    识别路径要求「重定向 = 识别失败 4」。同一个事件在两处必须给不同结论，故先抛
+    一个中性的内部异常，由各路径自己决定文案与退出码。
+    """
+
+    def __init__(self, code: int) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class _OllamaResponseTooLarge(Exception):
+    """响应体超过 `OLLAMA_MAX_RESPONSE`——内部信号，理由同 `_OllamaRedirect`。"""
+
+    def __init__(self, size: int, limit: int) -> None:
+        super().__init__(size)
+        self.size = size
+        self.limit = limit
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """把所有 3xx 重定向直接拒掉。
+
+    默认的 `HTTPRedirectHandler` 会跟着 `Location` 走：对 ollama 这种「本地可信
+    服务」的假设下，跟随重定向等于把**请求体（含整张图片的 base64）**发到
+    `Location` 指向的任意主机。本包不认为对端可信到可以替我们选目标，故一律拒绝。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        raise _OllamaRedirect(int(code))
+
+
+def _read_capped(response, limit: int = OLLAMA_MAX_RESPONSE) -> str:
+    """有界读取响应体，超过 LIMIT 抛 `_OllamaResponseTooLarge`；返回解码后文本。
+
+    两道闸：先看 `Content-Length`（声明就超限的直接拒，一个字节的 body 都不用读，
+    这也是测试里 `huge` 模式能动辄声明几十 MB 而不真传的原因），再 `read(limit+1)`
+    兜住「没声明长度 / 声明撒谎」的流式响应——多读 1 字节是为了区分「正好等于
+    上限」与「超了」。
+
+    `errors="replace"`：对端返回非 UTF-8 的中文编码时也要能给出可读报错，而不是
+    在这里抛 `UnicodeDecodeError`（那会穿透成 traceback）。
+    """
+    declared = None
+    try:
+        raw_length = response.headers.get("Content-Length") if response.headers else None
+        if raw_length is not None:
+            declared = int(raw_length)
+    except (TypeError, ValueError):
+        # 声明值不可解析：退回「按实际读到的字节数」判定，不在这里失败。
+        declared = None
+    if declared is not None and declared > limit:
+        raise _OllamaResponseTooLarge(declared, limit)
+
+    raw = response.read(limit + 1)
+    if len(raw) > limit:
+        raise _OllamaResponseTooLarge(len(raw), limit)
+    return raw.decode("utf-8", "replace")
+
+
+def _ollama_http(url: str, payload: dict | None, timeout: int) -> tuple[int, str]:
+    """请求 ollama 的 JSON 接口，返回 `(HTTP 状态码, 响应体文本)`。
+
+    - `payload is None` 时发 GET，否则发 POST JSON（`Content-Type: application/json`）。
+    - **必须绕过代理**：本机 `no_proxy` 未设置，裸 `urlopen` 会把 `127.0.0.1` 的请求
+      交给 `http_proxy`，表现为「本地服务在跑却报不可达 / 假 503」。
+      `ProxyHandler({})` 给一张空代理表是唯一可靠的绕法。
+    - **必须拒绝重定向**：见 `_NoRedirect`——跟随 3xx 会把带图片的请求体发去
+      任意 `Location`。
+    - HTTP 错误码**不抛异常**而是照常返回：`404` 的响应体里带着
+      `{"error": "model ... not found"}`，那正是「模型未安装」分支的判据。
+    - 响应体**有界读取**（`_read_capped`）：成功与 `HTTPError` 两条路径都不能
+      `read()` 到底。
+    - 网络层失败（连不上 / 超时 / DNS）仍向上抛，由调用方决定文案；
+      `_OllamaRedirect` / `_OllamaResponseTooLarge` 也原样向上抛（内部信号）。
+    """
+    data = None
+    headers: dict[str, str] = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirect()
+    )
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            status = getattr(response, "status", None) or response.getcode()
+            return int(status), _read_capped(response)
+    except urllib.error.HTTPError as exc:
+        # 顺序要紧：HTTPError 是 URLError 的子类，先捕获它才不会把 404 当连接失败。
+        try:
+            body = _read_capped(exc)
+        except (_OllamaRedirect, _OllamaResponseTooLarge):
+            # 策略性拒绝（重定向 / 响应过大）必须让调用方看见，不能被下面的兜底吞掉。
+            raise
+        except (OSError, ValueError):
+            # 错误响应体读不出来（连接已断 / 已超时）不该掩盖状态码本身：404 的
+            # 判据仍然成立，只是少了响应体里的 `error` 文案。
+            body = ""
+        return int(exc.code), body
+
+
+def _ollama_installed_models(url: str) -> str:
+    """`GET {url}/api/tags` 取已装模型名，拼成一行（仅「模型未安装」分支调用）。
+
+    只在失败分支发一次这个请求：成功路径靠一次 `/api/show` 就能定性，多一次往返
+    没有收益，而 `--list-backends` 已经在探测上多花了时间。
+    """
+    try:
+        status, body = _ollama_http(f"{url}/api/tags", None, OLLAMA_PROBE_TIMEOUT)
+    except (
+        urllib.error.URLError,
+        OSError,
+        ValueError,
+        http.client.HTTPException,  # 对端提前关连接 / 坏 chunk 头（IncompleteRead 等）
+        _OllamaRedirect,  # 「已装列表」只是辅助信息，重定向不值得让整条探测失败
+        _OllamaResponseTooLarge,
+    ):
+        return "（无法获取）"
+    if status != 200:
+        return "（无法获取）"
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return "（无法获取）"
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        return "（无法获取）"
+    names: list[str] = []
+    for item in data["models"]:
+        if not isinstance(item, dict):
+            continue
+        for key in ("name", "model"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                names.append(value.strip())
+                break
+    return ", ".join(names) if names else "（无）"
+
+
+def _probe_ollama(model: str | None, url: str) -> dict:
+    """探测 ollama：服务可达 **且** 指定模型已装 **且** 该模型带 vision 能力才可用。
+
+    返回的 entry 除通用的 `name` / `available` / `reason` 外**额外**带 `model` 与
+    `url`：识别阶段要复用它们（`auto` 选中 ollama 时 `args.ollama_model` 可能是
+    None，值来自 config.json），而 `reason` 只放人读文案——rapidocr 用 `reason` 传
+    解释器路径，语义不同不能混用。
+
+    **本函数永不 raise**：连不上 / 超时 / 坏 JSON 一律折成 `available=False` +
+    明确 reason。只有 `resolve_backend` 才会因为「后端不可用」抛退出码 2。
+    """
+    entry = {
+        "name": "ollama",
+        "available": False,
+        "reason": "",
+        "model": model,
+        "url": url,
+    }
+
+    # 分支 1：未配置模型。此分支**不发任何网络请求**——没模型时连服务在不在都没意义，
+    # 而 `--list-backends` 不该因为缺配置就多等一次超时。
+    if not model:
+        entry["reason"] = (
+            "未配置 ollama 模型：用 --ollama-model NAME 或 config.json 的 ollama_model 键指定"
+        )
+        return entry
+
+    try:
+        status, body = _ollama_http(
+            f"{url}/api/show", {"model": model}, OLLAMA_PROBE_TIMEOUT
+        )
+    except _OllamaRedirect as exc:
+        # 分支 2a：服务端要重定向。探测侧**不能**按「识别失败」报，只能判不可用。
+        entry["reason"] = (
+            f"ollama 服务返回重定向（HTTP {exc.code}），已拒绝跟随"
+            f"（{_mask_url(url)}）"
+        )
+        return entry
+    except _OllamaResponseTooLarge as exc:
+        # 分支 2b：响应体超限。同样是「对端不像 ollama」的信号，判不可用。
+        entry["reason"] = (
+            f"ollama 响应体过大（{exc.size} 字节，上限 {exc.limit}）"
+            f"（{_mask_url(url)}）"
+        )
+        return entry
+    except (
+        urllib.error.URLError,
+        OSError,
+        ValueError,
+        http.client.HTTPException,
+    ) as exc:
+        # 分支 2c：服务不可达（连接失败 / 超时 / 坏 HTTP 报文）。
+        entry["reason"] = (
+            f"ollama 服务不可达（{_mask_url(url)}）：{_ollama_error_text(exc)}"
+        )
+        return entry
+
+    parsed: object = None
+    if body.strip():
+        try:
+            parsed = json.loads(body)
+        except (ValueError, TypeError):
+            parsed = None
+
+    error_field = ""
+    if isinstance(parsed, dict):
+        raw_error = parsed.get("error")
+        if isinstance(raw_error, str):
+            error_field = raw_error
+
+    # 分支 3：模型未安装。判据是 404，或 error 字段里明确说 not found——服务端对
+    # 「模型不存在」的两种表达方式都要认，否则老版本 ollama 会掉进「探测失败」分支。
+    if status == 404 or "not found" in error_field.lower():
+        installed = _ollama_installed_models(url)
+        entry["reason"] = (
+            f"模型 {model} 未安装（{_mask_url(url)}）；已装：{installed}；"
+            f"用 ollama pull {model} 安装"
+        )
+        return entry
+
+    # 分支 4：其它非 200（500 / 503 等）。带响应体前 200 字符，便于用户贴日志排查。
+    if status != 200:
+        entry["reason"] = f"ollama 探测失败（HTTP {status}）：{body[:200]}"
+        return entry
+
+    if not isinstance(parsed, dict):
+        # 200 但不是 JSON 对象：多半是反代塞进来的 HTML 错误页。
+        entry["reason"] = (
+            f"ollama 探测失败（HTTP 200 但响应不是 JSON 对象）：{body[:200]}"
+        )
+        return entry
+
+    capabilities = parsed.get("capabilities")
+    # 分支 5a：capabilities 缺失 / 非 list。按「不支持视觉」处理，但文案要点明成因——
+    # 老版本 ollama 不返回该字段，「缺少字段」与「明确不支持」对用户是两回事。
+    if not isinstance(capabilities, list):
+        entry["reason"] = (
+            f"模型 {model} 不支持视觉（capabilities 缺失）；请换一个视觉模型"
+        )
+        return entry
+
+    caps = [str(item) for item in capabilities]
+    # 分支 5b：含 vision → 可用。
+    if "vision" in caps:
+        entry["available"] = True
+        entry["reason"] = f"{model}（{_mask_url(url)}，vision）"
+        return entry
+
+    # 分支 5c：明确不含 vision。
+    listed = ", ".join(caps) if caps else "空"
+    entry["reason"] = (
+        f"模型 {model} 不支持视觉（capabilities: {listed}）；请换一个视觉模型"
+    )
+    return entry
+
+
 def probe_backends(
     lang: list[str] | str = DEFAULT_LANG,
     python: str | None = None,
     tessdata_dir: str | None = None,
     only: str | None = None,
+    ollama_model: str | None = None,
+    ollama_url: str | None = None,
 ) -> list[dict]:
     """探测可用 OCR 后端，返回 `[{"name", "available", "reason"}, ...]`。
 
-    顺序固定为 rapidocr → tesseract（`auto` 按此优先级取第一个可用者）。
+    顺序固定为 rapidocr → ollama → tesseract（`auto` 按此优先级取第一个可用者）。
     模块级纯函数、无全局副作用：`bin/eimg-ocr-setup` 通过
     `importlib.util.spec_from_file_location` 复用它做 `--check` 体检。
 
@@ -575,17 +1037,50 @@ def probe_backends(
     会为 rapidocr 起一个解释器跑 `import rapidocr`（连带导入 onnxruntime，慢磁盘上
     可达数百毫秒），而那份结果注定不会被 `resolve_backend` 选中。`only=None`
     （默认）保持全量语义——`--list-backends` 与 `--check` 体检依赖它。
+
+    `ollama_model` / `ollama_url` 是**显式值**（CLI 的 `--ollama-model` /
+    `--ollama-url`），为 None 时按配置链回落（config.json → 内置默认 URL）。
+    因此调用方可以直接传 None（`bin/eimg-ocr-setup --check` 就是这么做的：它的
+    argparse 没有这两个选项）。解析**必须在函数内完成**，不能把入参原样下传给
+    `_probe_ollama`——否则 None 会恒落入「未配置模型」分支，config.json 的两个键
+    永远失效。
     """
 
     def probe_rapidocr() -> list[dict]:
         return [_probe_rapidocr(python)]
 
+    def probe_ollama() -> list[dict]:
+        resolved_model = _ollama_model(ollama_model)
+        raw_url = ollama_url or _config_ollama_url() or DEFAULT_OLLAMA_URL
+        try:
+            url = _validate_ollama_url(raw_url)
+        except EimgError as exc:
+            # 地址不合规时**不能**把异常放出去：`--list-backends`、`auto` 与
+            # `bin/eimg-ocr-setup --check`（它直接复用本函数）都要求「探测永不
+            # raise」，异常会变 traceback 或让「查询后端」变成参数错误。
+            # 故折成「不可用 + reason」；CLI 侧「显式 --ollama-url 写错 → 退出码 5」
+            # 由 `main` 在探测之前单独校验（见那里的注释）。
+            return [
+                {
+                    "name": "ollama",
+                    "available": False,
+                    "reason": exc.message,
+                    "model": resolved_model,
+                    "url": _mask_url(raw_url),
+                }
+            ]
+        return [_probe_ollama(resolved_model, url)]
+
     def probe_tesseract() -> list[dict]:
         return [_probe_tesseract(lang, tessdata_dir)]
 
     if only is None:
-        return [*probe_rapidocr(), *probe_tesseract()]
-    known = {"rapidocr": probe_rapidocr, "tesseract": probe_tesseract}
+        return [*probe_rapidocr(), *probe_ollama(), *probe_tesseract()]
+    known = {
+        "rapidocr": probe_rapidocr,
+        "ollama": probe_ollama,
+        "tesseract": probe_tesseract,
+    }
     if only not in known:
         # 显式后端名由 argparse 的 choices 先拦一遍，这里兜住程序内调用者。
         raise fail(EXIT_NO_BACKEND, f"未知后端: {only}")
@@ -1220,6 +1715,154 @@ def run_tesseract(
     return _parse_tesseract_tsv(proc.stdout)
 
 
+# ─── ollama 后端（本地 HTTP + VLM，逐行成块） ────────────────────────────────
+
+# 代码围栏首行：三个反引号，可带语言名（```text / ```python），但**不能有空格**——
+# 带空格的是正文（比如用反引号写的 Markdown 说明），不能当围栏剥掉。
+_FENCE_FIRST = re.compile(r"^```[\w.+\-]*$")
+
+
+def _strip_code_fence(text: str) -> str:
+    """整段被 ``` 围栏包裹时去掉首末两行。
+
+    VLM 常把答案塞进 Markdown 代码块（提示词已明确禁止，但不能只靠它）。判据收紧
+    到「首行是纯围栏标记 + 末行是三反引号」，避免把正文里恰好以 ``` 开头的行当围栏。
+    """
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return text
+    if _FENCE_FIRST.match(lines[0].strip()) and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1])
+    return text
+
+
+def run_ollama(
+    image_path: Path,
+    model: str | None,
+    url: str | None,
+    timeout: int = OLLAMA_TIMEOUT,
+) -> list[dict]:
+    """用 ollama 的视觉模型识别一张图，返回 blocks 列表（每行一块，全部无 box）。
+
+    走 `/api/chat`（而不是 `/api/generate`）：只有 chat 接口有 `messages[].images`
+    这个放图片的槽位，`stream: false` 关掉流式（否则要处理 NDJSON 分块），
+    `options.temperature: 0` 换取可复现的逐字输出，`keep_alive: "5m"` 让模型在多页
+    PDF 的连续调用之间驻留——否则每页都要重新加载权重。
+
+    **拿不到置信度与坐标**：VLM 只回文本，故 `conf` 恒 0.0（不吃 None，下游不必写
+    `if conf is None`）、`box` 恒 None。顺序即模型给的顺序（`sort_blocks_reading_order`
+    对无坐标块整页原样返回），不做任何二次猜测。
+
+    `model` / `url` 由调用方从探测 entry 取（`backend["model"]` / `backend["url"]`）。
+    失败一律退出码 4，且**清理后没有任何行也算失败**——返回空列表会让 `main` 报
+    「未产出任何文本页」，那对 VLM 场景太含糊（图片里确实没字，也该说清是哪一步空的）。
+    """
+    if not model:
+        raise fail(EXIT_OCR_FAILED, f"识别失败: {image_path}（未配置 ollama 模型）")
+    target = url or DEFAULT_OLLAMA_URL
+
+    # 大小检查放在 `read_bytes` **之前**：一张 1 GB 的图读进内存再 base64（再多 4/3）
+    # 足以把本进程的常驻内存推到 OOM，而 OOM 是不带退出码契约的崩溃。stat 只读
+    # inode，代价可忽略；超限按「输入不可读」（3）报，与其它「这个文件不能当输入」
+    # 的失败一致。
+    try:
+        total_bytes = image_path.stat().st_size
+    except OSError as exc:
+        raise fail(
+            EXIT_BAD_INPUT, f"无法读取输入: {image_path}（{exc.strerror or exc}）"
+        )
+    if total_bytes > OLLAMA_MAX_IMAGE:
+        raise fail(
+            EXIT_BAD_INPUT,
+            f"无法读取输入: {image_path}"
+            f"（文件过大，ollama 后端上限 {OLLAMA_MAX_IMAGE // (1024 * 1024)} MB）",
+        )
+
+    try:
+        raw_bytes = image_path.read_bytes()
+    except OSError as exc:
+        raise fail(
+            EXIT_BAD_INPUT,
+            f"无法读取输入: {image_path}（{exc.strerror or exc}）",
+        )
+
+    body = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": OLLAMA_PROMPT,
+                "images": [base64.b64encode(raw_bytes).decode("ascii")],
+            }
+        ],
+        "stream": False,
+        "options": {"temperature": 0},
+        "keep_alive": "5m",
+    }
+
+    try:
+        status, text = _ollama_http(f"{target}/api/chat", body, timeout)
+    except _OllamaRedirect as exc:
+        # 识别侧的重定向就是识别失败（4）：跟过去等于把整张图发到 Location 指向的主机。
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {image_path}"
+            f"（ollama 服务返回重定向（HTTP {exc.code}），已拒绝跟随）",
+        )
+    except _OllamaResponseTooLarge as exc:
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {image_path}"
+            f"（ollama 响应体过大（{exc.size} 字节，上限 {exc.limit}））",
+        )
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        detail = _ollama_error_text(exc)
+        if _ollama_timed_out(exc):
+            raise fail(
+                EXIT_OCR_FAILED,
+                f"识别失败: {image_path}（ollama 超时: 超过 {timeout} 秒未完成）",
+            )
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {image_path}"
+            f"（无法连接 ollama 服务 {_mask_url(target)}: {detail}）",
+        )
+
+    if status != 200:
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {image_path}（ollama 退出码 HTTP {status}: {text[:200]}）",
+        )
+
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError) as exc:
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {image_path}（ollama 响应不是合法 JSON: {exc}）",
+        )
+
+    content = None
+    if isinstance(data, dict):
+        message = data.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+    if not isinstance(content, str):
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {image_path}（ollama 响应缺少 message.content）",
+        )
+
+    # 清理顺序固定：strip → 剥围栏 → 逐行 strip 并丢空行 → 每行一块。
+    lines = [line.strip() for line in _strip_code_fence(content.strip()).splitlines()]
+    blocks = [make_block(line, 0.0, None) for line in lines if line]
+    if not blocks:
+        raise fail(
+            EXIT_OCR_FAILED, f"识别失败: {image_path}（ollama 未识别出任何文字）"
+        )
+    return blocks
+
+
 # ─── PDF 栅格化（pdftoppm） ──────────────────────────────────────────────────
 
 
@@ -1404,6 +2047,19 @@ def recognize_image(path: Path, backend: dict, args) -> list[dict]:
             args.lang,
             tessdata_dir=getattr(args, "tessdata_dir", None),
         )
+    elif name == "ollama":
+        # D-E：扩展名白名单。CLI 无 PIL 无法转码，而 ollama 对 tiff / gif / webp 的
+        # 解码支持不确定（未实测）；明确拒绝优于静默失败。PDF 栅格化产物恒为 png，
+        # 故 PDF 路径不受影响。
+        if path.suffix.lower() not in OLLAMA_SUFFIXES:
+            raise fail(
+                EXIT_BAD_INPUT,
+                f"无法读取输入: {path}（ollama 后端只支持 png/jpg/jpeg；"
+                "tiff/gif/webp 请用 rapidocr 或 tesseract）",
+            )
+        # 模型与 URL **一律取探测 entry 的字段**，不从 args 重新解析：`auto` 选中
+        # ollama 时 `args.ollama_model` 可能是 None（值来自 config.json）。
+        blocks = run_ollama(path, backend.get("model"), backend.get("url"))
     else:
         raise fail(EXIT_OCR_FAILED, f"识别失败: {path}（{kind}；未知后端 {name}）")
 
@@ -1489,14 +2145,27 @@ def main(argv: list[str] | None = None) -> int:
     if not args.list_backends and not args.files:
         parser.error("至少需要一个 FILE（或用 --list-backends 只查后端）")
 
+    # 显式给出的 ollama 地址先校验一次：`--ollama-url ftp://…` 是**参数错误**
+    # （退出码 5），不能等到探测阶段被折成「后端不可用」（那是 2，会让人以为问题
+    # 在服务端而不是自己敲的地址）。config.json 里的地址不在这里拦——那是配置
+    # 问题，折成「ollama 不可用」比让整条命令（含 rapidocr / tesseract）失败更合适，
+    # 见 `probe_backends`。
+    # 校验放在 `try` 内部：它抛的是 `EimgError`（退出码 5），掉到 `try` 之外就是
+    # 一个裸 traceback（退出码 1），那正好是退出码契约里不允许出现的形态。
     try:
+        if args.ollama_url:
+            _validate_ollama_url(args.ollama_url)
         if args.list_backends:
             # --list-backends 是**查询**动作而非识别任务：即便所有后端都不可用，
             # 命令本身也成功完成了「告诉你哪个后端可用、为什么不可用」这件事，
             # 故退出码为 0。否则调用方无法区分「查询失败」与「后端全缺」，
             # 也拿不到已经打印出来的 reason。
             backends = probe_backends(
-                lang=args.lang, python=args.python, tessdata_dir=args.tessdata_dir
+                lang=args.lang,
+                python=args.python,
+                tessdata_dir=args.tessdata_dir,
+                ollama_model=args.ollama_model,
+                ollama_url=args.ollama_url,
             )
             for entry in backends:
                 print(format_backend_line(entry))
@@ -1510,6 +2179,8 @@ def main(argv: list[str] | None = None) -> int:
             python=args.python,
             tessdata_dir=args.tessdata_dir,
             only=None if args.backend == "auto" else args.backend,
+            ollama_model=args.ollama_model,
+            ollama_url=args.ollama_url,
         )
         backend = resolve_backend(args.backend, backends)
 

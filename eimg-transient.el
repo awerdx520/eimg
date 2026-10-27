@@ -74,7 +74,7 @@
   :class 'transient-option
   :key "-b"
   :argument "--backend="
-  :choices '("auto" "rapidocr" "tesseract"))
+  :choices '("auto" "rapidocr" "ollama" "tesseract"))
 
 (transient-define-argument eimg-menu--lang ()
   "tesseract 语言（会话内覆盖，不写入任何 defcustom）。"

@@ -52,12 +52,14 @@
   :group 'eimg)
 
 (defcustom eimg-ocr-backend "auto"
-  "OCR 后端：`auto' 自动选择，或指定 `rapidocr' / `tesseract'。
+  "OCR 后端：`auto' 自动选择，或指定 `rapidocr' / `ollama' / `tesseract'。
+`ollama' 需配合 `eimg-ocr-ollama-model`（未配置时该后端判不可用）。
 落成 CLI 参数 `--backend VALUE'。`eimg-ocr--run' 拼 argv 时取本值，但**ARGS 里
 显式给出的 `:backend' 优先**（菜单 infix `-b' 走的就是这条路），故菜单里换一次
 后端不会写回本变量——「只在这次调用里试了下 tesseract」不该变成改配置。"
   :type '(choice (const :tag "自动选择" "auto")
                  (const :tag "rapidocr" "rapidocr")
+                 (const :tag "ollama" "ollama")
                  (const :tag "tesseract" "tesseract"))
   :group 'eimg)
 
@@ -91,6 +93,24 @@
 
 只在 `tesseract' 后端有意义；ARGS 显式给出 `:tessdata-dir' 时以 ARGS 为准。"
   :type '(choice (const :tag "交给 CLI 探测" nil) directory)
+  :group 'eimg)
+
+(defcustom eimg-ocr-ollama-model nil
+  "ollama 后端使用的视觉模型名（如 \"qwen2.5vl:7b\"）；nil 表示未配置。
+落成 CLI 参数 `--ollama-model NAME'。**必须显式指定**：本层不替你挑模型，CLI 也
+不写死默认模型名——nil 时该后端直接判不可用，退出码提示会给出配置指引。
+配置层共三级，优先级与 `--python' 同构：ARGS 显式给出的 `:ollama-model' 最优先
+（本层不改写 defcustom），其次是 CLI 读到的 `config.json' 的 `ollama_model' 键，
+都没有即不可用。模型还得是带 vision 能力的那种（CLI 会探测并拒绝纯文本模型）。"
+  :type '(choice (const :tag "未配置（ollama 不可用）" nil) string)
+  :group 'eimg)
+
+(defcustom eimg-ocr-ollama-url nil
+  "ollama 服务地址（如 \"http://127.0.0.1:11434\"）；nil 表示交给 CLI 默认。
+落成 CLI 参数 `--ollama-url URL'。nil 时不写进 argv，CLI 自己用内置默认
+`http://127.0.0.1:11434'；只有服务跑到别处（换端口、远程主机）才需要显式配置。
+ARGS 显式给出 `:ollama-url' 时以 ARGS 为准。"
+  :type '(choice (const :tag "交给 CLI 默认（http://127.0.0.1:11434）" nil) string)
   :group 'eimg)
 
 (defcustom eimg-ocr-timeout 300
@@ -745,13 +765,17 @@ batch 环境（`noninteractive'）只填 buffer 不显示窗口：`make test' �
 `:pdf-pages' 没有对应的 defcustom——页范围是**每次调用**才决定的东西，
 默认「全部页」恰好就是「不写这个选项」，故不需要一个可持久化的默认值。
 `:tessdata-dir' 为 nil 时同样不写进 argv：CLI 自己会先看系统默认位置、再看 eimg
-安装目录，本层只负责「用户显式要一个目录」时才接管。"
+安装目录，本层只负责「用户显式要一个目录」时才接管。
+`:ollama-model' / `:ollama-url' 与 `:tessdata-dir' 同理——为 nil 时不进 argv，
+CLI 自己用内置默认 URL、或据此判 ollama 不可用。"
   (list :backend eimg-ocr-backend
         :lang eimg-ocr-lang
         :format "json"
         :dpi eimg-ocr-pdf-dpi
         :python eimg-ocr-python
-        :tessdata-dir eimg-ocr-tessdata-dir))
+        :tessdata-dir eimg-ocr-tessdata-dir
+        :ollama-model eimg-ocr-ollama-model
+        :ollama-url eimg-ocr-ollama-url))
 
 (defun eimg-ocr--config-source (config)
   "从配置 CONFIG 里取第一个输入文件路径；没有时返回 nil。
@@ -1059,8 +1083,12 @@ ARGS 同 `eimg-ocr-region'（plist 覆盖，ARGS 优先，缺的键落 defcustom
    "\n"
    "    bin/eimg-ocr-setup --check\n"
    "\n"
-   "  只做只读探测：列出 rapidocr（Python）与 tesseract 各自的可用状态。\n"
-   "  首次安装前先跑它，能省掉「装完了发现本来就不缺」这类来回。\n"
+   "  只做只读探测：列出 rapidocr（Python）、ollama 与 tesseract 各自的\n"
+   "  可用状态。首次安装前先跑它，能省掉「装完了发现本来就不缺」这类来回。\n"
+   "\n"
+   "  ollama 后端（可选）：ollama pull 一个视觉模型，并在 config.json 写\n"
+   "  ollama_model（或 --ollama-model 临时指定）。模型没有内置默认值：未配置\n"
+   "  即判不可用，`--check' 会把它列为缺项。\n"
    "\n"
    "* 2. 安装 rapidocr 后端（Python）\n"
    "\n"

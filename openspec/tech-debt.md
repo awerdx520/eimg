@@ -147,3 +147,39 @@ OCR 编排路径；在那之前，从 daemon（`emacsclient -e`、定时任务�
 修法二选一：① 给全部 `(interactive)` 命令补 `;;;###autoload` cookie（straight 的
 autoloads 步骤会收集，宿主即可安全 `:defer`）；② 明确把「本包不做延迟加载」写成契约
 （`:demand t` + README 说明），让后来改 `:defer` 的人先看到这句话。
+
+## ollama（VLM）后端的四条边界
+
+1. **无 box/conf**：VLM 只回纯文本，blocks 的 `conf` 恒 `0.0`、`box` 恒 `None`，`sort_blocks_reading_order`
+   退化为「原样返回」。多栏/竖排/跨行块的版面还原能力与 tesseract 路线不可比；下游若依赖置信度
+   做过滤，ollama 结果会被整体当作「低置信」。
+2. **多页 PDF 每页一次推理**：模型驻留靠 `keep_alive:"5m"`，但每页仍是一次完整请求，10 页文档可能
+   到分钟级；且 elisp 侧整体 `eimg-ocr-timeout`（默认 300s）会先于单页 `OLLAMA_TIMEOUT`（300s）
+   触发，多页 PDF 走 ollama 实际表现为「到点被取消」而非「慢慢跑完」。要真正可用需要单进程多用例
+   或调大/解耦整体超时。
+3. **只支持 png/jpg/jpeg**：CLI 无 PIL 无法转码，tiff/gif/webp 直接退出码 3。`auto` 锁定 ollama 时
+   这类输入不会回退 tesseract（有意行为）。
+4. **输出格式漂移未充分防御**：只剥了 Markdown 三反引号围栏，编号列表、解释性前缀、空行结构等
+   漂移未处理；真实 VLM 识别质量与稳定性**未验证**（本轮禁止下载模型，端到端只用了 stub）。
+
+## ollama 探测的超时上限只覆盖单次 socket 操作
+
+`OLLAMA_PROBE_TIMEOUT = 3` 交给 `urllib` 的 `timeout` 参数，它约束的是**每次 socket 操作**，
+不是整个探测：慢速滴流响应用户实测可把一次 `read()` 拖到 19.6 秒，DNS 解析阶段完全不受它约束。
+更彻底的做法是读循环里加单调时钟 deadline（或 `signal.alarm`），把语义升级为「整个探测的硬上限」。
+当前未做：实现成本与收益不成比例（对端是本地服务，异常场景需要主动构造），已通过响应体上限
+（`OLLAMA_MAX_RESPONSE` = 16 MB，`_read_capped` 按 `Content-Length` 先拒、再 `read(limit+1)` 兜底）
+与探测超时缓解到「不会吃满内存、不会无限挂起」，但**「3 秒」不是硬保证**。
+
+## ollama 默认端点无身份校验
+
+`http://127.0.0.1:11434` 是约定而非认证：ollama 未运行时同机其它用户可抢先 bind 该端口冒充服务，
+从而拿到被 OCR 图片的 base64、并控制注入结果 buffer 的文本。缓解手段只有「别指向不受信任的主机」
+与结果 buffer 只做纯文本插入（不 `eval`）。若将来需要，可在探测阶段校验 `/api/version` 响应特征，
+但那只是「更难冒充」，不是认证。
+
+## `--list-backends` / `--check` 现在会发一次本地 HTTP 请求
+
+ollama 探测让这两个「应该毫秒级」的只读命令多了一条网络路径：ollama 未运行时是快速
+ECONNREFUSED（毫秒级），但端口被防火墙 DROP 或对端不响应时最多等 3 秒（且如上一节所述，
+3 秒不是硬上限）。不要在 shell 补全、`init`、hook 或任何启动路径里调用它们。

@@ -58,7 +58,7 @@
   "退出码到文案标签的映射，与 `bin/eimg-ocr' 的退出码契约一致。")
 
 (defconst eimg-core-exit-hints
-  '((2 . "没有可用的 OCR 后端：跑 bin/eimg-ocr-setup --rapidocr 装 Python 后端，或跑 bin/eimg-ocr-setup --tessdata 补齐 tesseract 语言数据（先跑 bin/eimg-ocr-setup --check 可看缺什么）")
+  '((2 . "没有可用的 OCR 后端：跑 bin/eimg-ocr-setup --rapidocr 装 Python 后端，或跑 bin/eimg-ocr-setup --tessdata 补齐 tesseract 语言数据（先跑 bin/eimg-ocr-setup --check 可看缺什么）；或配置 ollama 视觉模型（--ollama-model / config.json 的 ollama_model）后走 ollama 后端")
     (3 . "输入不可读：检查路径与支持的扩展名（png/jpg/jpeg/webp/bmp/tif/tiff/gif/pdf）")
     (4 . "识别失败：可尝试 --backend 切换或重试（换后端 / 提高 --dpi）")
     (5 . "参数错误：查看 --help 确认取值与语法"))
@@ -104,7 +104,9 @@ STDERR 末行（没有则空串）——成功路径不应显示「成功」这�
     (:pdf-pages    . "--pdf-pages")
     (:dpi          . "--dpi")
     (:python       . "--python")
-    (:tessdata-dir . "--tessdata-dir"))
+    (:tessdata-dir . "--tessdata-dir")
+    (:ollama-model . "--ollama-model")
+    (:ollama-url   . "--ollama-url"))
   "plist 关键字到 CLI 选项名的映射；顺序即参数生成顺序。")
 
 (defun eimg-core--arg-value (value)

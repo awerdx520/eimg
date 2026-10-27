@@ -148,6 +148,73 @@
                  (eimg-core-build-args
                   (list :dpi 150 :file "x.png" :format "lines" :backend "auto")))))
 
+;;;; ── 2b. ollama 选项（视觉后端） ────────────────────────────────────────
+
+;; 这一节只关心**新键**：既有的 seven-option 断言保持原样（它不含新键，故不会红，
+;; 也不该为了「看起来完整」去改写——那会丢掉「老键顺序不变」这层旧覆盖）。
+;; 新键按约定只能追加到映射表末尾，因此既验证「存在 / 取值形态」，也验证「位置」。
+
+(ert-deftest eimg-core-test-option-args-ollama-at-end ()
+  "`eimg-core-option-args' 末尾两项是 ollama 的键，且 `:tessdata-dir' 仍在它们之前。
+顺序即 argv 生成顺序：新键只允许追加到末尾。既有键的相对顺序一旦变动，所有既有
+调用方的 argv 日志 diff 都会失真，而功能上又看不出来。"
+  (let* ((keys (mapcar #'car eimg-core-option-args))
+         (pos-tessdata (cl-position :tessdata-dir keys))
+         (pos-model (cl-position :ollama-model keys))
+         (pos-url (cl-position :ollama-url keys)))
+    (should (equal '(:ollama-model :ollama-url) (last keys 2)))
+    (should pos-tessdata)
+    (should pos-model)
+    (should pos-url)
+    (should (< pos-tessdata pos-model))
+    (should (< pos-model pos-url))
+    ;; 映射的取值是 CLI 的真实选项名（拼错就是「参数错误」退出码 5）。
+    (should (equal "--ollama-model" (cdr (assq :ollama-model eimg-core-option-args))))
+    (should (equal "--ollama-url" (cdr (assq :ollama-url eimg-core-option-args))))))
+
+(ert-deftest eimg-core-test-build-args-ollama-nil-absent ()
+  "`--ollama-model' / `--ollama-url' 为 nil 时不进 argv。
+nil 的语义是「交给 CLI 自己决定」：模型 nil 时 CLI 判 ollama 不可用（不替你挑模型），
+URL nil 时用它内置的 `http://127.0.0.1:11434'。写成 `--ollama-model nil' 会让 CLI
+收到一个叫 \"nil\" 的模型名，比不传更糟。"
+  (should (equal '("input.png")
+                 (eimg-core-build-args
+                  (list :ollama-model nil :ollama-url nil :file "input.png"))))
+  (let ((argv (eimg-core-build-args '(:file "input.png"))))
+    (should-not (member "--ollama-model" argv))
+    (should-not (member "--ollama-url" argv))
+    (should-not (member "nil" argv))))
+
+(ert-deftest eimg-core-test-build-args-ollama-nonnil-order ()
+  "两个键都给值时落在选项区末尾、文件路径之前；完整 argv 逐项断言。
+只断言「存在」会放过位置回归（比如被插到 `--backend' 前面），故这里比对整条 argv。"
+  (should (equal '("--backend" "ollama"
+                   "--tessdata-dir" "/usr/share/tessdata"
+                   "--ollama-model" "qwen2.5-vl:7b"
+                   "--ollama-url" "http://127.0.0.1:11434"
+                   "input.png")
+                 (eimg-core-build-args
+                  (list :backend "ollama"
+                        :tessdata-dir "/usr/share/tessdata"
+                        :ollama-model "qwen2.5-vl:7b"
+                        :ollama-url "http://127.0.0.1:11434"
+                        :file "input.png"))))
+  ;; 多文件输入时同样先选项、后路径（`:files' 与 `:file' 都排在最后）。
+  (should (equal '("--ollama-model" "m" "a.png" "b.png")
+                 (eimg-core-build-args
+                  (list :ollama-model "m" :files '("a.png" "b.png"))))))
+
+(ert-deftest eimg-core-test-exit-hint-2-mentions-ollama ()
+  "退出码 2 的提示补上 ollama 的配置路径，且两条老路径仍在。
+这是「只加不改」：ollama 是第三条可选后端，不是 rapidocr / tesseract 的替代品，
+老提示一旦被换掉，用户按提示做就找不到原来的安装入口。"
+  (let ((hint (eimg-core-exit-hint 2)))
+    (should (stringp hint))
+    (should (string-match-p "ollama" hint))
+    (should (string-match-p "--ollama-model" hint))
+    (should (string-match-p "--rapidocr" hint))
+    (should (string-match-p "--tessdata" hint))))
+
 ;;;; ── 3. JSON 解析 ───────────────────────────────────────────────────────
 
 (ert-deftest eimg-core-test-parse-json-two-pages ()

@@ -179,3 +179,31 @@
   `eimg-ocr`，并新增 `eimg-autoload-test-ocr-utilities-load-no-transient` 锁住
   「仅加载 autoloads 时 `(featurep 'transient)` 为 nil 且三条命令 autoload 文件名为
   `"eimg-ocr"`」。`eimg-menu` 仍指向 `eimg-transient`（D8 的结论不变）。
+
+## D12 ollama 视觉模型（VLM）后端接入（2026-10-27）
+
+- **决策**：新增第三个 OCR 后端 `ollama`，通过本地 ollama 服务的 `/api/chat`（`stream:false`、
+  `options.temperature:0`、`keep_alive:"5m"`、`messages[0].images` 传 base64）识别图片与 PDF 页；
+  可用性探测用 `POST /api/show` 读 `capabilities` 是否含 `"vision"`，模型与 URL 解析顺序为
+  `--ollama-model` / `--ollama-url` > `config.json` 的 `ollama_model` / `ollama_url` > 内置默认
+  （URL 有默认 `http://127.0.0.1:11434`，**模型无默认——未配置即判不可用**）。`BACKEND_ORDER`
+  变为 `rapidocr → ollama → tesseract`。
+- **理由**：① 几何型引擎（rapidocr / tesseract）的版面理解靠一维启发式（见 tech-debt「阅读顺序
+  排序只还原单栏横排」），VLM 恰好补这个短板；② 用户已有本地 ollama 服务与模型，接入零额外依赖——
+  HTTP 用 `urllib.request` + `base64`，**stdlib-only 不变量未破**；③ 模型必须显式配置：自动挑
+  vision 模型会让「这次用哪个模型」不可预测，且本机实测零视觉模型，自动挑选必然落到不可用分支；
+  ④ ollama 放在 rapidocr 之后、tesseract 之前：本机默认行为不变（rapidocr 可用），只有在 rapidocr
+  不可用时才用 VLM，而不是让低精度的 tesseract 先吃掉请求。
+- **取舍记录**：VLM 不产出 box/conf，blocks 按「模型输出的行序」切分（`conf=0.0`、`box=None`），
+  `sort_blocks_reading_order` 对全无坐标的块原样返回，因此**不写后端特例**、保持单一归一路径；
+  `auto` 锁定 ollama 后遇到 tiff/gif/webp 直接退出码 3、**不回退** tesseract（`resolve_backend`
+  只挑一次，动态回退会让结果不可预测）；探测阶段给 `--list-backends` / `--check` 引入一次本地
+  HTTP 请求（3 秒上限、`ProxyHandler({})` 绕代理）；本轮**不下载模型**，端到端用
+  `test/fixtures/ollama-stub.py`（stdlib `http.server`）验证请求形态与六条错误分支，真实 VLM
+  识别质量列为未验证项。
+- **同日安全加固（Phase 4 审查驱动，不推翻上述决策）**：`--ollama-url` 入口校验 scheme 白名单
+  （仅 `http` / `https`）与拒绝 `user:pass@`、拒绝跟随重定向（`_NoRedirect`）、错误文案对 userinfo
+  脱敏（`_mask_url`）、响应体 16 MB / 图片 32 MB 上限、`except` 补齐 `http.client.HTTPException`
+  使探测「永不 raise」与退出码契约同时成立。理由：引入 HTTP 对端等于把信任边界从本地二进制扩到
+  网络端点，输入收敛与资源上界是这一层的最低要求；「探测总时长不受 socket timeout 约束」与
+  「默认端点无身份校验」两条未修，已记入 `tech-debt.md`。

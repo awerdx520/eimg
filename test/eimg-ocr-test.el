@@ -1111,6 +1111,81 @@ nil 的语义是「交给 CLI 自己决定」（先系统默认位置、再 eimg
     (should-not (member "/x/tessdata" argv))
     (should (= 1 (cl-count "--tessdata-dir" argv :test #'equal)))))
 
+;;;; ── 9b. ollama 的两个 defcustom 与接线 ──────────────────────────────────
+
+;; 判据仍是「接线」而不是「有没有定义变量」：`eimg-ocr-ollama-model' 单独存在毫无
+;; 价值，价值在于它真的经 `eimg-ocr--config-defaults' → `eimg-core-build-args' 落成
+;; `--ollama-model'，且 nil 时**不**出现（交给 CLI 判「ollama 不可用」）。
+
+(ert-deftest eimg-ocr-test-ollama-defcustoms-and-defaults ()
+  "ollama 的两个 defcustom 存在、默认 nil、类型是 choice，且 choice 首项能表达「未配置」。
+默认 nil 是契约的一部分：`eimg-ocr-backend' 默认 `auto'，模型未配置时 ollama 必须判
+不可用，而不是替用户挑一个模型名（「自动挑模型」是被明确否决的方案）。"
+  (should (boundp 'eimg-ocr-ollama-model))
+  (should (null (default-value 'eimg-ocr-ollama-model)))
+  (should (eq 'choice (car (get 'eimg-ocr-ollama-model 'custom-type))))
+  (should (boundp 'eimg-ocr-ollama-url))
+  (should (null (default-value 'eimg-ocr-ollama-url)))
+  (should (eq 'choice (car (get 'eimg-ocr-ollama-url 'custom-type))))
+  ;; 两个 choice 的首项都是「值为 nil 的 const」：Customize 里能表达「不配置」，
+  ;; 逼用户填一个字符串就等于取消了「未配置即不可用」这条语义。
+  (dolist (symbol '(eimg-ocr-ollama-model eimg-ocr-ollama-url))
+    (let ((first-choice (nth 1 (get symbol 'custom-type))))
+      (should (eq 'const (car first-choice)))
+      (should (null (car (last first-choice)))))))
+
+(ert-deftest eimg-ocr-test-backend-choice-includes-ollama ()
+  "`eimg-ocr-backend' 的 choice 里含 ollama，且四个取值一个不少。
+按取值扫描而不是比对 `(const :tag …)' 整条：tag 是给人看的文案，允许措辞调整；
+取值是契约，`--backend' 的 choices 必须与它一致。"
+  (let ((choices (cdr (get 'eimg-ocr-backend 'custom-type))))
+    (dolist (value '("auto" "rapidocr" "ollama" "tesseract"))
+      (should (cl-some (lambda (item) (equal value (car (last item)))) choices)))))
+
+(ert-deftest eimg-ocr-test-config-defaults-include-ollama ()
+  "`eimg-ocr--config-defaults' 带 `:ollama-model' / `:ollama-url' 两键，默认值 nil。
+判据必须用 `plist-member'：两键的默认值本来就是 nil，`plist-get' 取不到与「键压根
+不存在」不可区分，正好会放过「定义变量但没接线」。"
+  (let ((defaults (eimg-ocr--config-defaults)))
+    (should (plist-member defaults :ollama-model))
+    (should (plist-member defaults :ollama-url))
+    (should (null (plist-get defaults :ollama-model)))
+    (should (null (plist-get defaults :ollama-url)))
+    ;; 新键只允许追加：既有键一个都不能少。
+    (dolist (key '(:backend :lang :format :dpi :python :tessdata-dir))
+      (should (plist-member defaults key)))))
+
+(ert-deftest eimg-ocr-test-run-ollama-nil-not-in-argv ()
+  "两键为 nil 时 `eimg-ocr--run' 的 argv 不含 `--ollama-model' / `--ollama-url'。
+nil 的语义是「交给 CLI」：模型 nil → CLI 判 ollama 不可用并给配置指引；URL nil →
+CLI 用它内置的 `http://127.0.0.1:11434'。"
+  (eimg-ocr-test--reset)
+  (let ((argv (eimg-ocr-test--capture-argv '(:file "/tmp/eimg-a.png"))))
+    (should-not (member "--ollama-model" argv))
+    (should-not (member "--ollama-url" argv))
+    (should-not (member "nil" argv))
+    ;; 既有键不受影响（新键为 nil 不该把别的选项挤掉）。
+    (should (equal "auto" (eimg-ocr-test--arg-value argv "--backend")))
+    (should (equal "/tmp/eimg-a.png" (car (last argv))))))
+
+(ert-deftest eimg-ocr-test-run-ollama-from-defcustom-and-args ()
+  "两键非 nil 时进 argv；ARGS 显式给出则覆盖 defcustom（同一选项只出现一次）。
+两向都钉：只测「不出现」会把「压根没接线」判成通过，只测「出现」又看不出优先级。"
+  (eimg-ocr-test--reset)
+  (let* ((eimg-ocr-ollama-model "qwen2.5-vl:7b")
+         (eimg-ocr-ollama-url "http://127.0.0.1:11434")
+         (argv (eimg-ocr-test--capture-argv '(:file "/tmp/eimg-a.png"))))
+    (should (equal "qwen2.5-vl:7b" (eimg-ocr-test--arg-value argv "--ollama-model")))
+    (should (equal "http://127.0.0.1:11434"
+                   (eimg-ocr-test--arg-value argv "--ollama-url"))))
+  (eimg-ocr-test--reset)
+  (let* ((eimg-ocr-ollama-model "from-defcustom")
+         (argv (eimg-ocr-test--capture-argv
+                '(:ollama-model "from-args" :file "/tmp/eimg-a.png"))))
+    (should (equal "from-args" (eimg-ocr-test--arg-value argv "--ollama-model")))
+    (should-not (member "from-defcustom" argv))
+    (should (= 1 (cl-count "--ollama-model" argv :test #'equal)))))
+
 (ert-deftest eimg-ocr-test-run-forces-json-format ()
   "ARGS 里的 `:format' 被忽略，argv 恒为 `--format json'。
 理由：结果 buffer 必须按页解析结构化输出；渲染风格是**另一件事**
@@ -1217,14 +1292,15 @@ nil 的语义是「交给 CLI 自己决定」（先系统默认位置、再 eimg
       targets))))
 
 (ert-deftest eimg-ocr-test-config-defcustoms-have-no-global-setq ()
-  "源码里不存在对这六个 defcustom 的全局 `setq' / `setq-default'。
+  "源码里不存在对这八个 defcustom 的全局 `setq' / `setq-default'。
 一旦有人用 `setq' 把它们钉死，用户的 Customize 设置会被静默覆盖（且谁赢取决于
 加载时机），而代码里看不出任何异常——这类回归只能在文本层锁住。
 注释里出现这些名字是允许的（`read' 会跳过注释），故不受影响。"
   (let* ((root (file-name-directory (file-truename (locate-library "eimg"))))
          (files (directory-files root t "\\`eimg.*\\.el\\'"))
          (names '(eimg-ocr-backend eimg-ocr-lang eimg-ocr-pdf-dpi
-                  eimg-ocr-python eimg-ocr-tessdata-dir eimg-ocr-report-style)))
+                  eimg-ocr-python eimg-ocr-tessdata-dir eimg-ocr-report-style
+                  eimg-ocr-ollama-model eimg-ocr-ollama-url)))
     (should files)
     (dolist (file files)
       (with-temp-buffer

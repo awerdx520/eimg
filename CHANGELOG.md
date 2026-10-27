@@ -18,6 +18,20 @@
   不加 cookie）、embark 补偿形态、真跑 `loaddefs-generate` 的映射表、仅加载 autoloads 时
   的 `fboundp` / `autoloadp` 语义、「看结果 / 开目录 / 看指引不加载 transient」、以及
   embark 加载后的注册结果。
+- **ollama 视觉模型（VLM）OCR 后端**：`bin/eimg-ocr` 新增第三个后端 `ollama`，走本地 ollama
+  服务的 `/api/chat`（`stream:false`、`options.temperature:0`、`keep_alive:"5m"`、
+  `messages[0].images` 传 base64）；可用性探测用 `POST /api/show` 读 `capabilities` 是否含
+  `vision`。CLI 新增 `--ollama-model` / `--ollama-url`，`--list-backends` 与
+  `bin/eimg-ocr-setup --check` 各多一行 ollama 状态与指引。
+- **elisp 侧接入 ollama**：新增 defcustom `eimg-ocr-ollama-model` / `eimg-ocr-ollama-url`
+  （默认 `nil` = 不传对应选项），`eimg-ocr-backend` 增加 `ollama` 取值，`eimg-core-option-args`
+  末尾补两键，`eimg-core-exit-hints` 的 2 号提示补 ollama 一句，transient `-b` 的 choices
+  增加 `ollama`，安装指引 `eimg-ocr--setup-help-text` 补 ollama 一条。
+- **`test/fixtures/ollama-stub.py` + 6 条 stub 端到端 ERT**：用 stdlib `http.server` 起本地
+  stub（`OLLAMA_STUB_MODE` 分 vision / novision / missing 三档），锁请求形态（chat 请求体、
+  base64 图片、`stream:false`）与六条用例：vision 端到端产出多行文本 / 不支持视觉 /
+  模型未安装（回显已装列表）/ 未配置模型 / 拒绝 tiff 等不支持后缀 / 收尾无残留进程。
+  真实 VLM 识别质量未验证（本轮不下载模型）。
 
 ### 变更
 
@@ -38,6 +52,26 @@
   与 `make clean` 同步覆盖 `*-autoloads-test*.el`——ERT 的 autoload 用例把生成物写到仓库根
   （`loaddefs-generate` 记的是相对输出目录的路径，写 `/tmp` 会得到解析不到的 `../eimg-*`），
   正常跑完即删，Ctrl-C 打断时会残留。
+- **`auto` 后端顺序由 `rapidocr → tesseract` 改为 `rapidocr → ollama → tesseract`**：
+  几何引擎可用时行为不变；只有 rapidocr 不可用时才轮到 VLM，而不是让低精度的 tesseract
+  先吃掉请求。ollama 锁定后的输入不支持（tiff / gif / webp）直接退出码 3，不回退 tesseract。
+- **ollama 模型无内置默认**：模型必须显式配置（`--ollama-model` / config.json 的
+  `ollama_model`），未配置即判 ollama 不可用；URL 有默认 `http://127.0.0.1:11434`。
+
+### 修复
+
+- ollama 后端安全加固（Phase 4 审查驱动）：
+  - `--ollama-url` 只接受 `http` / `https`，拒绝 `user:pass@` 形式与含空白字符的主机名（退出码 5），
+    避免把图片发往任意协议/主机的输入面
+  - 拒绝跟随 HTTP 重定向（302/307 不再被跟随），防止请求被引向别的主机
+  - 错误文案与 `--list-backends` 的 `reason` 对 URL 中的 userinfo 做脱敏（`***@`），凭据不再进 stderr / buffer
+  - `_probe_ollama` / `run_ollama` 捕获 `http.client.HTTPException`，非法 URL 不再打出 traceback、退出码回归 0/2/3/4/5 契约
+  - ollama 响应体上限 16 MB、单张图片上限 32 MB（超限分别按退出码 4 / 3 处理）
+
+### 测试
+
+- 新增 8 条 ollama ERT：代码围栏剥除、拒绝重定向、响应体过大、非 http(s) URL、
+  含凭据 URL 被拒且不泄漏、config.json 凭据不泄漏、超大图片被拒、`--list-backends` 行序
 
 ## [0.1.0] - 2026-10-27
 
