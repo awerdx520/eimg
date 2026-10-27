@@ -41,10 +41,8 @@
 
 ;;;; ── 1. 可配置项与模块状态 ────────────────────────────────────────────
 
-(defgroup eimg nil
-  "截图与 OCR 一体化工具包。"
-  :group 'tools
-  :prefix "eimg-")
+;; 自定义组 `eimg' 由 `eimg-core.el' 定义（全包唯一，`eimg-core' 保证先加载）；
+;; 本文件的 defcustom 一律 `:group 'eimg'`，不再重复 `defgroup'。
 
 (defcustom eimg-ocr-cli-path nil
   "`bin/eimg-ocr' 的绝对路径；nil 表示按 `eimg-ocr--cli-path' 自动推导。

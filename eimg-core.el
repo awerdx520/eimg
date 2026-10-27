@@ -22,8 +22,8 @@
 ;;   1. **顶层零第三方依赖**：只 require 内置库。本文件会被 headless 的 `emacs -Q'
 ;;      测试进程加载，顶层 require 任何第三方 UI 包（补全 / 预览 / 菜单 / 弹窗
 ;;      四类）都会让 `make test' 直接失败——它们不在 `emacs -Q' 的 load-path 上。
-;;   2. **不引用任何宿主配置的常量**（如 thomas-emacs 的 `init-const'）：目录、
-;;      版本一类的东西由调用方（`eimg-ocr.el'）传参或自行 setq。
+;;   2. **不引用任何宿主配置的常量**（如宿主 Emacs 配置仓库的 `init-const'）：目录、
+;;      版本一类的东西由调用方（`eimg-ocr.el' / `eimg-capture.el'）传参或自行 setq。
 
 ;;; Code:
 
@@ -31,6 +31,18 @@
 (require 'json)
 
 (define-error 'eimg-core-parse-error "eimg JSON 解析错误")
+
+;;;; ── 0. 自定义组（全包唯一） ─────────────────────────────────────────────
+
+;; 全包的 `defgroup' 只在这里定义一次，其它模块一律 `:group 'eimg'`。
+;; 为什么不让各模块各写一份：`defgroup' 带 `:prefix` 与 `:group 'tools'`，
+;; 重复定义会让 `customize-group` 的父子关系随加载顺序漂移；而且 `eimg-core'
+;; 是唯一被所有模块（含 `eimg-ocr'）require 的底层，放在这里能保证任何模块
+;; 求值 `defcustom' 时组已存在。
+(defgroup eimg nil
+  "截图与 OCR 一体化工具包。"
+  :group 'tools
+  :prefix "eimg-")
 
 ;;;; ── 1. 退出码映射（单一事实来源） ──────────────────────────────────────
 
