@@ -24,6 +24,10 @@
 (defconst eimg-version "0.1.0"
   "eimg 当前版本号。")
 
+;; 纯逻辑层与版本常量同批加载：它零第三方依赖，加载代价可忽略，而调用方
+;; （eimg-ocr.el / eimg-transient.el）几乎总要用到其中的参数拼装与渲染。
+(require 'eimg-core)
+
 (provide 'eimg)
 
 ;;; eimg.el ends here
