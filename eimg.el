@@ -28,6 +28,10 @@
 ;; （eimg-ocr.el / eimg-transient.el）几乎总要用到其中的参数拼装与渲染。
 (require 'eimg-core)
 
+;; 进程层同样零第三方依赖，且它是 eimg 唯一的对外能力入口（`eimg-ocr-cancel'
+;; 等交互命令随之可用），故紧随纯逻辑层加载。
+(require 'eimg-ocr)
+
 (provide 'eimg)
 
 ;;; eimg.el ends here
