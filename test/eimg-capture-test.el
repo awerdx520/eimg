@@ -1,4 +1,4 @@
-;;; eimg-capture-test.el --- eimg-capture 与「本步未接线」不变量的 ERT 用例  -*- lexical-binding: t; -*-
+;;; eimg-capture-test.el --- eimg-capture 与「接线已完成」不变量的 ERT 用例  -*- lexical-binding: t; -*-
 
 ;; Author: ThomasDon
 ;; Version: 0.1.0
@@ -11,8 +11,8 @@
 ;; 的形态，任一被悄悄拆掉的症状都属于事后难以归因的类型：
 ;;   - 四个迁移模块顶层零第三方 require（headless 测试进程没有这些包）；
 ;;   - 四个模块不得出现宿主符号（`thomas' 一律禁止）；
-;;   - `eimg.el' 本步**不** require 新模块（否则采集命令与宿主实现并存，
-;;     同一张截图会被写进两份历史）；
+;;   - `eimg.el' **已** require 四个截图模块（否则采集探测会退到宿主实现，
+;;     同一张截图被写进两份历史）；
 ;;   - `(defgroup eimg' 全包只定义一次。
 ;;
 ;; 本文件自带 `(require 'eimg-capture)'：Makefile 按字母序加载 `TEST_FILES'，
@@ -224,17 +224,45 @@ push 时报 `wrong-type-argument'。同时反向断言「合法形态仍被采�
     (should-not (string-match-p "thomas-" core))
     (should-not (string-match-p (regexp-quote "+thomas/") core))))
 
-(ert-deftest eimg-capture-test-eimg-el-does-not-require-new-modules ()
-  "本步不接线：`eimg.el' 不得 require（甚至不得提及）四个新模块。
+(ert-deftest eimg-capture-test-eimg-el-requires-new-modules ()
+  "接线已完成：`eimg.el' 必须 require 四个截图模块，且 `(require 'eimg)' 后
+四个 feature 全部就绪。
 
-为什么必须锁：`eimg-ocr--capture-function' 的探测顺序是
-「显式函数 → `eimg-capture' → 宿主截图命令」。一旦 `eimg.el' 把 `eimg-capture'
-拉起来，用宿主配置的用户会同时拥有 eimg 与宿主两套采集实现，同一张截图被写进
-两份历史文件。接线是下一步（切换）的事，届时这条断言应被**改写**而不是删除。"
-  (let ((src (eimg-capture-test--source "eimg.el")))
+为什么必须锁（方向已反转，防的问题不变）：`eimg-ocr--capture-function' 的
+探测顺序是「显式函数 → `eimg-capture' → 宿主截图命令」。`eimg-capture' 若没被
+加载，探测会静默退到宿主实现——两套采集并存，同一张截图被写进两份历史文件。
+故本用例锁「模块存在但未被加载」这个失败态。
+
+featurep 走**子进程**：本测试文件自身 `(require 'eimg-capture)' / `(require
+'eimg-insert)'，当前进程里 featurep 恒为 t，断言会假绿。"
+  ;; 一、源码形态：四条 require 都在 `(provide 'eimg)' 之前
+  (let* ((src (eimg-capture-test--code-text
+               (eimg-capture-test--source "eimg.el")))
+         (provide-pos (string-match "(provide 'eimg)" src)))
     (should src)
+    (should provide-pos)
     (dolist (library eimg-capture-test--migrated-modules)
-      (should-not (string-match-p (regexp-quote library) src)))))
+      (let ((pos (string-match (concat "^(require '" (regexp-quote library) ")")
+                               src)))
+        (should pos)
+        (should (< pos provide-pos)))))
+  ;; 二、运行态：全新进程里 `(require 'eimg)' 即拉起四层
+  (let* ((root (file-name-directory (file-truename (locate-library "eimg"))))
+         (emacs (expand-file-name invocation-name invocation-directory))
+         (buffer (generate-new-buffer " *eimg-capture-probe*")))
+    (unwind-protect
+        (progn
+          (should (eq 0 (call-process
+                         emacs nil buffer nil
+                         "-Q" "--batch" "-L" root
+                         "--eval"
+                         (concat "(progn (require 'eimg) (princ (format \"%s\" "
+                                 "(mapcar #'featurep (quote (eimg-capture "
+                                 "eimg-select eimg-insert eimg-embark))))))"))))
+          (should (equal "(t t t t)"
+                         (string-trim
+                          (with-current-buffer buffer (buffer-string))))))
+      (kill-buffer buffer))))
 
 (ert-deftest eimg-capture-test-defgroup-defined-once ()
   "`(defgroup eimg' 全包只在 `eimg-core.el' 定义一次。
