@@ -363,22 +363,34 @@ BOX 先经 `--normalize-box'：OCR 后端给出 x0>x1 / y0>y1 的坐标并不罕
             (if current eimg-ocr-view--stroke-current eimg-ocr-view--stroke)
             (if current (round (* 1.5 stroke-width)) stroke-width))))
 
+(defconst eimg-ocr-view--svg-prefix-cache-size 3
+  "SVG 前缀缓存的条目容量（LRU 淘汰），见 `eimg-ocr-view--svg-prefix-cache'。
+为什么是 3 而不是 1：实际用起来最常发生在「对比」上——盯着当前页，往前翻一页看看、
+再往后翻一页看看，然后翻回当前页。只留一条时每次翻回去都要重读并重编码几 MB 的
+底图（翻三轮就是三次全量重拼），留 3 条正好覆盖「当前页 + 正反各一页」这一个来回。
+为什么也不留更多：每条缓存里都是一份 MB 级的 base64 前缀，无界就等于把整份文档的
+底图全驻在内存里；而且再往外的页早就翻过去了，命中率低得不值这份内存。")
+
 (defvar eimg-ocr-view--svg-prefix-cache nil
-  "最近一次合成的 SVG 前缀缓存，plist `(:key KEY :text TEXT)'；nil 表示还没算过。
+  "SVG 前缀的 LRU 缓存：有序 alist `((KEY . TEXT) ...)'，**最近使用在最前**；nil 表示空。
 为什么要单独缓存「前缀」：前缀里含整张底图的 base64（单页几 MB），而 `--refresh'
 每次光标移动都要重拼整条 SVG 串，重拼的代价几乎全在那一段上。命中时只拼 `<rect>'，
 「光标动一格」的开销就从「几 MB 的字符串拼接」降到「几十条几百字节的 rect」。
 KEY 是 `(路径 修改时间 大小 原图宽 原图高 显示宽 显示高)'，**任一项变化即重建**：
 页图被重新识别覆盖（路径相同、mtime / size 变）、换页（路径变）、窗口尺寸变化导致
-显示尺寸变化（px-w / px-h 变）都会让旧前缀失效。只留一条（不像 base64 缓存留多条）：
-前缀永远只服务「当前页」，翻页后旧前缀再也用不上，留多份只是白占内存。")
+显示尺寸变化（px-w / px-h 变）都会让旧前缀失效。
+容量上限是 `eimg-ocr-view--svg-prefix-cache-size'（3）条，按 LRU 淘汰：命中即把该
+条目提到表头（`--svg-prefix' 负责），未命中插表头、超出容量砍掉表尾。于是「翻回上
+一页」这类来回对比能直接命中，而连续翻很多页时内存也不会随页数增长。
+维护提示：KEY 是 list，查表一律用按 `equal' 比较的 `assoc'，**不要**用 `assq'。")
 
 (defun eimg-ocr-view--svg-prefix (image-path width height px-w px-h)
   "返回 SVG 从根元素到内嵌底图为止的那一段字符串；读不到底图时返回 nil。
 IMAGE-PATH 是页图路径（MIME 类型也由它的扩展名得出），WIDTH / HEIGHT 是原图像素
 （`viewBox' 与底图尺寸都用它），PX-W / PX-H 是显示像素——它们当前不写进 SVG，但
 「显示尺寸变了」意味着换了画布，保守起见让它们参与缓存失效判断。
-缓存与失效条件见 `eimg-ocr-view--svg-prefix-cache'。
+缓存是容量 `eimg-ocr-view--svg-prefix-cache-size'（3）条的 LRU：命中即把该条目提到
+表头，未命中则插表头、超容砍掉表尾；失效条件见 `eimg-ocr-view--svg-prefix-cache'。
 底图必须带 `preserveAspectRatio=\"none\"'：viewBox 与显示尺寸的比例一致时两种写法
 画出来一样，但一旦比例有微小差异（浮点取整），等比居中就会把整张图缩到中间、四周
 留白，而框还在原坐标上——看起来像「框全偏了」。"
@@ -387,10 +399,17 @@ IMAGE-PATH 是页图路径（MIME 类型也由它的扩展名得出），WIDTH /
                    (list image-path
                          (float-time (nth 5 attrs))
                          (nth 7 attrs)
-                         width height px-w px-h))))
-    (if (and (plist-get eimg-ocr-view--svg-prefix-cache :text)
-             (equal key (plist-get eimg-ocr-view--svg-prefix-cache :key)))
-        (plist-get eimg-ocr-view--svg-prefix-cache :text)
+                         width height px-w px-h)))
+         (hit (and key (assoc key eimg-ocr-view--svg-prefix-cache))))
+    (cond
+     (hit
+      ;; 命中即「刚用过」：把这一条提到表头。提到表头而不是原地不动，是因为淘汰发生在
+      ;; 表尾——不提升就会把「正在来回对比的两页」当成最旧的淘汰掉。`remq' 按 cons 单元
+      ;; 比较（`hit' 就是表里那一格），删掉原位后重挂表头，不碰其它条目。
+      (setq eimg-ocr-view--svg-prefix-cache
+            (cons hit (remq hit eimg-ocr-view--svg-prefix-cache)))
+      (cdr hit))
+     (t
       (let ((base64 (eimg-ocr-view--base64 image-path)))
         (when base64
           (let ((text (concat
@@ -402,8 +421,13 @@ IMAGE-PATH 是页图路径（MIME 类型也由它的扩展名得出），WIDTH /
                                        " preserveAspectRatio=\"none\"/>\n")
                                (eimg-ocr-view--mime-type image-path)
                                base64 width height))))
-            (setq eimg-ocr-view--svg-prefix-cache (list :key key :text text))
-            text))))))
+            ;; 插表头 + 按容量截断表尾：`seq-take' 返回前 N 条（新表头 + 旧缓存的前 N-1），
+            ;; 被截掉的正好是最久未使用的那些。插入路径上不会出现重复键——能走到这里说明
+            ;; 上面 `assoc' 没命中。
+            (setq eimg-ocr-view--svg-prefix-cache
+                  (seq-take (cons (cons key text) eimg-ocr-view--svg-prefix-cache)
+                            eimg-ocr-view--svg-prefix-cache-size))
+            text)))))))
 
 (defun eimg-ocr-view--svg (image-path width height px-w px-h rects current)
   "合成一页的 SVG 字符串；读不到底图时返回 nil。

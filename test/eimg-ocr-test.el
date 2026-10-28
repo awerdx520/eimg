@@ -1369,6 +1369,40 @@ CLI 用它内置的 `http://127.0.0.1:11434'。"
         (funcall callback status stdout stderr code)))
     (eimg-ocr-test--arg-value captured "--page-images-dir")))
 
+(defun eimg-ocr-test--run-with-pages (args page-count &optional status)
+  "调 `eimg-ocr--run'（`eimg-ocr--start' 打桩），模拟 CLI 落 PAGE-COUNT 张页图。
+在回调触发**之前**把页图写进本次 argv 的 `--page-images-dir' 目录：真实时序就是
+「CLI 边跑边写、sentinel 收尾时才有机会删目录」，提前写会让「目录已被删」的用例
+假绿。stdout 是与页数一致的 JSON（每页带 `image' 绝对路径，联动视图要它定位原图）。
+STATUS 默认 `finished'；`failed' / `cancelled' 时不产生页图渲染（结果 buffer 不动）。
+返回本次 argv 里生效的页图目录；调用方没有 `--page-images-dir' 时为 nil。
+失败态的 `message' 一律压掉：批量输出里那些文案不影响断言，却会把 `make test' 的
+输出刷满。"
+  (let (captured callback)
+    (cl-letf (((symbol-function 'eimg-ocr--start)
+               (lambda (argv cb) (setq captured argv callback cb) 'eimg-ocr-test-proc))
+              ((symbol-function 'message) (lambda (&rest _) nil)))
+      (with-temp-buffer
+        (eimg-ocr--run args))
+      (let* ((dir (eimg-ocr-test--arg-value captured "--page-images-dir"))
+             (pages nil))
+        (dotimes (i page-count)
+          (let ((name (format "page-%d.png" (1+ i))))
+            (when (stringp dir)
+              (with-temp-file (expand-file-name name dir)
+                (insert "PNG")))
+            (push (format (concat "{\"page\":%d,\"image\":%S,"
+                                  "\"blocks\":[{\"text\":\"第 %d 页\"}]}")
+                          (1+ i) (and dir (expand-file-name name dir)) (1+ i))
+                  pages)))
+        (when callback
+          (funcall callback
+                   (or status 'finished)
+                   (format "{\"pages\":[%s]}"
+                           (mapconcat #'identity (nreverse pages) ","))
+                   "" (if (eq (or status 'finished) 'finished) 0 2)))
+        dir))))
+
 (ert-deftest eimg-ocr-test-pdf-input-p ()
   "`eimg-ocr--pdf-input-p' 只看扩展名、大小写不敏感，且 `:file' / `:files' 都算。
 这一条决定「这次要不要让 CLI 落页图」，判错的两个方向都有代价：漏判 → 联动视图
@@ -1631,69 +1665,164 @@ DIR 的出处是 plist，任何一段 elisp 都能往里面塞任意路径；「
       (when (and dir (file-exists-p dir))
         (ignore-errors (delete-directory dir t))))))
 
-(ert-deftest eimg-ocr-test-run-rerun-keeps-page-images-dir ()
-  "rerun 复用上一轮配置（其中带 `:page-images-dir'）时，页图目录必须保留。
-**这是 T10 的行为变更**：META 的 `:pages-dir' 记的是**实际生效目录**（effective），
-不是「本层是否拥有该目录」（owned）。`g'（`eimg-ocr-rerun'）复用的是上一轮合并后
-的配置，本轮不新建目录（`owned' 为 nil），但 CLI 这次仍把页图写进上一轮那个目录；
-若 meta 按 owned 记成 nil，`eimg-ocr--show-result' 会把「旧 `:pages-dir' = D」与
-「新 `:pages-dir' = nil」判为不同，删掉 D——重跑一次页图全失效，联动视图退化成
-「找不到页图」的一列文本。
+(ert-deftest eimg-ocr-test-run-rerun-rebuilds-pages-dir ()
+  "rerun 时本包自建的页图目录被视为过期并重建，旧目录由 show-result 清理删掉。
+**这是对 T10 语义的有意变更**：T10 让 `g'（`eimg-ocr-rerun'）复用上一轮那个临时
+目录，并有用例锁住「新旧目录相同」。但「复用同一目录」正是页图残留的根因——页数
+变少时上一轮的 `pN.png' 既不会被本轮覆盖、也没有人清理，联动视图于是看到多出来的
+页，而旧路径在 `eimg-ocr--result-data' 被覆盖后就再没人记得。
+新语义：`eimg-ocr--run' 用 `eimg-ocr--owned-pages-dir-p' 认出「上一轮配置一路带回
+来的那个目录是本包自建的」，判为过期 → 本轮 `make-temp-file' 另建目录（天然没有
+残留），旧目录仍由 `eimg-ocr--show-result' 的 stale-dir 清理删除。用户显式指定的
+目录不满足判据，行为不变（见 `...-explicit-pages-dir-not-adopted'）。
 
 用例走两遍 `eimg-ocr--run'（`eimg-ocr--start' 打桩，不跑真实 CLI）：第一遍模拟
-首次识别（PDF、无显式目录 → 本层自建 D），第二遍拿 `eimg-ocr--last-meta' 的
-`:config' 模拟 `g'，并断言本次生效目录仍是 D。"
+首次识别（PDF、无显式目录 → 本层自建 dir-a，2 页），第二遍拿 `eimg-ocr--last-meta'
+的 `:config' 模拟 `g'，页数降到 1 页。"
   (eimg-ocr-test--reset)
-  (let* ((json-for
-          ;; 单页、带 `image' 绝对路径：联动视图要靠它定位原图。
-          (lambda (dir)
-            (format (concat "{\"pages\":[{\"page\":1,\"image\":%S,"
-                            "\"blocks\":[{\"text\":\"第一页\"}]}]}")
-                    (expand-file-name "page-1.png" dir))))
-         (run-once
-          (lambda (args)
-            ;; 打桩只捕获 argv 与回调；返回本次 argv 里生效的页图目录。
-            (let (captured callback)
-              (cl-letf (((symbol-function 'eimg-ocr--start)
-                         (lambda (argv cb)
-                           (setq captured argv callback cb)
-                           'eimg-ocr-test-proc)))
-                (with-temp-buffer
-                  (eimg-ocr--run args)))
-              (let ((dir (eimg-ocr-test--arg-value captured "--page-images-dir")))
-                ;; 模拟 CLI 在**进程运行期间**把页图写进 DIR：必须发生在回调之前，
-                ;; 与真实时序一致（CLI 边跑边写，sentinel 收尾时才可能删目录）。
-                (when (stringp dir)
-                  (with-temp-file (expand-file-name "page-1.png" dir)
-                    (insert "PNG")))
-                ;; 回调在 `cl-letf' 外触发，模拟进程收尾（含渲染进结果 buffer）。
-                (funcall callback 'finished (funcall json-for dir) "" 0)
-                dir))))
-         (dir-a nil)
-         (dir-b nil))
+  (let ((dir-a nil)
+        (dir-b nil))
     (unwind-protect
         (progn
-          ;; ① 首次识别：本层自建临时目录并注入 `--page-images-dir'
-          (setq dir-a (funcall run-once (list :file "/x/a.pdf")))
+          ;; ① 首次识别：本层自建临时目录，2 页
+          (setq dir-a (eimg-ocr-test--run-with-pages (list :file "/x/a.pdf") 2))
           (should (stringp dir-a))
           (should (file-directory-p dir-a))
+          (should (equal '("page-1.png" "page-2.png")
+                         (directory-files dir-a nil "\\`page-")))
           ;; ② 模拟 `g'：复用上一轮合并后的配置（`eimg-ocr-rerun' 就是这么做的）
           (let ((rerun-config (plist-get eimg-ocr--last-meta :config)))
             (should (equal dir-a (plist-get rerun-config :page-images-dir)))
-            (setq dir-b (funcall run-once rerun-config))
-            ;; 不另建新目录：本次生效目录仍是上一轮那个
-            (should (equal dir-a dir-b)))
-          ;; 核心断言：目录与页图都还在（修复前 D 已被 show-result 删掉）
-          (should (file-directory-p dir-a))
-          (should (file-exists-p (expand-file-name "page-1.png" dir-a)))
+            (setq dir-b (eimg-ocr-test--run-with-pages rerun-config 1)))
+          ;; 核心断言 1：新目录不是上一轮那个（复用即残留的根因）
+          (should (stringp dir-b))
+          (should-not (equal dir-a dir-b))
+          ;; 核心断言 2：上一轮目录已被 show-result 的 stale-dir 清理删掉
+          (should-not (file-directory-p dir-a))
+          ;; 核心断言 3：新目录里只有本轮这一页，旧页数的残留不存在
+          (should (equal '("page-1.png") (directory-files dir-b nil "\\`page-")))
+          (should-not (file-exists-p (expand-file-name "page-2.png" dir-b)))
           (let ((buffer (get-buffer eimg-ocr-buffer-name)))
             (should (buffer-live-p buffer))
             (with-current-buffer buffer
-              ;; meta 记的是实际生效目录，不是所有权
-              (should (equal dir-a (eimg-ocr--result-pages-dir)))
+              ;; meta 记的是**本轮**实际生效目录，不是所有权
+              (should (equal dir-b (eimg-ocr--result-pages-dir)))
+              ;; 页数与目录内页图数量一致
+              (should (= 1 (length (plist-get eimg-ocr--result-data :pages))))
               ;; 每页 `image' 指向的文件可读——联动视图有图可画
               (dolist (page (plist-get eimg-ocr--result-data :pages))
                 (should (file-readable-p (alist-get 'image page)))))))
+      (when (get-buffer eimg-ocr-buffer-name)
+        (ignore-errors (kill-buffer (get-buffer eimg-ocr-buffer-name))))
+      (dolist (dir (list dir-a dir-b))
+        (when (and dir (file-exists-p dir))
+          (ignore-errors (delete-directory dir t)))))))
+
+(ert-deftest eimg-ocr-test-run-rerun-fewer-pages-no-leftover ()
+  "rerun 后页数变少时，目录里只剩本轮页图——上一轮的页图一张都不留。
+这是残留的**最小复现**：上一轮 3 页（`page-1.png` 到 `page-3.png`），本轮 2 页。
+复用同一目录时 `page-3.png' 会原地留着（CLI 只重写它产出的那几张，不会清理多余的
+旧文件），联动视图于是画出一张「不属于本轮结果」的页；换新目录后它连存在的机会
+都没有，旧目录整体随 stale-dir 清理消失。
+断言给的是**具体文件名集合**而不是「目录非空」：残留恰恰发生在「目录里还有东西」
+的场合，只判非空等于什么都没锁。"
+  (eimg-ocr-test--reset)
+  (let ((dir-a nil)
+        (dir-b nil))
+    (unwind-protect
+        (progn
+          ;; ① 上一轮：3 页
+          (setq dir-a (eimg-ocr-test--run-with-pages (list :file "/x/a.pdf") 3))
+          (should (stringp dir-a))
+          (should (equal '("page-1.png" "page-2.png" "page-3.png")
+                         (directory-files dir-a nil "\\`page-")))
+          ;; ② rerun：同一份配置、页数降到 2
+          (setq dir-b (eimg-ocr-test--run-with-pages
+                       (plist-get eimg-ocr--last-meta :config) 2))
+          ;; 新目录里恰好是本轮那两张，`page-3.png' 不存在
+          (should (stringp dir-b))
+          (should (equal '("page-1.png" "page-2.png")
+                         (directory-files dir-b nil "\\`page-")))
+          (should-not (file-exists-p (expand-file-name "page-3.png" dir-b)))
+          ;; 旧目录（含 3 张旧页图）已被整体删除，不留任何残留文件
+          (should-not (file-directory-p dir-a))
+          (should-not (file-exists-p (expand-file-name "page-3.png" dir-a))))
+      (when (get-buffer eimg-ocr-buffer-name)
+        (ignore-errors (kill-buffer (get-buffer eimg-ocr-buffer-name))))
+      (dolist (dir (list dir-a dir-b))
+        (when (and dir (file-exists-p dir))
+          (ignore-errors (delete-directory dir t)))))))
+
+(ert-deftest eimg-ocr-test-run-explicit-pages-dir-not-adopted ()
+  "配置里显式给的 `:page-images-dir' 在 rerun 时仍被原样复用，不被判为过期。
+`eimg-ocr--owned-pages-dir-p' 要求「位于 `temporary-file-directory' 之下」**且**
+「目录名以 `eimg-ocr-pages-' 开头」两条同时成立；用户自己的目录（本例前缀
+`eimg-user-pages-'）两条都不满足，故 rerun 沿用同一个目录、也不删它。把用户目录当
+过期临时目录丢弃的代价是每次重跑都换一个位置，用户的目录配置形同虚设。
+断言同时锁住「目录还在」与「目录里是本轮写的那两张」：只判复用不判内容，会让
+「复用了但被清空」也变绿。"
+  (eimg-ocr-test--reset)
+  (let ((user-dir (make-temp-file "eimg-user-pages-" t))
+        (dir-b nil))
+    (unwind-protect
+        (progn
+          (should (file-directory-p user-dir))
+          ;; ① 首次识别：显式目录 → 本层不接管、也不新建
+          (should (equal user-dir
+                         (eimg-ocr-test--run-with-pages
+                          (list :file "/x/a.pdf" :page-images-dir user-dir) 2)))
+          (should (equal '("page-1.png" "page-2.png")
+                         (directory-files user-dir nil "\\`page-")))
+          ;; ② rerun：配置里带的仍是用户目录 → 复用，不另建、不删
+          (setq dir-b (eimg-ocr-test--run-with-pages
+                       (plist-get eimg-ocr--last-meta :config) 2))
+          (should (equal user-dir dir-b))
+          (should (file-directory-p user-dir))
+          (should (equal '("page-1.png" "page-2.png")
+                         (directory-files user-dir nil "\\`page-")))
+          ;; `eimg-ocr--result-pages-dir' 读 buffer-local 的 `eimg-ocr--result-data'，
+          ;; 必须在结果 buffer 的上下文里取，否则恒为 nil。
+          (should (buffer-live-p (get-buffer eimg-ocr-buffer-name)))
+          (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+            (should (equal user-dir (eimg-ocr--result-pages-dir)))))
+      (when (get-buffer eimg-ocr-buffer-name)
+        (ignore-errors (kill-buffer (get-buffer eimg-ocr-buffer-name))))
+      (when (file-directory-p user-dir)
+        (ignore-errors (delete-directory user-dir t))))))
+
+(ert-deftest eimg-ocr-test-run-rerun-failure-keeps-previous-dir ()
+  "rerun 失败时：本轮新建的 owned 目录当场删，上一轮目录**保留**。
+失败态没有任何 buffer 接手页图，本轮目录不删就是纯泄漏；而上一轮目录此刻仍被
+结果 buffer 记着（`eimg-ocr--result-data' 没被覆盖，失败分支不渲染），删了等于用
+一次失败的尝试顺手毁掉上一份还能看的结果——失败路径只该清理它自己建的东西。
+断言给具体路径：`dir-b' 不存在、`dir-a' 及其两张页图仍在。"
+  (eimg-ocr-test--reset)
+  (let ((dir-a nil)
+        (dir-b nil))
+    (unwind-protect
+        (progn
+          ;; ① 成功一轮：dir-a 被结果 buffer 接手
+          (setq dir-a (eimg-ocr-test--run-with-pages (list :file "/x/a.pdf") 2))
+          (should (stringp dir-a))
+          (should (file-directory-p dir-a))
+          ;; `eimg-ocr--result-pages-dir' 读的是 buffer-local 的
+          ;; `eimg-ocr--result-data'，必须在结果 buffer 的上下文里取，
+          ;; 否则恒为 nil（会变成「断言永远失败」或假绿）。
+          (should (buffer-live-p (get-buffer eimg-ocr-buffer-name)))
+          (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+            (should (equal dir-a (eimg-ocr--result-pages-dir))))
+          ;; ② rerun 失败：本轮另建 dir-b，随即被 owned 清理删掉
+          (setq dir-b (eimg-ocr-test--run-with-pages
+                       (plist-get eimg-ocr--last-meta :config) 1 'failed))
+          (should (stringp dir-b))
+          (should-not (equal dir-a dir-b))
+          (should-not (file-directory-p dir-b))
+          ;; 上一轮目录与它的页图原样还在，且仍是结果 buffer 记着的那个
+          (should (file-directory-p dir-a))
+          (should (equal '("page-1.png" "page-2.png")
+                         (directory-files dir-a nil "\\`page-")))
+          (with-current-buffer (get-buffer eimg-ocr-buffer-name)
+            (should (equal dir-a (eimg-ocr--result-pages-dir)))))
       (when (get-buffer eimg-ocr-buffer-name)
         (ignore-errors (kill-buffer (get-buffer eimg-ocr-buffer-name))))
       (dolist (dir (list dir-a dir-b))

@@ -17,8 +17,8 @@
 
 设计约束（不要在本文件里打破）：
 
-1. **只依赖 Python 标准库**（argparse / importlib / json / os / shutil / ssl /
-   subprocess / sys / urllib / pathlib）。本脚本的职责是「在依赖都没装的环境里把
+1. **只依赖 Python 标准库**（argparse / hashlib / importlib / json / os / shutil /
+   ssl / subprocess / sys / urllib / pathlib）。本脚本的职责是「在依赖都没装的环境里把
    依赖装好」，它自己先要依赖就自相矛盾了。`certifi` 是唯一例外，且是**可选**的：
    存在就用它的 bundle，不存在直接跳过（见 `ssl_context`）。
 2. **探测逻辑不复制，直接复用 `bin/eimg-ocr` 的 `probe_backends`**：两处各写一份
@@ -39,6 +39,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -85,6 +86,29 @@ TESSDATA_URLS = (
 # 体积下限：正常 chi_sim 约 2.5 MB、eng 约 4 MB。错误页（GitHub 的 HTML 报错、
 # 代理返回的 503 页面）往往几 KB 就被当成「下载成功」，故设 1 MB 下限兜住。
 MIN_TESSDATA_BYTES = 1024 * 1024
+
+# 体积上限：下限挡「错误页」，上限挡「上游被控或代理返回无限流写满磁盘」。64 MB 约
+# 是主流 `tessdata_fast` 文件（chi_sim ≈2.5 MB / eng ≈4 MB）的 10 倍以上余量，正常
+# 下载与将来换 `tessdata_best`（约 10–15 MB）都够用；超限一律删半成品并按失败退出，
+# 不给「一边报错一边留个几十 GB 的半成品」留口子。
+MAX_TESSDATA_BYTES = 64 * 1024 * 1024
+
+# 期望内容哈希（sha256 十六进制小写）。为什么在体积下限之外还要钉内容：
+# 1 MB 下限只能挡住「几 KB 的错误页」，挡不住**内容被替换或降级**——同一 URL 上换
+# 成体积相近但精度更差（或被人动了手脚）的模型，体积检查一律放行。TOFU（首次下载
+# 后信任）同样不解决这个问题：首次投毒之后所有校验都以投毒结果为基准。
+# 哈希值来源：`tesseract-ocr/tessdata_fast` 仓库 main 分支上 `chi_sim.traineddata` /
+# `eng.traineddata` 的**实际内容**（真跑本文件 `download()` 后算出的值，不是测试夹具
+# 的哈希）。上游改版时这里必须跟着更新，否则下载会被判为「内容校验不通过」。
+# 校验失败的处理：删掉 `.part` 半成品 + 抛 `EXIT_FAILED`，文案带上实际/期望的前 12 位
+# 十六进制，便于判断是「下载被中间人改过」还是「上游版本变了」。
+# 未登记时的行为：`warn()` 一条 stderr 警告，仅做体积校验并继续——**不存在静默降级**，
+# 用户能在 stderr 里看到「这个文件没被内容校验」。字典为空（真值待补）时对所有文件都
+# 是这个路径。
+TESSDATA_SHA256: dict[str, str] = {
+    "chi_sim.traineddata": "a5fcb6f0db1e1d6d8522f39db4e848f05984669172e584e8d76b6b3141e1f730",
+    "eng.traineddata": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2",
+}
 
 DOWNLOAD_TIMEOUT = 60      # 单次 urlopen 的连接/读取超时（秒）
 DOWNLOAD_CHUNK = 64 * 1024  # 分块读写，避免把整个模型读进内存
@@ -490,7 +514,11 @@ def _is_certificate_error(exc: BaseException) -> bool:
 
 
 def download(url: str, destination: Path) -> None:
-    """下载单个文件；任何失败或体积异常都删掉半成品再抛错，不留垃圾。
+    """下载单个文件；任何失败、体积异常或内容校验不过都删掉半成品再抛错，不留垃圾。
+
+    成功路径同时覆盖两道关：先体积下限（挡错误页），再与 `TESSDATA_SHA256` 比对
+    内容哈希（挡内容被替换 / 降级）。未登记期望值时往 **stderr** 打一条警告（含
+    「本次未做内容校验」）后放行，不做静默降级。
 
     证书类失败额外给**可执行指引**：报错原文之外再说清「怎么绕过」，否则用户看到
     的只有 openssl 的 `unable to get local issuer certificate`，得自己去查
@@ -501,12 +529,33 @@ def download(url: str, destination: Path) -> None:
     partial = destination.with_name(destination.name + ".part")
     note(f"下载 {url} → {destination}")
     context, source = ssl_context()
+    hasher = hashlib.sha256()
+    total = 0
     try:
         with urllib.request.urlopen(
             url, timeout=DOWNLOAD_TIMEOUT, context=context
         ) as response:
             with partial.open("wb") as handle:
-                shutil.copyfileobj(response, handle, DOWNLOAD_CHUNK)
+                # 自己分块循环而不用 `shutil.copyfileobj`：后者把数据直接搬进文件，
+                # 拿不到任何字节，也就无从算哈希。分块读写与 copyfileobj 的内存
+                # 上限一致（单块 ≤ DOWNLOAD_CHUNK）。
+                while True:
+                    chunk = response.read(DOWNLOAD_CHUNK)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_TESSDATA_BYTES:
+                        # 上限是写盘途中的闸门：命中即删半成品并按失败退出，不把
+                        # 「上游被控 / 代理返回无限流」变成磁盘写满。判据只能用累计
+                        # 字节，不能信 `Content-Length`——代理改写与 chunked 响应下
+                        # 它经常缺失或与实体不符。
+                        partial.unlink(missing_ok=True)
+                        raise fail(
+                            EXIT_FAILED,
+                            f"下载失败: {destination.name} 超过上限 64 MB，已删除半成品",
+                        )
+                    hasher.update(chunk)
+                    handle.write(chunk)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         partial.unlink(missing_ok=True)
         if _is_certificate_error(exc):
@@ -526,8 +575,58 @@ def download(url: str, destination: Path) -> None:
             f"下载失败: {destination.name} 体积异常（{size} 字节 ≤ 1 MB，疑似错误页），"
             "已删除半成品",
         )
+
+    # 体积只是快速先决（挡错误页），内容才对得上「拿到的是不是预期的那个模型」。
+    # 期望值按**目标文件名**查，不从 URL 推导：换镜像只换 URL，内容契约不该跟着变。
+    actual = hasher.hexdigest()
+    expected = TESSDATA_SHA256.get(destination.name)
+    if not expected:
+        # 未登记（含真值待补的空表）→ stderr 警告 + 仅体积校验，绝不静默当成已校验。
+        # 走 stderr 而不是 stdout 进度流：这是「本文件没被内容校验」的信号，不该和
+        # 「正在下载 / 已下载」混在同一条 stdout 里被管道或日志吞掉。行为不变——仍继续。
+        warn(
+            f"未登记 {destination.name} 的期望哈希，仅做体积校验（本次未做内容校验）"
+        )
+    elif actual != expected:
+        partial.unlink(missing_ok=True)
+        raise fail(
+            EXIT_FAILED,
+            f"下载失败: {destination.name} 内容校验不通过"
+            f"（实际 {actual[:12]}…，期望 {expected[:12]}…），已删除半成品",
+        )
+
     partial.replace(destination)
-    note(f"已下载 {destination}（{size} 字节）")
+    note(f"已下载 {destination}（{size} 字节，sha256 {actual[:12]}…）")
+
+
+def file_sha256(path: Path) -> str:
+    """算磁盘上已有文件的 sha256（跳过下载时用；分块读，不把整文件读进内存）。"""
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(DOWNLOAD_CHUNK)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def tessdata_up_to_date(destination: Path) -> bool:
+    """目标文件是否「已存在 + 过体积下限 + 登记了期望哈希 + 实算哈希匹配」。
+
+    未登记期望哈希时一律返回 False（走下载）：没有期望值就无从判断已有文件的
+    内容是否可信，此时跳过等于把来路不明的文件当成品。
+    """
+    expected = TESSDATA_SHA256.get(destination.name)
+    if not expected:
+        return False
+    try:
+        if not destination.is_file() or destination.stat().st_size <= MIN_TESSDATA_BYTES:
+            return False
+        return file_sha256(destination) == expected
+    except OSError:
+        # 读不了就当没有（权限 / 竞态），交给 download() 去给出确切报错。
+        return False
 
 
 def run_tessdata(args) -> int:
@@ -551,6 +650,11 @@ def run_tessdata(args) -> int:
         raise fail(EXIT_FAILED, f"创建目录失败: {target_dir}（{exc}）")
 
     for url, destination in targets:
+        # 先判「已有且内容对得上」：重复跑 `--tessdata` 是最常见的场景（换机重装、
+        # 只补缺失的一个语言），此时不该为已校验的文件再花一次数 MB 的流量。
+        if tessdata_up_to_date(destination):
+            note(f"跳过下载（校验通过）: {destination}")
+            continue
         download(url, destination)
 
     note(f"语言数据已就绪: {target_dir}")

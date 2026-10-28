@@ -274,7 +274,9 @@ ollama 后端一个 box 都没有时，这一页的 SVG 只有底图——多出
 (ert-deftest eimg-ocr-view-test-svg-prefix-cache ()
   "同参数连调两次 `--svg' 只读一次盘，且两次结果**逐字相同**；画布或 mtime 一变就重建。
 为什么这条是缓存正确性的关键：前缀里是整张底图的 base64，缓存命中却算错一点，
-表现就是「框画在旧页图上」——比不缓存更糟且完全静默。"
+表现就是「框画在旧页图上」——比不缓存更糟且完全静默。
+另外覆盖容量 3 的 LRU：超容淘汰最久未使用的那条——正是为了「多次翻页来回对比」时
+不必反复重建前缀，同时也不会让缓存随翻过的页数无限增长。"
   (let ((image (eimg-ocr-view-test--make-image))
         (reads 0))
     (unwind-protect
@@ -304,7 +306,54 @@ ollama 后端一个 box 都没有时，这一页的 SVG 只有底图——多出
               ;; 4. 同路径同尺寸但 mtime 变了（页图被重新识别覆盖）→ 必须重新读
               (set-file-times image (time-add (current-time) 5))
               (eimg-ocr-view--svg image 1000 800 500 400 boxes 0)
-              (should (= 2 reads)))))
+              (should (= 2 reads))
+              ;; 5. 容量 3 的 LRU：连用 4 个不同画布（键互不相同）→ 淘汰最久未使用的那个
+              ;;
+              ;; 为什么这里要清 base64 缓存：`reads' 数的是 `--image-bytes'（读盘），
+              ;; 而 `--base64' 自己也有缓存——不清的话，无论前缀重不重建，读盘都只发生
+              ;; 一次，`reads' 就区分不出「命中」与「重建」。清掉之后判据很干脆：命中
+              ;; 前缀根本不会调 `--base64'（读盘 0 次），重建则必然调它（读盘 +1）。
+              (cl-flet ((key-of (w h)
+                          ;; 按 `--svg-prefix' 的构成重建键（不硬编码 mtime / size，
+                          ;; 否则一旦块 4 改过 mtime，这里的键就对不上）
+                          (let ((attrs (file-attributes image)))
+                            (list image (float-time (nth 5 attrs)) (nth 7 attrs)
+                                  w h 500 400))))
+                (setq eimg-ocr-view--svg-prefix-cache nil)
+                (clrhash eimg-ocr-view--image-cache)
+                (setq reads 0)
+                (let* ((dims '((1000 800) (1200 800) (1400 800) (1600 800)))
+                       (keys (mapcar (lambda (d) (key-of (nth 0 d) (nth 1 d))) dims)))
+                  (dolist (d dims)
+                    (eimg-ocr-view--svg image (nth 0 d) (nth 1 d) 500 400 boxes 0))
+                  ;; 容量上界：用过 4 个键，缓存只留 3 条
+                  (should (= 3 (length eimg-ocr-view--svg-prefix-cache)))
+                  ;; 第 1 个键（最久未使用）已被淘汰
+                  (should-not (assoc (nth 0 keys) eimg-ocr-view--svg-prefix-cache))
+                  ;; LRU 顺序：表头是最后用过的，往后依次更旧
+                  (should (equal (list (nth 3 keys) (nth 2 keys) (nth 1 keys))
+                                 (mapcar #'car eimg-ocr-view--svg-prefix-cache)))
+                  ;; 被淘汰的键再请求时必须**重建**而不是命中：清掉 base64 缓存后，
+                  ;; 重建必然多读一次盘，命中则一次都不读。
+                  (clrhash eimg-ocr-view--image-cache)
+                  (let ((before reads))
+                    (eimg-ocr-view--svg image 1000 800 500 400 boxes 0)
+                    (should (> reads before)))
+                  ;; 重建同时把它提到表头，且仍只留 3 条（第 2 个键被挤出）
+                  (should (= 3 (length eimg-ocr-view--svg-prefix-cache)))
+                  (should (equal (nth 0 keys)
+                                 (car (car eimg-ocr-view--svg-prefix-cache))))
+                  (should-not (assoc (nth 1 keys)
+                                     eimg-ocr-view--svg-prefix-cache))
+                  ;; 6. 命中即提升：请求位于表尾的第 3 个键 → 它被提到表头（而不是原地不动）。
+                  ;; 同样是清掉 base64 缓存后判「有没有碰 base64」：不动说明这次是**命中**。
+                  (clrhash eimg-ocr-view--image-cache)
+                  (let ((before reads))
+                    (eimg-ocr-view--svg image (nth 0 (nth 2 dims)) (nth 1 (nth 2 dims))
+                                        500 400 boxes 0)
+                    (should (= before reads)))
+                  (should (equal (list (nth 2 keys) (nth 0 keys) (nth 3 keys))
+                                 (mapcar #'car eimg-ocr-view--svg-prefix-cache))))))))
       (ignore-errors (delete-file image)))))
 
 (ert-deftest eimg-ocr-view-test-mime-type ()

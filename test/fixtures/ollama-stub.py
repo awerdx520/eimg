@@ -19,6 +19,10 @@
     redirect       → chat 返回 302 + `Location: /api/chat2`（拒绝跟随用例）
     huge           → chat 声明 `Content-Length` 为 32 MB 但只写十几字节
                      （响应体上限用例；实现按 header 就拒，不必真传 32 MB）
+    trickle        → `/api/show` 与 `/api/chat` 都走慢速滴流：每 0.5 秒写 1 字节、
+                     持续 12 秒（探测整体超时用例；单次 socket 超时对滴流无效）
+    chat-trickle   → `/api/show` 正常回 vision，只有 `/api/chat` 滴流
+                     （识别整体超时用例；直接调 `run_ollama`，不经过 CLI 探测）
 
 除 `novision` / `missing` 外，`/api/show` 恒回 vision——否则「后端不可用」会先一步
 拦下命令，chat 分支的用例根本走不到。
@@ -35,6 +39,7 @@
 import json
 import os
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # `GET /api/tags` 的固定应答：两个模型名，供「模型未安装」分支文案里的「已装：」断言。
@@ -47,6 +52,20 @@ OLLAMA_MAX_RESPONSE = 16 * 1024 * 1024
 
 # `/api/chat` content 的两行固定文本（VLM 多行输出的替身）。
 CHAT_LINES = ["第一行文字", "第二行文字"]
+
+# 滴流模式的节奏：每 0.5 秒写 1 个字节，持续 12 秒。
+#
+# 时长要同时满足两件事：① 明显长于被测的整体预算（CLI 探测是 3 秒，用例里
+# `run_ollama(timeout=3)` 也是 3 秒），否则「预算到点就放弃」与「对端正常写完」区分不开；
+# ② 远小于识别预算（300 秒），别让一条用例等成分钟级。
+TRICKLE_SECONDS = 12.0
+TRICKLE_INTERVAL = 0.5
+
+# 滴流响应声明的 `Content-Length`。刻意取一个**远小于** 16 MB 响应体上限的小值：
+# 本模式要测的是「整体预算」，不是「响应体过大」——声明大了会让客户端在读之前就
+# 按 header 拒掉，两个失败原因的文案完全一样，用例就测不到预算那层了。
+# 同时也永不写满它（12 秒只写 24 字节），好让客户端始终处在「还没读完」的状态。
+TRICKLE_LENGTH = 1000
 
 
 def show_response(mode):
@@ -121,6 +140,30 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def _reply_trickle(self):
+        """慢速滴流响应：每 `TRICKLE_INTERVAL` 秒写 1 字节，持续 `TRICKLE_SECONDS` 秒。
+
+        为什么要这个模式：`read(n)` 的语义是「读满 n 字节或 EOF」，滴流下每次底层读
+        都有数据进来，**单次 socket 超时永远不会触发**，客户端会被吊到本函数自己
+        结束为止。只有「整体预算」语义才能给出硬上限，本模式正是那条边界的夹具。
+
+        客户端在预算耗尽时会主动关连接，那时的写会吃 `BrokenPipeError`（`OSError`
+        子类），静默 return 即可——stub 的 stderr 必须零输出，否则 ERT 侧会把它当成
+        CLI 自己报的错而误判。
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(TRICKLE_LENGTH))
+        self.end_headers()
+        deadline = time.monotonic() + TRICKLE_SECONDS
+        try:
+            while time.monotonic() < deadline:
+                time.sleep(TRICKLE_INTERVAL)
+                self.wfile.write(b" ")
+                self.wfile.flush()
+        except OSError:
+            return
+
     def _read_body(self):
         """读并解析请求体；坏 JSON / 空体一律归一成空 dict（stub 不因坏输入 500）。"""
         try:
@@ -145,9 +188,17 @@ class Handler(BaseHTTPRequestHandler):
         route = self.path.split("?")[0]
         mode = os.environ.get("OLLAMA_STUB_MODE") or "vision"
         if route == "/api/show":
-            self._reply(*show_response(mode))
+            if mode == "trickle":
+                # 探测路径的滴流：`/api/show` 就慢，客户端在 3 秒预算到点时放弃。
+                self._reply_trickle()
+            else:
+                self._reply(*show_response(mode))
         elif route == "/api/chat":
-            if mode == "redirect":
+            if mode in ("trickle", "chat-trickle"):
+                # `trickle` 连 chat 一起滴流（探测就先失败）；`chat-trickle` 只滴流 chat，
+                # 好让调用方先通过探测再撞上识别侧的预算。
+                self._reply_trickle()
+            elif mode == "redirect":
                 # 相对 Location 就够：CLI 侧在任何跟随动作之前就拒了，不需要真地址。
                 self._reply_redirect("/api/chat2")
             elif mode == "huge":

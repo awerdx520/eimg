@@ -66,6 +66,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -794,6 +795,26 @@ class _OllamaResponseTooLarge(Exception):
         self.limit = limit
 
 
+class _OllamaDeadlineExceeded(Exception):
+    """整体预算（`timeout` 秒）耗尽——内部信号，理由同 `_OllamaRedirect`。
+
+    **为什么继承 `Exception` 而不是 `OSError` / `TimeoutError`**：`_ollama_http` 的
+    调用方（`_probe_ollama` / `run_ollama` / `_ollama_installed_models`）都有一层
+    `except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException)`
+    兜底，把网络层异常统一说成「服务不可达 / 连不上」。`TimeoutError` 是 `OSError`
+    的子类，若本异常也走那条继承链，它一定会被**先**吞进兜底分支，用户看到的就变成
+    「无法连接 ollama 服务」，而真实原因是「服务通但太慢」——这两件事的排查方向完全
+    不同（前者查地址 / 防火墙，后者查模型是否在跑、图片是否太大、机器是否太慢）。
+    继承普通 `Exception` 让它在兜底链之外，各调用方必须显式写一个分支来处理它。
+
+    字段 `timeout` 是**整体预算的秒数**（不是剩下的秒数），用于人读文案。
+    """
+
+    def __init__(self, timeout: float) -> None:
+        super().__init__(timeout)
+        self.timeout = timeout
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """把所有 3xx 重定向直接拒掉。
 
@@ -806,13 +827,35 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise _OllamaRedirect(int(code))
 
 
-def _read_capped(response, limit: int = OLLAMA_MAX_RESPONSE) -> str:
+def _read_capped(
+    response,
+    limit: int = OLLAMA_MAX_RESPONSE,
+    deadline: float | None = None,
+    timeout: float | None = None,
+) -> str:
     """有界读取响应体，超过 LIMIT 抛 `_OllamaResponseTooLarge`；返回解码后文本。
 
     两道闸：先看 `Content-Length`（声明就超限的直接拒，一个字节的 body 都不用读，
-    这也是测试里 `huge` 模式能动辄声明几十 MB 而不真传的原因），再 `read(limit+1)`
-    兜住「没声明长度 / 声明撒谎」的流式响应——多读 1 字节是为了区分「正好等于
-    上限」与「超了」。
+    这也是测试里 `huge` 模式能动辄声明几十 MB 而不真传的原因），再逐块读兜住
+    「没声明长度 / 声明撒谎」的流式响应——多读 1 字节是为了区分「正好等于上限」与
+    「超了」，这个 `limit + 1` 的边界语义在两条路径上一致。
+
+    **两种读取路径**：
+
+    - `deadline is None`：一次性 `read(limit + 1)`，保持本函数最初的语义。向后
+      兼容保留（不传预算的调用方行为不变），但**不是**主路径——`read(n)` 的语义是
+      「读满 n 字节或 EOF」，慢速滴流响应下每次读都有数据进来，永远不触发 socket
+      超时，会一直阻塞到对端放手或 EOF，给不出硬上限。
+    - `deadline` 非 None：按整体预算分块读，**每块前**先查预算，耗尽即抛
+      `_OllamaDeadlineExceeded`。分块用的是 `read1(n)`：它只做一次底层读并返回当前
+      可用的字节，不等待凑满 n——这才是「每块之间能回到 Python 层查预算」的前提。
+      `read1` 是 `http.client.HTTPResponse` 的方法，`HTTPError` 路径上的对象不一定
+      有（故用 `getattr` 探测，缺失时回退 `read(min(n, 4096))`；**残余风险**：回退
+      路径上单次 `read` 仍可能阻塞到凑满 4096 字节或 EOF，慢速滴流下预算只能保证
+      「两次底层读之间」被检查，最坏多等一次底层读的时间）。
+    - `timeout` 只用于异常文案（`_OllamaDeadlineExceeded.timeout` 要报出「上限 N 秒」，
+      而 `deadline` 是个单调时钟的绝对时间点，反推不出原始预算）。传 `deadline`
+      就应一并传 `timeout`。
 
     `errors="replace"`：对端返回非 UTF-8 的中文编码时也要能给出可读报错，而不是
     在这里抛 `UnicodeDecodeError`（那会穿透成 traceback）。
@@ -828,10 +871,34 @@ def _read_capped(response, limit: int = OLLAMA_MAX_RESPONSE) -> str:
     if declared is not None and declared > limit:
         raise _OllamaResponseTooLarge(declared, limit)
 
-    raw = response.read(limit + 1)
-    if len(raw) > limit:
-        raise _OllamaResponseTooLarge(len(raw), limit)
-    return raw.decode("utf-8", "replace")
+    if deadline is None:
+        raw = response.read(limit + 1)
+        if len(raw) > limit:
+            raise _OllamaResponseTooLarge(len(raw), limit)
+        return raw.decode("utf-8", "replace")
+
+    # `budget` 只用于异常文案：`deadline` 非 None 时它本该一起给出（本文件的三个调用点
+    # 都传），缺失时异常里的 `timeout` 就是 None——不去编一个假秒数糊弄日志。
+    budget = timeout
+    reader = getattr(response, "read1", None)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        if time.monotonic() >= deadline:
+            raise _OllamaDeadlineExceeded(budget)
+        # 单次上限取 `limit + 1 - total`：读满 `limit + 1` 字节就必然超限，不必多读。
+        want = min(64 * 1024, limit + 1 - total)
+        if reader is not None:
+            chunk = reader(want)
+        else:
+            chunk = response.read(min(want, 4096))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            raise _OllamaResponseTooLarge(total, limit)
+    return b"".join(chunks).decode("utf-8", "replace")
 
 
 def _ollama_http(url: str, payload: dict | None, timeout: int) -> tuple[int, str]:
@@ -847,8 +914,14 @@ def _ollama_http(url: str, payload: dict | None, timeout: int) -> tuple[int, str
       `{"error": "model ... not found"}`，那正是「模型未安装」分支的判据。
     - 响应体**有界读取**（`_read_capped`）：成功与 `HTTPError` 两条路径都不能
       `read()` 到底。
+    - **`timeout` 是整体预算，不是单次 socket 操作超时**：连接、发送、读取响应体
+      共用同一笔预算。单次 socket 超时对「慢速滴流」响应完全无效——对端每次底层读
+      都有数据进来，socket 永远不会超时，调用方会被吊到对端自己放手为止（`read(n)`
+      要凑满 n 字节或 EOF 才返回）。故这里算一个 `deadline`，由 `_read_capped` 逐块
+      查预算，耗尽抛 `_OllamaDeadlineExceeded`（整体超时）。
     - 网络层失败（连不上 / 超时 / DNS）仍向上抛，由调用方决定文案；
-      `_OllamaRedirect` / `_OllamaResponseTooLarge` 也原样向上抛（内部信号）。
+      `_OllamaRedirect` / `_OllamaResponseTooLarge` / `_OllamaDeadlineExceeded`
+      也原样向上抛（内部信号）。
     """
     data = None
     headers: dict[str, str] = {}
@@ -859,22 +932,38 @@ def _ollama_http(url: str, payload: dict | None, timeout: int) -> tuple[int, str
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}), _NoRedirect()
     )
+    deadline = time.monotonic() + timeout
+    remaining = max(0.0, deadline - time.monotonic())
+    if remaining <= 0:
+        # 预算一开始就耗尽时**不调用** `opener.open`：把它当 socket 超时传下去，
+        # `socket.settimeout(0)` 在 CPython 里抛 ValueError（非正数），会被下面的
+        # 兜底说成「地址坏了 / 服务不可达」，与真实原因（预算用完）完全不符。
+        raise _OllamaDeadlineExceeded(timeout)
     try:
-        with opener.open(request, timeout=timeout) as response:
+        with opener.open(request, timeout=remaining) as response:
             status = getattr(response, "status", None) or response.getcode()
-            return int(status), _read_capped(response)
+            return int(status), _read_capped(
+                response, deadline=deadline, timeout=timeout
+            )
     except urllib.error.HTTPError as exc:
         # 顺序要紧：HTTPError 是 URLError 的子类，先捕获它才不会把 404 当连接失败。
         try:
-            body = _read_capped(exc)
-        except (_OllamaRedirect, _OllamaResponseTooLarge):
-            # 策略性拒绝（重定向 / 响应过大）必须让调用方看见，不能被下面的兜底吞掉。
+            body = _read_capped(exc, deadline=deadline, timeout=timeout)
+        except (
+            _OllamaRedirect,
+            _OllamaResponseTooLarge,
+            # 整体超时同理：错误响应体读到一半预算耗尽，也必须让调用方看见，
+            # 否则会被下面的 `except (OSError, ValueError)` 吞成 `body=""`。
+            _OllamaDeadlineExceeded,
+        ):
+            # 策略性拒绝（重定向 / 响应过大 / 整体超时）必须让调用方看见。
             raise
         except (OSError, ValueError):
             # 错误响应体读不出来（连接已断 / 已超时）不该掩盖状态码本身：404 的
             # 判据仍然成立，只是少了响应体里的 `error` 文案。
             body = ""
         return int(exc.code), body
+
 
 
 def _ollama_installed_models(url: str) -> str:
@@ -892,6 +981,9 @@ def _ollama_installed_models(url: str) -> str:
         http.client.HTTPException,  # 对端提前关连接 / 坏 chunk 头（IncompleteRead 等）
         _OllamaRedirect,  # 「已装列表」只是辅助信息，重定向不值得让整条探测失败
         _OllamaResponseTooLarge,
+        # 整体超时同理：它是「辅助信息拿不到」，不能让 `_probe_ollama`（文档承诺
+        # 永不 raise）在这个分支上冒出异常——那时用户连「模型未安装」都看不到。
+        _OllamaDeadlineExceeded,
     ):
         return "（无法获取）"
     if status != 200:
@@ -957,6 +1049,15 @@ def _probe_ollama(model: str | None, url: str) -> dict:
         entry["reason"] = (
             f"ollama 响应体过大（{exc.size} 字节，上限 {exc.limit}）"
             f"（{_mask_url(url)}）"
+        )
+        return entry
+    except _OllamaDeadlineExceeded as exc:
+        # 分支 2b-2：整体预算（`OLLAMA_PROBE_TIMEOUT` 秒）耗尽。必须与 2c 区分开：
+        # 2c 是「连不上」，这里是「连上了但太慢」（典型成因是慢速滴流响应——对端
+        # 每隔一段吐一个字节，单次 socket 超时永远不会触发）。两者排查方向不同，
+        # 合成一句「服务不可达」会让用户去查防火墙。
+        entry["reason"] = (
+            f"ollama 探测整体超时（上限 {exc.timeout} 秒）（{_mask_url(url)}）"
         )
         return entry
     except (
@@ -1837,6 +1938,16 @@ def run_ollama(
             EXIT_OCR_FAILED,
             f"识别失败: {image_path}"
             f"（ollama 响应体过大（{exc.size} 字节，上限 {exc.limit}））",
+        )
+    except _OllamaDeadlineExceeded as exc:
+        # 整体预算耗尽。**必须显式捕获**：`main` 只 catch `EimgError` /
+        # `KeyboardInterrupt` / `SubprocessError`，本异常穿透就是一条 traceback。
+        # 与下面的「单次操作超时」分开报：这条是「服务通但慢」，慢速滴流响应下
+        # 单次 socket 超时永远不会触发，只有整体预算能在这里终止它。
+        raise fail(
+            EXIT_OCR_FAILED,
+            f"识别失败: {image_path}"
+            f"（ollama 整体超时：上限 {exc.timeout} 秒）",
         )
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
         detail = _ollama_error_text(exc)

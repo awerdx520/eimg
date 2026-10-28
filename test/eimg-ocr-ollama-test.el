@@ -457,6 +457,104 @@ buffer 与用户贴出的排障日志——所以入口直接拒，而不是「�
         ;; 行号断言在「探测全挂」的机器上也绿了，测不到顺序之外的东西。
         (should (string-match-p "available=true" (nth ollama lines)))))))
 
+;;;; ── L. 超时预算：整体预算，不是单次 socket 操作超时 ─────────────────
+
+(ert-deftest eimg-ocr-ollama-test-probe-deadline ()
+  "`trickle` 模式（`/api/show` 每 0.5 秒吐 1 字节、持续 12 秒）→ 退出码 0，ollama 行含
+「超时」，且总耗时 ≤ `OLLAMA_PROBE_TIMEOUT` + 5 秒（即 8 秒）。
+为什么断言耗时：`read(n)` 的语义是「读满 n 字节或 EOF」，滴流下每次底层读都有数据
+进来，**单次 socket 超时永远不触发**——只有「整体预算」能给硬上限。只断言文案的话，
+把「单次 socket 超时」说成预算的实现也能过，这条用例就白写了。8 秒这个阈值的判据：
+与「12 秒滴流」之间留 4 秒区分度（实现退化成不限预算时必然跑到 12 秒以上，红），
+同时给 rapidocr / tesseract 的探测与子进程启动留足余量（实测总耗时 3.4 秒左右；
+原 1.5 秒余量在慢机器上会因探测变慢假红，属计时抖动而非实现退化）。"
+  (skip-unless (eimg-ocr-ollama-test--ready-p))
+  (eimg-ocr-ollama-test--with-data-dir data-dir
+    (eimg-ocr-ollama-test--with-stub stub "trickle"
+      (let* ((start (current-time))
+             (result (eimg-ocr-ollama-test--run-cli
+                      (list "--list-backends"
+                            "--ollama-model" "stub-model"
+                            "--ollama-url" (eimg-ocr-ollama-test--url stub))
+                      data-dir))
+             (elapsed (float-time (time-subtract (current-time) start)))
+             (lines (split-string (nth 1 result) "\n" t))
+             (ollama (seq-find (lambda (line) (string-prefix-p "ollama:" line))
+                               lines)))
+        (should (equal 0 (nth 0 result)))
+        (should ollama)
+        ;; 探测侧永远是「不可用 + 人读文案」：既不是异常，也不是退出码 2。
+        (should (string-match-p "available=false" ollama))
+        (should (string-match-p "超时" ollama))
+        (should (<= elapsed 8.0))))))
+
+(defconst eimg-ocr-ollama-test--chat-deadline-script
+  "import importlib.machinery
+import importlib.util
+import sys
+from pathlib import Path
+
+cli, url, png = sys.argv[1], sys.argv[2], sys.argv[3]
+loader = importlib.machinery.SourceFileLoader(\"eimg_ocr_cli\", cli)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+try:
+    module.run_ollama(Path(png), \"stub-model\", url, timeout=3)
+except module.EimgError as exc:
+    print(\"code={}\".format(exc.code))
+    print(\"message={}\".format(exc.message))
+    sys.exit(0)
+print(\"code=none\")
+print(\"message=run_ollama 未抛 EimgError\")
+sys.exit(0)
+"
+  "内联 Python 脚本：加载 `bin/eimg-ocr' 并调 `run_ollama(..., timeout=3)'。
+加载手法照抄生产文件自己的说明（无 `.py' 后缀，必须显式给 `SourceFileLoader'，
+否则 `spec_from_file_location' 推出的 loader 是 None）。
+脚本把结论 `print' 出来并以 `sys.exit(0)' 结束：ERT 侧只做文本断言，不解析结构化输出。")
+
+(ert-deftest eimg-ocr-ollama-test-chat-deadline ()
+  "`chat-trickle` 模式（只有 `/api/chat` 滴流）→ `run_ollama(..., timeout=3)` 抛
+`EimgError` 且 `code=4`、文案含「超时」、无 traceback。
+为什么不跑真 CLI：CLI 会先在 3 秒的**探测**预算上超时、以退出码 2 结束，根本走不到
+识别路径；而识别预算默认 300 秒，12 秒滴流不足以触发它。故按用例能接受的时间尺度
+直接调 `run_ollama(timeout=3)`——这也是「整体预算」在识别侧唯一可被单条用例验证的切法。
+断言「不含 Traceback」是防穿透：`main' 只 catch `EimgError' / `KeyboardInterrupt' /
+`SubprocessError'，整体超时的内部异常若没被 `run_ollama` 显式转成 `EimgError`，
+真 CLI 就会吐一条 traceback。"
+  (skip-unless (eimg-ocr-ollama-test--ready-p))
+  (eimg-ocr-ollama-test--with-data-dir data-dir
+    (eimg-ocr-ollama-test--with-stub stub "chat-trickle"
+      (let* ((out (generate-new-buffer " *eimg-ollama-chat-deadline*"))
+             (err-file (make-temp-file "eimg-ollama-chat-deadline-" nil ".log"))
+             (default-directory (eimg-ocr-ollama-test--root))
+             (coding-system-for-read 'utf-8-unix)
+             (coding-system-for-write 'utf-8-unix)
+             (process-environment
+              (append (list (format "XDG_DATA_HOME=%s" data-dir)
+                            (format "TMPDIR=%s" data-dir)
+                            "PYTHONIOENCODING=utf-8")
+                      process-environment)))
+        (unwind-protect
+            (let* ((code (call-process
+                          (eimg-ocr-ollama-test--python) nil (list out err-file) nil
+                          "-c" eimg-ocr-ollama-test--chat-deadline-script
+                          (eimg-ocr-ollama-test--cli-path)
+                          (eimg-ocr-ollama-test--url stub)
+                          (expand-file-name "test/fixtures/hello.png"
+                                            (eimg-ocr-ollama-test--root))))
+                   (stdout (with-current-buffer out (buffer-string)))
+                   (stderr (with-temp-buffer
+                             (insert-file-contents err-file)
+                             (buffer-string))))
+              (should (equal 0 code))
+              (should (string-match-p "code=4" stdout))
+              (should (string-match-p "超时" stdout))
+              (should-not (string-match-p "Traceback" (concat stdout stderr))))
+          (kill-buffer out)
+          (ignore-errors (delete-file err-file)))))))
+
 ;;;; ── F. 收尾不变量：不留 stub 进程 ────────────────────────────────────
 
 (ert-deftest eimg-ocr-ollama-test-no-leftover-processes ()

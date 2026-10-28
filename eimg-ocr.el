@@ -492,6 +492,45 @@ PDF」的判定标准本来就由 CLI 按扩展名做（它拒收别的格式并
       (make-temp-file "eimg-ocr-pages-" t)
     (error nil)))
 
+(defun eimg-ocr--owned-pages-dir-p (dir)
+  "判断 DIR 是不是**本包自建**的页图目录（`eimg-ocr--make-pages-dir' 的产物）。
+为什么需要它：`eimg-ocr-rerun' 复用的是上一轮合并后的配置，其中的
+`:page-images-dir' 指向**上一轮**建的那个临时目录——于是「调用方显式给了
+`:page-images-dir'」这句话在 rerun 时已经不再成立。同一目录被反复写的问题在页数
+变少时暴露出来：上一轮的 `pN.png' 不会被本轮覆盖，也没有人清理，联动视图于是看到
+上一轮多出来的页图。把命中本判据的目录在 rerun 时视为**过期**并重建，新目录天然
+干净，旧目录随后由 `eimg-ocr--show-result' 的 stale-dir 清理删除——两件事各由本
+来就负责它们的那段代码完成，本函数只出「是不是过期的自建目录」这一句结论。
+判据为什么是「临时目录 + 名字前缀」：本包一律用 `make-temp-file \"eimg-ocr-pages-\"'
+建目录，产物形如 `eimg-ocr-pages-XXXXXX' 且必在 `temporary-file-directory' 之下，
+两条都是**当下可判定**的事实，不依赖跨轮状态。若改成记一张「哪些目录是我建的」的
+全局表，`M-x load-file' 重载、多个 Emacs 会话、`emacs --batch' 反复启动都会让这张
+表与磁盘分叉，而它一旦失准，失准方向恰好是「该丢弃的继续复用」。
+三条判据同时成立才算命中：
+  1. DIR 是非空字符串且 `file-directory-p' 为真；
+  2. 真实路径（`file-truename'）位于 `temporary-file-directory' 的真实路径之下；
+  3. `file-name-nondirectory'（去掉末尾分隔符后）以 `eimg-ocr-pages-' 开头。
+第 2 条与 `eimg-ocr--delete-pages-dir' 的三条守卫同口径：两侧都 `file-truename'、
+比较前都用 `file-name-as-directory' 补分隔符，不另创一套前缀比较——否则
+`/tmpfoo' 与 `/tmp' 这类共享前缀会在这里和那里给出相反的答案。
+误判边界：用户手工在临时目录下建一个同名前缀的目录，会被当成「过期的自建目录」——
+本函数本身不删任何东西，但**该目录一旦被记进结果 buffer 的 `:pages-dir'，下一轮
+rerun 时就会经 `eimg-ocr--delete-pages-dir' 被清理**（那条守卫只看「位于
+`temporary-file-directory' 之下」，同名前缀目录恰好满足），同时下一轮不再往它里面写。
+概率极低（名字带 `XXXXXX' 随机后缀且落在临时目录下），影响面也只落在「本来就属于
+临时产物、可随时重建」的类别上；反方向的漏判代价是页图残留，更难察觉。用户显式指定
+的目录（如 `~/ocr/pages'）不满足第 2、3 条，永远不受影响。
+**纯判定**：不删、不改、不建任何东西。删目录只有 `eimg-ocr--delete-pages-dir'
+一个入口，本函数只回答「这是不是过期的自建目录」。"
+  (and (stringp dir)
+       (not (string-empty-p dir))
+       (file-directory-p dir)
+       (let ((target (file-truename dir))
+             (root (file-truename (file-name-as-directory temporary-file-directory))))
+         (string-prefix-p root (file-name-as-directory target)))
+       (string-prefix-p "eimg-ocr-pages-"
+                        (file-name-nondirectory (directory-file-name dir)))))
+
 (defun eimg-ocr--delete-pages-dir (dir)
   "删除 DIR 及其中全部内容；**仅在 DIR 位于 `temporary-file-directory' 之下时**。
 守卫是硬要求，不是洁癖：DIR 的最终出处是 plist（`eimg-ocr--result-data' 里的
@@ -987,8 +1026,10 @@ ON-FAILURE 仅在失败态以拼好的错误文案调用一次（超时也算失
 **PDF 自动落页图**：输入里有 PDF 且调用方**没有**显式给 `:page-images-dir' 时，
 本函数建一个临时目录、用 `--page-images-dir' 让 CLI 把每页栅格图落进去（JSON 每页
 因此多一个 `image' 绝对路径），目录路径记进 META 的 `:pages-dir'，供联动视图把块的
-坐标框画到对应页图上。调用方显式给了 `:page-images-dir' 就完全不接管——目录不是
-本层建的，清理责任也不在本层（见下两段）。
+坐标框画到对应页图上。调用方显式给的 `:page-images-dir' 不被接管——目录不是本层
+建的，清理责任也不在本层；而**本包自建的页图目录**（见
+`eimg-ocr--owned-pages-dir-p'）在 rerun 时视为过期并重建：上一轮的临时目录名会随
+上一轮配置一路传回来，若继续复用，页数变少时旧 `pN.png' 就留在原地看着像多余的页。
 目录是**交接**制：成功 → 交给结果 buffer（kill 该 buffer 时删，rerun 覆盖旧结果时删
 旧的，见 `eimg-ocr--show-result'）；失败 / 取消 / 解析失败 → 当场删（这三条路上没有
 任何 buffer 接手，不删就是纯泄漏）。建目录失败不阻断 OCR：拿不到页图只是联动视图
@@ -996,14 +1037,14 @@ ON-FAILURE 仅在失败态以拼好的错误文案调用一次（超时也算失
 
 **所有权与实际生效目录是两件事**，本函数分开记账：`owned' 只有本层
 `make-temp-file' 新建的目录才非 nil，**只有它负责清理**；`effective' 是本次真正传给
-CLI 的目录（`(or owned explicit)'，`explicit' 即调用方配置里原本带的）。
-META 的 `:pages-dir' 记 `effective' 而不是 `owned'：`eimg-ocr-rerun' 复用的是上一轮
-合并后的配置，其中的 `:page-images-dir' 指向**上一轮建的临时目录**——本轮不拥有它，
-但 CLI 这次仍把页图写进它。若按 `owned' 记成 nil，
-`eimg-ocr--show-result' 比较「旧 `:pages-dir' = 上一层那个目录」与「新 `:pages-dir'
-= nil」会判为不同，把正在使用的目录当「旧目录」删掉，而页图刚刚写进去——重跑一次
-页图全失效，联动视图退化成「找不到页图」的一列文本。清理路径仍只看 `owned'，故
-「删」永远落在本层自己建的目录上，不会误删用户指定的或上一轮留下的目录。
+CLI 的目录（`(or owned explicit)'，`explicit' 即调用方配置里原本带的、且不属于本包
+自建页图目录的那部分）。
+META 的 `:pages-dir' 记 `effective' 而不是 `owned'：两者不一致的唯一场合是「调用方
+显式给了目录」（`explicit' 非 nil、`owned' 为 nil），此时 CLI 把页图写进 `explicit'。
+若按 `owned' 记成 nil，`eimg-ocr--show-result' 比较「旧 `:pages-dir'」与「新
+`:pages-dir' = nil」会判为不同，把正在使用的目录当「旧目录」删掉，而页图刚刚写
+进去——联动视图退化成「找不到页图」的一列文本。清理路径仍只看 `owned'，故「删」
+永远落在本层自己建的目录上，不会误删用户指定的目录。
 
 四态：
   finished  → `eimg-core-parse-json' → `eimg-ocr--show-result'（写结果 buffer）
@@ -1021,17 +1062,24 @@ META 的 `:pages-dir' 记 `effective' 而不是 `owned'：`eimg-ocr-rerun' 复�
                 :format "json"))
          ;; 「目录的所有权」与「本次实际生效的目录」必须分开记（见 docstring）：
          ;;
-         ;;   explicit  —— 调用方配置里原本就带的 `:page-images-dir'。`g' 重跑时它
-         ;;                是**上一轮**建的临时目录，也可能是用户自己指的目录。
+         ;;   candidate —— 配置里带的 `:page-images-dir' 原值。`g' 重跑时它是
+         ;;                **上一轮**建的临时目录，也可能是用户自己指的目录。
+         ;;   explicit  —— candidate 中**真正由调用方指定**的那部分：命中
+         ;;                `eimg-ocr--owned-pages-dir-p' 的（即本包自建的页图目录）
+         ;;                降级为 nil，本轮重建新目录；其余原样保留。判据只看目录
+         ;;                本身的形态（临时目录 + 名字前缀），不看跨轮状态，故 rerun
+         ;;                与首次识别走同一段代码、同一套语义。
          ;;   owned     —— 只有本层 `make-temp-file' 新建的目录才非 nil。
          ;;                **只有它负责清理**：失败分支删的必须是 owned——配置里有
          ;;                路径不等于这个路径归本层处置。
          ;;   effective —— 本次真正传给 CLI 的目录，即 `(or owned explicit)'。
          ;;
-         ;; 两者不一致的唯一场合就是 rerun（owned 为 nil、explicit 为上一轮的
-         ;; 临时目录）：此时 CLI 仍把页图写进 explicit，所以 META 必须记
-         ;; effective，否则 `eimg-ocr--show-result' 会把正在使用的目录当旧目录删掉。
-         (explicit (plist-get base :page-images-dir))
+         ;; 本包自建目录在 rerun 时视为过期并重建，用户显式目录不受影响：复用同一
+         ;; 目录在页数变少时会把上一轮的 `pN.png' 留在原地（本轮不覆盖、也没人清
+         ;; 理），新目录天然干净；旧目录随后由 `eimg-ocr--show-result' 的 stale-dir
+         ;; 清理删除。
+         (candidate (plist-get base :page-images-dir))
+         (explicit (unless (eimg-ocr--owned-pages-dir-p candidate) candidate))
          (owned (and (null explicit)
                      (eimg-ocr--pdf-input-p base)
                      (eimg-ocr--make-pages-dir)))
@@ -1062,27 +1110,29 @@ META 的 `:pages-dir' 记 `effective' 而不是 `owned'：`eimg-ocr-rerun' 复�
                          ;; 页图目录也记进 META：结果 buffer 从它取「图在哪」，
                          ;; 并在 kill / 下次重跑时据此删掉（见 show-result）。
                          ;; 记的是 **effective**（实际生效目录）而不是 owned：
-                         ;; rerun 时 owned 为 nil 而 CLI 仍写进上一轮的目录，记 nil
-                         ;; 会让 show-result 把正在使用的目录当「旧目录」删掉。
+                         ;; 调用方显式给目录时 owned 为 nil 而 CLI 写进 explicit
+                         ;; 那个目录，记 nil 会让 show-result 把正在使用的目录当
+                         ;; 「旧目录」删掉。
                          :pages-dir effective
                          ;; 配置本身也记下来：`eimg-ocr-rerun' 要重跑就得有配置，
                          ;; argv 是从它推出来的，反过来推不回去（选项顺序固定，但
                          ;; 无法区分「未指定」与「指定成默认值」）。记**合并后**的
                          ;; 完整配置：重跑要复现这次的结果，而不是复现调用方的原始
                          ;; 入参（后者会随 defcustom 改动而改变行为）。
-                         ;; 注意其中的 `:page-images-dir' 是本次实际生效的目录（含
-                         ;; rerun 沿用的上一轮目录），所以 `eimg-ocr--run' 在重跑时
-                         ;; 不会另建新目录：重跑沿用同一个目录 → 新旧 `:pages-dir'
-                         ;; 相同 → `eimg-ocr--show-result' 不删它（页图刚被这次
-                         ;; CLI 重写进该目录，删掉就等于重跑后页图全失效）。
+                         ;; 注意其中的 `:page-images-dir' 是本次实际生效的目录：若它
+                         ;; 是本包自建的页图目录，`eimg-ocr--run' 在重跑时会按
+                         ;; `eimg-ocr--owned-pages-dir-p' 判为过期 → 本轮另建目录，
+                         ;; 旧目录由 `eimg-ocr--show-result' 的 stale-dir 清理删掉
+                         ;; （新目录天然没有上一轮残留的页图）。调用方显式给的目录
+                         ;; 不满足判据，会被原样带进下一轮并继续复用。
                          :config config
                          :elapsed (float-time (time-subtract (current-time) started))))
                   (eimg-ocr--safe-call on-success pages)))
             (eimg-core-parse-error
              (eimg-ocr--clear-progress)
              ;; 解析失败：结果 buffer 没接手这批页图，不删就没人删了。
-             ;; 只删 `owned'——explicit / effective 指向的目录本层不拥有（可能是
-             ;; 用户自己的目录，也可能是 rerun 沿用上一轮的临时目录）。
+             ;; 只删 `owned'——explicit / effective 指向的目录本层不拥有（那是调用方
+             ;; 显式指定的目录，可能就落在用户自己的路径上）。
              (eimg-ocr--delete-pages-dir owned)
              (eimg-ocr--remember-raw stdout)
              (message "eimg-ocr 输出无法解析：%s（原始输出前 %d 字符已存入 %s）"
