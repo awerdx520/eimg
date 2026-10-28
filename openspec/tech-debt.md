@@ -1,235 +1,139 @@
 # 技术债
 
-## 截图能力尚未迁移 [已解决 2026-10-27，见 decisions D10]
-截图采集、选择预览、插入、embark 集成仍在 thomas-emacs 的 `site-lisp/thomas-screenshot.el`；
-eimg 侧通过软依赖调用，计划迁移后删除原文件。
+## 本文件约定
 
-> 已解决：四个模块已迁入本仓（`eimg-capture.el` / `eimg-select.el` / `eimg-insert.el` /
-> `eimg-embark.el`），跨仓软依赖与两个转调桥接命令一并删除。以上正文保留作为迁移前的
-> 现状记录。
+- 只记工程侧债务。用户可见的契约与边界写进 `README.org`（`* 已知边界` 与后端各节），本文件只留一行指针（见文末「已转入 README（非债）」）。
+- 关闭条目必须给出日期与可验证证据（决策编号 / commit / 测试文件与用例名），并移入文末「已关闭（索引）」——不留整段旧正文。
+- 每条必须有「现状 / 影响 / 验证方式 / 改进方向」四段；「改进方向」为「无」时必须写清是能力边界而非缺陷。
+- 标题带级别与成本：`（P1/P2/P3 · 成本 S/M/L）`。P1 = 修法明确且低风险；P2 = 需业务决策或中件；P3 = 需新能力或环境限制。
 
-## tesseract 语言数据需显式装一次（CLI 已默认使用 eimg 安装目录）
-系统 tesseract 5.5.3 默认只有 afr/osd；中英文需 `bin/eimg-ocr-setup --tessdata` 把 chi_sim+eng
-补到 `~/.local/share/eimg/tessdata/`。2026-10-27 起 CLI 在**未显式传** `--tessdata-dir` 时会
-自动使用该目录（判据：目录存在且含 `*.traineddata`；探测 `reason` 里注明，显式传入仍以显式
-为准），elisp 侧也有 `eimg-ocr-tessdata-dir` 可覆盖，因此「装了却不可用」不再需要手工配路径。
+## 无 pdfinfo 时部分页码越界会静默截断（P1 · 成本 S）
 
-剩下的债务只有「必须由用户显式跑一次安装」这一条事实本身：配置、`init` 与任何 hook 都不
-下载（不变量），`--check` 只能如实报告 `available=false` 并给指引。
+现状：`--pdf-pages 2-9` 打在 3 页文档上，系统没有 `pdfinfo` 时 `pdftoppm -f 2 -l 9` 返回 rc=0 且只输出第 2、3 页，CLI 如实返回识别到的页而不报错——没有总页数就没有判据。有 `pdfinfo` 时走总页数前置校验，越界报退出码 3。
 
-## 解释器自带的 CA 配置可能与系统不一致
-本机 `python3` 是 `/opt/miniforge/bin/python3`，其 openssl 编译期 cafile 路径不存在，于是
-`ssl.create_default_context()` 拿不到任何根证书——且因为 `SSL_CERT_FILE` 未被使用，表现成
-「系统信任库完好（`curl` 200）但 urlopen 报 `unable to get local issuer certificate`」。
+影响：用户以为「2–9 页都识别了」，实际少了 4–9 页，而结果 JSON 里看不出任何异常。
 
-`bin/eimg-ocr-setup` 已按候选表自己加载系统 bundle 兜底（`/etc/ssl/cert.pem` →
-`/etc/ssl/certs/ca-certificates.crt` → `/etc/pki/tls/certs/ca-bundle.crt` → `certifi`，
-全不可用才回退解释器默认），但这是**客户端绕行**：同一台机器上不经本脚本的其它 Python 下载
-仍会撞上同一问题。根治方向是给解释器配好 `certifi` / `SSL_CERT_FILE`，或用系统 python3。
+验证方式：构造 3 页 PDF，在 PATH 里剔除 `pdfinfo` 后跑 `--pdf-pages 2-9`，断言退出码 3 且 stderr 说明请求页数超出实际渲染页数；保留 `pdfinfo` 的同名用例断言既有行为不变。
 
-## rapidocr 依赖 Python 环境
-rapidocr 需 onnxruntime + numpy + pillow，首轮依赖用户已有 venv 或 `--rapidocr` 新建。
+改进方向：不必引入硬依赖——把「退出码 3」的判据从「总页数」换成「请求页数 vs 实际渲染页数」：`pdftoppm` 只产出 m 页而请求 n 页（n > m）时即判越界，不装 `pdfinfo` 也能发现「少了几页」；`pdfinfo` 退化为「只用于给出更准确的文案」。
 
-## 无 pdfinfo 时部分越界会静默截断
-`--pdf-pages 2-9` 打在 3 页文档上，若系统没有 `pdfinfo`，`pdftoppm -f 2 -l 9` 返回 rc=0 且
-只输出 2、3 两页，CLI 如实返回识别到的页而不报错——没有总页数就没有判据。有 `pdfinfo`
-时用总页数做前置校验（当前主路径），越界直接报退出码 3。要让「少了几页」这件事本身
-可发现，只能靠下游对 `pages` 的页数自检，或给 `pdfinfo` 补一条硬依赖。
+## `--pdf-pages` 对多 PDF 混排重复生效（P2 · 成本 S · 需先定语义）
 
-## `--pdf-pages` 对多 PDF 混排重复生效
-多个 PDF 输入时页码范围对每个文件都套用：若第二个文件页数不足，会整体以退出码 3 失败，
-前面文件已识别出的结果被一并丢弃（一次失败的识别成本是整批栅格化 + OCR）。批量场景
-可能需要「逐文件跳过并继续」的语义，与当前「参数错误即整批失败」的契约不同，留作后续
-决定；在决定前，多文件混排时不要带 `--pdf-pages`。
+现状：多个 PDF 输入时页码范围对每个文件都套用；若第二个文件页数不足，整体以退出码 3 失败，前面文件已识别出的结果被一并丢弃（一次失败的识别成本是整批栅格化 + OCR）。
 
-## 阅读顺序排序只还原单栏横排，多栏与竖排会失效
-`sort_blocks_reading_order` 只做「按 y 中心聚行 + 行内按 x0 从左到右」这一维还原，
-前提是页面为单栏横排。具体失效场景：
-- **多栏排版**（双栏论文 / 报纸 / 并排代码）：左右栏处在同一水平带时会被聚成同一行，
-  输出变成「左栏第 1 行 → 右栏第 1 行 → 左栏第 2 行 …」的左右交错，而不是读完左栏
-  再读右栏；栏间距越窄、栏内行距越大，串行越严重。
-- **竖排文字**（中日文竖排、旋转 90° 的表头）：字块 x0 相同、y 递增，被排成一字一行，
-  行内只剩单块，还原不出「从右到左、从上到下」的列序；与横排正文混排时两者还会被
-  交错插入同一顺序。
-- **跨行块**（整段贴图、跨行大标题）：块的 cy 落在它所跨的多行之间，整块会被插到
-  中间位置，版式越复杂偏差越大。
-- 容差取自「所有块高度的中位数的一半」，同一页混排超大块（整幅截图）与正文时中位数
-  仍稳健，但整页都是超大块时容差会大到把相邻行并成一行。
+影响：批量场景无法用页码参数，用户只能拆成多次调用。
 
-留作后续：要真正还原需做栏检测（按 x 投影切栏）与书写方向判定（竖排需按 y 优先、
-x 递减）；当前实现刻意只做最保守的一维聚类，宁可排错也不猜版面。
+验证方式：两个 PDF（3 页 + 1 页）带 `--pdf-pages 2`，断言当前行为（整批失败、退出码 3）；改为逐文件跳过后断言第一份结果保留、第二份跳过并计入 stderr 汇总。
 
-## sentinel 状态判定不得依赖 event 文案（0b75ecc 引入、d128464 修复）
-`make-process` 的 sentinel 事件串对「因信号死亡」的描述取自 `strsignal`，会经 gettext
-翻译：本机 zh_CN 下 `delete-process` 给出的是「已杀死」、SIGINT 给出「中断」，按
-`"killed"` / `"interrupt"` 字面匹配永远不命中——取消与超时两条路径整个哑掉（回调不执行、
-状态不复位、`eimg-ocr--process` 一直停在被删的进程对象上，后续每次识别都报「已有任务」）。
-判据必须换成与文案无关的 `process-status`（`exit` / `signal`）+ `process-exit-status`
-（退出码），超时与用户取消再靠进程属性 `eimg-timeout` 区分。
+改进方向：需要一次契约决策——「逐文件跳过并继续」（更符合批量直觉，但「参数错误」变成「部分成功」，退出码要有新语义，例如 0 + stderr 警告）vs 维持「整批失败」（简单、可预测）。在决定前，多文件混排不要带 `--pdf-pages`。
 
-**风险形态是假绿**：英文 locale 下 `strsignal` 返回 "killed" / "interrupted"，同一份代码
-全绿；只有中文环境才暴露。因此这类缺陷不能靠「本地 `make test` 通过」证明不存在——
-新增任何依赖进程事件串的分支时，必须同时断言在非英文 locale 下的行为（或用
-`process-status` 这类语言无关来源）。
+## 阅读顺序排序只还原单栏横排（P3 · 成本 L）
 
-## `+thomas/screenshot` 的返回值契约未经跨仓契约测试 [已解决 2026-10-27，见 decisions D10]
-`eimg-ocr-region` 通过软依赖调用 thomas-emacs 的 `+thomas/screenshot`，靠它的**返回值**
-（成功分支最后一个表达式 `file`）拿截图路径。实测（`emacs -Q --batch` 打桩
-`call-process` + 历史写入后 `call-interactively`）确认当前返回绝对路径字符串，但这条契约
-只写在对方的 docstring 里，没有任何测试跨仓锁定：上游若把成功分支改成「先 `message`
-再返回 nil」或在末尾追加一句 `(force-mode-line-update)` 之类，返回值就变成非路径，而
-eimg 侧只会得到「截图函数没有返回文件路径」——功能静默退化，且改的是**另一个仓库**，
-本仓库的 ERT 看不见。
+现状：`sort_blocks_reading_order` 只做「按 y 中心聚行 + 行内按 x0 从左到右」这一维还原，前提是单栏横排。多栏（双栏论文 / 并排代码）会把左右栏聚成同一行、输出左右交错；竖排会一字一行；跨行块（整段贴图、跨行大标题）的 cy 落在所跨多行之间，被插到中间位置；容差取「所有块高度中位数的一半」，整页都是超大块时会大到把相邻行并成一行。
 
-迁移到 `eimg-capture` 之后，截图实现与 OCR 同仓，应把这条契约改成同仓 ERT 锁定
-（命令返回绝对路径 + 文件确实存在 + 走 `call-interactively` 路径），届时本条债务关闭。
+影响：内容不缺、顺序错，下游摘要与翻译质量下降；多栏与竖排版面尤其明显。
 
-> 已解决：契约现在由同仓的 `test/eimg-ocr-test.el` 第 8 节锁定——四态（合法路径 / nil /
-> 不可读 / 命令自身 signal）+「`eimg-ocr-capture-function` 为 nil 时探测到
-> `eimg-capture`」+「`eimg-ocr.el` 的可执行代码不出现宿主符号」。
-> `eimg-capture-test-no-host-symbols` 另行锁定四个模块的源码边界。
+验证方式：多栏 fixture（两块 x 区间不重叠、y 区间重叠）断言输出为「左栏全部行 → 右栏全部行」；竖排 fixture 断言按列右到左、列内上到下；现有单栏用例必须继续通过。
 
-## 交互入口在 daemon / 批处理下会阻塞（异步只覆盖「识别」这一段）
+改进方向：需要栏检测（按 x 投影切栏）+ 书写方向判定（竖排按 y 优先、x 递减），属 P4 范畴。当前实现刻意只做最保守的一维聚类——宁可排错也不猜版面；改动前必须先用 fixture 锁住现状，避免「改一处、错两处」。
 
-OCR 本身全异步（`eimg-ocr--start` 立即返回，收尾由 sentinel 完成），但**取输入**与
-**取确认**这两段仍是同步的：
+## 交互入口在 daemon / 批处理下会阻塞（P2 · 成本 M）
 
-| 位置 | 同步点 | 无 attached frame / `noninteractive` 时的表现 |
-|---|---|---|
-| `eimg-ocr-region` | `call-interactively` 调截图命令（外部工具选区域） | 等外部进程；无图形环境时 `eimg-ocr-region` 已先 `user-error`，但 `display-graphic-p` 为真却无可用 frame 时仍会卡在这里 |
-| `eimg-ocr-file` | `read-file-name` | 无 minibuffer 可交互 → 阻塞或直接失败 |
-| `eimg-ocr-history` | `completing-read` | 同上 |
-| `eimg-ocr-write-file` | 覆盖前 `y-or-n-p` | 同上（ERT 用例里靠 `cl-letf` 打桩绕过，未覆盖真实 daemon 路径） |
+现状：OCR 本身全异步（`eimg-ocr--start` 立即返回，收尾由 sentinel 完成），但「取输入」与「取确认」两段仍是同步的：`eimg-ocr-region` 经 `call-interactively` 等外部截图进程；`eimg-ocr-file` 用 `read-file-name`；`eimg-ocr-history` 用 `completing-read`；`eimg-ocr-write-file` 覆盖前 `y-or-n-p`。
 
-这不是可以「顺手修」的缺陷：截图选区域本质上要人操作。留作后续决定——可选方向是给三个
-入口命令加一个「非交互参数入口」（直接吃文件路径，不弹选择器），让 daemon / 脚本能复用同一条
-OCR 编排路径；在那之前，从 daemon（`emacsclient -e`、定时任务）调这些命令不要指望能返回。
+影响：无 attached frame 或 `noninteractive` 时阻塞或直接失败（ERT 用例里靠 `cl-letf` 打桩绕过，未覆盖真实 daemon 路径）。从 `emacsclient -e`、定时任务调这些命令不要指望能返回。
 
-## 多页 PDF 每页独立起进程，rapidocr 模型每页重新加载
-`recognize_pdf` 先 `pdftoppm` 栅格化，再**逐页**走 `recognize_image` → `run_rapidocr` /
-`run_tesseract`：每页一个子进程，rapidocr 那份内联脚本每页都要重新导入 onnxruntime 并
-加载检测/识别模型（实测冷启动 8–10 秒）。10 页文档≈10 次冷启动，真正的 OCR 时间被模型
-加载淹没。
+验证方式：`emacs --batch` 下调用四个入口，断言在 1 秒内以明确错误结束（`user-error` 指路到非交互入口）而非挂起。
 
-超时也只在**单页**粒度上：`RAPIDOCR_TIMEOUT = 180` / `TESSERACT_TIMEOUT = 120` 落在每次
-`subprocess.run` 上，CLI 层**没有整体超时**（也没有 `--timeout` 选项）。页数一多，总耗时
-可以远超用户对「一次识别」的预期；elisp 侧靠 `eimg-ocr-timeout`（整体定时器 →
-`delete-process`）兜住，于是表现为「到点被取消」而不是「慢慢跑完」，且已识别出的页一并
-丢弃。
+改进方向：给三个入口补「非交互参数入口」（直接吃文件路径、不弹选择器），复用同一条 OCR 编排路径；截图选区域本质上要人操作，`eimg-ocr-region` 保持只支持交互。
 
-改进方向：**单进程识别多页**——一次 `subprocess.run` 传入多张图，Python 侧循环识别并把
-每页 block 合并进同一个结果 JSON，模型只加载一次。代价有两条，需先定取舍：① 错误粒度变粗
-（一页失败是丢整份还是跳过该页？）；② 超时语义要从「每页上限」改成「总量上限 + 每页软
-上限」，CLI 与 elisp 两侧的退出码 4 / 超时文案都要跟着重做。
+## 多页 PDF 每页独立起进程，rapidocr 模型每页重新加载（P2 · 成本 M）
 
-## tessdata 下载只校验体积下限，没有 SHA256
-`bin/eimg-ocr-setup --tessdata` 从 GitHub 取 `chi_sim.traineddata` / `eng.traineddata`，
-校验只有「文件大于 1 MB」一条，没有内容哈希比对：HTTPS 被降级、或环境配了不校验的代理、
-或上游同名文件被替换时都会静默通过。后果是 OCR 质量退化而不是报错——只要文件大于 1 MB，
-`tesseract --list-langs` 就认为语言可用，`probe_backends` 也判 tesseract 可用。
+现状：`recognize_pdf` 先 `pdftoppm` 栅格化，再逐页 `recognize_image` → 每页一个子进程；rapidocr 的内联脚本每页重新导入 onnxruntime 并加载检测/识别模型（实测冷启动 8–10 秒），10 页文档≈10 次冷启动。超时只在单页粒度（`RAPIDOCR_TIMEOUT = 180` / `TESSERACT_TIMEOUT = 120` 落在每次 `subprocess.run`），CLI 无整体超时、也无 `--timeout`。
 
-当前「HTTPS + 体积下限」可接受（公开大文件，篡改动机与收益都低），严格起来应固定每个文件
-的 SHA256 并在下载后比对，顺带补一条「已存在且哈希匹配则跳过下载」的路径（现在重复执行
-`--tessdata` 会重下）。
+影响：多页文档的耗时被模型加载淹没；elisp 侧 `eimg-ocr-timeout`（整体定时器 → `delete-process`）到点取消，表现为「到点被取消」而不是「慢慢跑完」，且已识别页一并丢弃。
 
-## 交互命令没有 `;;;###autoload`，可用性隐式依赖宿主不延迟加载
-`eimg-ocr-region` / `eimg-ocr-file` / `eimg-ocr-history` / `eimg-ocr-write-file` 等
-交互命令只定义在 `eimg-ocr.el` 里，**没有 `;;;###autoload` cookie**。宿主
-（thomas-emacs 的 `lisp/init-tools.el`）在 `use-package-always-defer` 为 nil 的默认值下
-于启动期 require 本包，于是这些键位「恰好」可用——这是一条隐式契约，本仓库自己的 ERT
-也锁不住（`make test` 用 `-L . -L test -l` 显式加载，永远看不到延迟加载的形态）。
+验证方式：固定 10 页 fixture，记录改造前后 `--format json` 的总耗时与 `elapsed` 字段；断言 blocks 逐字段一致。
 
-风险：若将来 eimg 改成 `:defer t`（延迟加载省启动时间，是很可能的下一步），`SPC` 系列
-键位会静默变成 `void-function`，而 `eimg-menu`（transient 菜单，上游带 autoload）仍能
-打开并调用同一批命令——属「部分可用」的隐蔽退化：菜单能跑、直接按键报错，错误信息只说
-函数未定义，排查时很难联想到「autoload 没生成」。
+改进方向：单进程识别多页——一次 `subprocess.run` 传多张图，Python 侧循环识别并把每页 block 合并进同一份 JSON，模型只加载一次。两条取舍需先定：① 错误粒度（一页失败是丢整份还是跳过该页）；② 超时语义从「每页上限」改为「总量上限 + 每页软上限」，CLI 退出码 4 与 elisp 超时文案都要跟着重做。
 
-修法二选一：① 给全部 `(interactive)` 命令补 `;;;###autoload` cookie（straight 的
-autoloads 步骤会收集，宿主即可安全 `:defer`）；② 明确把「本包不做延迟加载」写成契约
-（`:demand t` + README 说明），让后来改 `:defer` 的人先看到这句话。
+## ollama（VLM）后端的四条边界（P2/P3 · 成本 M）
 
-## ollama（VLM）后端的四条边界
+现状与分级：
+- **无 box/conf**（P3，能力边界）：VLM 只回纯文本，`conf` 恒 `0.0`、`box` 恒 `None`，`sort_blocks_reading_order` 退化为原样返回；下游若按置信度过滤会把结果整体当作「低置信」。
+- **多页 PDF 每页一次推理**（P2，与上条「多页 PDF」同源同解）：模型驻留靠 `keep_alive:"5m"`，但每页仍是一次完整请求；elisp 侧整体 `eimg-ocr-timeout`（默认 300s）会先于单页 `OLLAMA_TIMEOUT`（300s）触发。
+- **只支持 png/jpg/jpeg**（P3，有意行为）：CLI 无 PIL 无法转码，tiff/gif/webp 直接退出码 3；`auto` 锁定 ollama 时按设计不回退 tesseract（`resolve_backend` 只挑一次，动态回退会让结果不可预测）。
+- **输出格式漂移未充分防御**（P2）：只剥了 Markdown 三反引号围栏，编号列表、解释性前缀、空行结构等漂移未处理；真实 VLM 识别质量与稳定性**未验证**（端到端只用 `test/fixtures/ollama-stub.py`）。
 
-1. **无 box/conf**：VLM 只回纯文本，blocks 的 `conf` 恒 `0.0`、`box` 恒 `None`，`sort_blocks_reading_order`
-   退化为「原样返回」。多栏/竖排/跨行块的版面还原能力与 tesseract 路线不可比；下游若依赖置信度
-   做过滤，ollama 结果会被整体当作「低置信」。
-2. **多页 PDF 每页一次推理**：模型驻留靠 `keep_alive:"5m"`，但每页仍是一次完整请求，10 页文档可能
-   到分钟级；且 elisp 侧整体 `eimg-ocr-timeout`（默认 300s）会先于单页 `OLLAMA_TIMEOUT`（300s）
-   触发，多页 PDF 走 ollama 实际表现为「到点被取消」而非「慢慢跑完」。要真正可用需要单进程多用例
-   或调大/解耦整体超时。
-3. **只支持 png/jpg/jpeg**：CLI 无 PIL 无法转码，tiff/gif/webp 直接退出码 3。`auto` 锁定 ollama 时
-   这类输入不会回退 tesseract（有意行为）。
-4. **输出格式漂移未充分防御**：只剥了 Markdown 三反引号围栏，编号列表、解释性前缀、空行结构等
-   漂移未处理；真实 VLM 识别质量与稳定性**未验证**（本轮禁止下载模型，端到端只用了 stub）。
+影响：位置能力对该后端整体不可用；速度与输入格式受限；输出形态可能随模型漂移。
 
-## ollama 探测的超时上限只覆盖单次 socket 操作
+验证方式：stub 增「编号列表前缀」「解释性前言」两种输出模式，断言解析后 blocks 不含前缀行；真实模型质量需人工抽样，记入 L3 手工清单。
 
-`OLLAMA_PROBE_TIMEOUT = 3` 交给 `urllib` 的 `timeout` 参数，它约束的是**每次 socket 操作**，
-不是整个探测：慢速滴流响应用户实测可把一次 `read()` 拖到 19.6 秒，DNS 解析阶段完全不受它约束。
-更彻底的做法是读循环里加单调时钟 deadline（或 `signal.alarm`），把语义升级为「整个探测的硬上限」。
-当前未做：实现成本与收益不成比例（对端是本地服务，异常场景需要主动构造），已通过响应体上限
-（`OLLAMA_MAX_RESPONSE` = 16 MB，`_read_capped` 按 `Content-Length` 先拒、再 `read(limit+1)` 兜底）
-与探测超时缓解到「不会吃满内存、不会无限挂起」，但**「3 秒」不是硬保证**。
+改进方向：格式漂移可加通用清洗（去前言、剥列表序号）；「无 box」与「只支持三种格式」属能力边界与有意行为，不修。
 
-## ollama 默认端点无身份校验
+## CLI 输出兼容无自动化回归（P2 · 成本 S）
 
-`http://127.0.0.1:11434` 是约定而非认证：ollama 未运行时同机其它用户可抢先 bind 该端口冒充服务，
-从而拿到被 OCR 图片的 base64、并控制注入结果 buffer 的文本。缓解手段只有「别指向不受信任的主机」
-与结果 buffer 只做纯文本插入（不 `eval`）。若将来需要，可在探测阶段校验 `/api/version` 响应特征，
-但那只是「更难冒充」，不是认证。
+现状：「不传 `--page-images-dir` 时 json/text/lines 逐字节一致」目前靠手工快照（18/18 对比），项目无 Python 测试框架。
 
-## `--list-backends` / `--check` 现在会发一次本地 HTTP 请求
+影响：后续改动 CLI 输出路径时可能静默破坏兼容，CI 抓不到。
 
-ollama 探测让这两个「应该毫秒级」的只读命令多了一条网络路径：ollama 未运行时是快速
-ECONNREFUSED（毫秒级），但端口被防火墙 DROP 或对端不响应时最多等 3 秒（且如上一节所述，
-3 秒不是硬上限）。不要在 shell 补全、`init`、hook 或任何启动路径里调用它们。
+验证方式：固定 fixtures + 期望 stdout 文件，对三种 `--format` 各断言逐字节相等。
 
-## P1 联动视图遗留项（2026-10-27）
+改进方向：加一个最小快照测试（或把对比脚本固化成 `make` 目标）。ERT 已能 `call-process` 跑真 CLI（见 `test/eimg-ocr-ollama-test.el`），无需引入 pytest。
 
-P1（坐标地基 + 联动高亮）验收通过后剩下来的九项，逐条记现状、影响与改进方向。
+## `eimg-select--preview-fit` 与 `eimg-core-fit-size` 逻辑重复（P2 · 成本 S）
 
-1. **底图未真正降采样**（对应 decisions D14 决策一）
-   现状：超过 `eimg-ocr-view-max-embed-bytes`（默认 8 MB）就明确降级——不内嵌底图，只显示文本列表与可行动提示。
-   影响：高 DPI 扫描件在内置渲染路径下看不到图；用户需降低 `--dpi` 重识别或裁剪后重认。
-   改进方向：引入可选外部图像后端（ImageMagick 等）做像素级降采样；P2 需要导出合成图时再评估是否接受该依赖。
+现状：两处各有一套「按 frame 尺寸算缩放比与显示像素」的换算，P1 刻意未重构（避免触碰截图链路）。
 
-2. **SVG 前缀缓存只有一条**
-   现状：`eimg-ocr-view--svg-prefix-cache` 只保留「最近一次」的前缀（含 base64 底图）。
-   影响：正反翻页会重建前缀，约 70 ms/次；来回对比两页时这笔开销反复出现。
-   改进方向：扩成 2–3 条 LRU（键已含路径 + mtime + size + 画布/显示尺寸，扩容不改变正确性）。
+影响：修一处缩放策略时容易漏另一处，视觉上表现为「截图预览与联动视图缩放不一致」。
 
-3. **内嵌上限按字节判、不按像素**
-   现状：判断依据是文件字节数（`file-attribute-size`，只读元数据不读内容）。
-   影响：高质量 JPEG 的 8 MB 可能解码出很大位图，仍会触发 `create-image` 的重解析开销。
-   改进方向：改按像素判（宽 × 高 × 4 估算），但需先解码——与「不先把文件读进内存」的设计冲突，需重新设计判断入口。
+验证方式：重构前先给两处各补一条「同输入同输出」的 ERT（core 侧已有 `eimg-ocr-view-test-geometry-uses-fit-size`），重构后两文件用例全绿。
 
-4. **`create-image` 每次全量重解析 SVG**
-   现状：前缀缓存只省了「重拼 MB 级字符串」，`create-image` 仍按整条 SVG 解析（`:map` 一变必须重造 image spec）。
-   影响：单次重绘有约 2.2 ms 的固定成本（24 块场景），与块数关系不大而与底图体积相关。
-   改进方向：进一步只能换渲染后端（例如把底图与框分两层叠加），代价是坐标对齐逻辑要重做，P1 不做。
+改进方向：让 `eimg-select--preview-fit` 改用 `eimg-core-fit-size`（需保留 `:chars-w` / `:chars-h` 的计算），触及截图链路，需单独验证。
 
-5. **rerun 复用同一页图目录会残留旧页图**
-   现状：所有权记账（`owned` vs `effective`）已修好「重跑误删正在使用的目录」，但同一目录内页数变少时，旧的 `pN.png` 仍留在目录里。
-   影响：视图按页结构取图，不受残留影响；但目录不干净，用户手工查看时会困惑。
-   改进方向：rerun 创建新目录（新临时目录天然干净），或在写入前清掉同名目录内未被本轮覆盖的页图。
+## 网络对端输入与下载入口的加固缺口（P2/P3 · 成本 S–M）
 
-6. **CLI 输出兼容无自动化回归**
-   现状：项目无 Python 测试框架，「不传 `--page-images-dir` 时 json/text/lines 逐字节一致」目前靠手工快照（18/18 对比）。
-   影响：后续改动 CLI 输出路径时可能静默破坏兼容，且 CI 抓不到。
-   改进方向：加一个最小快照测试（固定 fixtures + 期望 stdout 文件），或把对比脚本固化成 `make` 目标。
+现状（安全审查发现，本轮均**不可利用**——默认配置下不成立，记录以备入口放宽时收口）：
+- `bin/eimg-ocr-setup` 的 `download()` 用裸 `urlopen`：默认 opener 含 `file:` / `data:` / `ftp:` handler 且跟随 3xx 重定向。当前 `TESSDATA_URLS` 硬编码 https，故不可利用；一旦将来支持镜像覆盖（`--tessdata-url` 等），立刻变成「读本地任意文件写入 tessdata」或 SSRF 探测内网。改进方向：scheme 白名单 + 拒绝重定向 + 显式构造 `OpenerDirector` 去掉不需要的 handler（**必须保留环境代理能力**，否则企业网下载会断）。
+- `.part` 半成品用固定文件名 + `open("wb")`（跟随符号链接，CWE-59 / CWE-377）：仅当 `--tessdata-dir` 指向他人可写目录时，本地攻击者可预置符号链接覆写目标文件。改进方向：`tempfile.mkstemp(dir=destination.parent, ...)`（自带 `O_EXCL|O_NOFOLLOW`）。
+- `bin/eimg-ocr` 把对端响应体前 200 字符与模型名原样回显（CWE-150，既有行为，非本轮引入）：恶意 ollama 返回含 `\x1b]0;` / `\r` 的错误体可改写终端标题、伪造输出行。改进方向：统一 `_sanitize_snippet()` 剥 C0 控制字符后再截断。
+- CLI 的 `OLLAMA_TIMEOUT`（300 秒）与 elisp 的 `eimg-ocr-timeout`（300 秒）相同，Emacs 内的定时器通常先到，用户看到的是「OCR 超时（124）」而不是 CLI 新增的「ollama 整体超时」文案——新分支的排障价值在 elisp 路径上被削弱。改进方向：CLI 侧预算调到略小于 elisp（如 240 秒），或让 elisp 超时文案附带 stderr 尾部原因。
 
-7. **`eimg-select--preview-fit` 与 `eimg-core-fit-size` 逻辑重复**
-   现状：两处各有一套「按 frame 尺寸算缩放比与显示像素」的换算，P1 刻意未重构。
-   影响：修一处缩放策略时容易漏另一处（视觉上表现为「截图预览与联动视图缩放不一致」）。
-   改进方向：让 `eimg-select--preview-fit` 改用 `eimg-core-fit-size`（需保留 `:chars-w` / `:chars-h` 的计算），触及截图链路，需单独验证。
+影响：只在「后端或镜像指向不可信主机」「tessdata 目录在他人可写位置」这类前提下成立；默认配置不成立。
 
-8. **ollama（VLM）后端无 `box`**
-   现状：VLM 后端 `box` 恒 `None`，联动视图对它只显示文本列表 + 一行提示。
-   影响：位置能力对该后端整体不可用——这是后端能力边界，不是缺陷。
-   改进方向：无（除非换用能输出坐标的 VLM，或加一个「按行序粗略布局」的降级画框，但那等于凭空造坐标，不建议）。
+验证方式：加固后补三条用例——非 http/https scheme 被拒、重定向到异主机被拒、`.part` 落在符号链接上不覆写目标；超时抢跑项在调整预算后断言 elisp 路径能看到 CLI 的「整体超时」文案。
 
-9. **`--posn-entry` 的真实鼠标点击未端到端验证**
-   现状：本环境无法合成 GTK 点击事件，只验证了热区形状 / 坐标 / ID / keymap 绑定，以及几何兜底路径（正向 `--image-map` 与反向 `--posn-entry` 互为逆运算，已有 ERT 用例）。
-   影响：真实点击链路（事件 → `[ID mouse-1]` → 命令 → 跳转）只在代码层与单测层成立。
-   改进方向：在 GUI 环境加一条人工验证步骤（或引入可合成事件的测试工具），记入 L3 手工清单。
+改进方向：见各条；属纵深防御，优先级低于「阅读顺序」与「多页单进程」两项。
 
+## 联动视图遗留项（P2/P3 · 成本 S–L）
+
+P1（坐标地基 + 联动高亮）验收后剩余五项，逐项标级别：
+
+- **底图未真正降采样**（P2 · 成本 L）：超过 `eimg-ocr-view-max-embed-bytes`（默认 8 MB）即明确降级——不内嵌底图，只显示文本列表与可行动提示。高 DPI 扫描件在内置渲染路径下看不到图，用户需降低 `--dpi` 重识别或裁剪后重认。改进方向：引入可选外部图像后端（ImageMagick 等）做像素级降采样；P2 需要导出合成图时再评估是否接受该依赖。
+- **内嵌上限按字节判、不按像素**（P2 · 成本 M）：判据是 `file-attribute-size`（只读元数据不读内容），高质量 JPEG 的 8 MB 可能解码出很大位图，仍会触发 `create-image` 的重解析开销。改进方向：改按像素判（宽 × 高 × 4 估算），但需先解码——与「不先把文件读进内存」的设计冲突，需重新设计判断入口。
+- **`create-image` 每次全量重解析 SVG**（P3 · 成本 M）：前缀缓存（现为容量 3 的 LRU）只省了「重拼 MB 级字符串」，`create-image` 仍按整条 SVG 解析（`:map` 一变必须重造 image spec），单次重绘有约 2.2 ms 固定成本。改进方向：只能换渲染后端（例如底图与框分两层叠加），坐标对齐逻辑要重做。
+- **ollama（VLM）后端无 `box`**（P3 · 能力边界）：见「ollama（VLM）后端的四条边界」第一条，不重复展开；改进方向：无。
+- **`--posn-entry` 的真实鼠标点击未端到端验证**（P3 · 环境限制）：本环境无法合成 GTK 点击事件，只验证了热区形状 / 坐标 / ID / keymap 绑定，以及几何兜底路径（`--image-map` 与 `--posn-entry` 互为逆运算已有 ERT）。改进方向：在 GUI 环境加一条人工验证步骤（事件 → `[ID mouse-1]` → 命令 → 跳转），记入 L3 手工清单。
+
+影响：高 DPI 扫描件的可视化降级；重绘有固定成本；真实点击链路只在代码层与单测层成立。
+
+验证方式：逐项有对应 ERT（几何换算 / 内嵌上限 / 兜底路径互逆 / LRU 淘汰）或 L3 手工步骤；改动时按项验收。
+
+改进方向：逐项见上（三项有明确方向，两项是能力边界与环境限制）。
+
+## 已关闭（索引）
+
+- 截图能力尚未迁移 —— 2026-10-27 关闭。证据：decisions D10（四模块迁入本仓，跨仓软依赖与两个转调桥接命令一并删除）。
+- `+thomas/screenshot` 的返回值契约未经跨仓契约测试 —— 2026-10-27 关闭。证据：decisions D10 + `test/eimg-ocr-test.el` 第 8 节（四态契约）+ `eimg-capture-test-no-host-symbols`（源码边界）。
+- 交互命令没有 `;;;###autoload`，可用性隐式依赖宿主不延迟加载 —— 2026-10-27 关闭。证据：decisions D11 + `test/eimg-autoload-test.el` 7 条用例（cookie 覆盖、真跑 `loaddefs-generate` 的 13 条映射、仅加载 autoloads 时 `featurep` 为 nil）。
+- sentinel 状态判定不得依赖 event 文案 —— 2026-10-27 关闭。证据：decisions D7 + commit d128464。教训已固化为不变量：判据用 `process-status` + `process-exit-status`，禁止匹配事件串；风险形态是「英文 locale 全绿、中文 locale 全哑」的假绿。
+
+## 已转入 README（非债）
+
+以下条目是用户可见的契约与边界，权威描述在 `README.org`，本文件不再重复维护：
+
+- tesseract 语言数据须显式安装一次 → `README.org` 的 `** 后端准备`（两条硬约束）。
+- rapidocr 依赖 Python 环境（venv / onnxruntime / numpy / pillow）→ `README.org` 的 `** 后端矩阵`。
+- 解释器自带 CA 配置可能与系统不一致 → `README.org` 的 `** 后端准备` 的 CA 段（脚本已按候选表兜底；不经本脚本的其它 Python 下载仍会撞）。
+- ollama 默认端点无身份校验 → `README.org` 的 `** ollama 后端的安全边界`（回环端口不等于可信）。
+- `--list-backends` / `--check` 会发一次本地 HTTP 请求 → `README.org` 的 `** 后端矩阵` 末段（不要放进补全 / `init` / hook）。

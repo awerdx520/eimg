@@ -69,6 +69,12 @@ eimg 把「采集图像 → 识别文字 → 产出可用文本或链接」收�
 该目录（前提是里面已有 =*.traineddata= ），探测的 =reason= 里会注明
 =默认使用 eimg 安装目录: …= 。只有把语言数据放在别处才需要显式指向。
 
+*=--tessdata= 按内容校验* ：脚本内置 =chi_sim= / =eng= 的 SHA256，下载后比对，不一致即失败
+（退出码 1）并删除半成品；已存在且校验通过时跳过下载（不联网）。上游 =tessdata_fast= 改版后
+需同步更新脚本里的 =TESSDATA_SHA256= ，否则下载会被判为「内容校验不通过」。
+
+需要更新哈希时先算新值： =sha256sum chi_sim.traineddata= （或 =python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' 文件= ）。只用你自己下载并确认过的文件算，不要用测试夹具的哈希。
+
 *CA 证书报错的排错* ： =--tessdata= 下载时报
 =SSL: CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate= ，说明
 **解释器** 的 CA 配置有问题（常见于 conda / 自编译 Python：编译期 cafile 路径不存在，且
@@ -77,6 +83,9 @@ eimg 把「采集图像 → 识别文字 → 产出可用文本或链接」收�
 =/etc/pki/tls/certs/ca-bundle.crt= 与已安装的 =certifi= ，全部不可用才回退解释器默认。
 若仍失败，显式兜底一次： =SSL_CERT_FILE=/etc/ssl/cert.pem bin/eimg-ocr-setup --tessdata= ——
 错误文案里会带「本次用的 CA」与可复制的这条命令。
+
+这一点只在走本脚本时被绕开：同一台机器上不经 =bin/eimg-ocr-setup= 的其它 Python 下载仍会撞上
+同一问题——根治要给解释器配好 =certifi= / =SSL_CERT_FILE= ，或改用系统 =python3= 。
 
 ** 后端矩阵
 
@@ -98,6 +107,10 @@ ollama 后端的模型与服务地址解析顺序：模型 =--ollama-model= → 
 声明支持视觉」（探测 =POST /api/show= 的 =capabilities= ）， **不是** =which ollama= ——典型
 形态是 ollama 装在 Windows 原生侧、WSL 里根本没有该命令，但经 mirrored 网络仍能访问
 =127.0.0.1:11434= 。
+
+=--list-backends= 与 =--check= 会发一次本地 HTTP 请求（探测 ollama）：ollama 未运行时是毫秒级的
+连接拒绝，但端口被防火墙 DROP 或对端不响应时最多等 3 秒。不要把它们放进 shell 补全、
+=init= 或任何启动路径。
 
 ** ollama 后端的安全边界
 
@@ -466,12 +479,14 @@ CLI 默认）。 =transient= 不随 =eimg.el= 加载：不按菜单的人不为�
 - *=--page-images-dir= 的目录创建优先于查询动作* ： =--list-backends --page-images-dir /x=
   会顺手建出 =/x= 。副作用仅此（空目录）；不想留空目录就别把它和查询参数混用。
 
+工程侧的技术债与后续方向（不面向使用者）记录在 [[file:openspec/tech-debt.md][openspec/tech-debt.md]]。
+
 * 开发与验证
 
 | 命令                | 内容                                                               |
 |---------------------+--------------------------------------------------------------------|
 | =make check-parens= | L1：逐文件 =check-parens= （每个文件一个 =emacs -Q --batch= 进程） |
-| =make test=         | L2：加载 =test/*-test.el= 跑 ERT（当前 146 条）                    |
+| =make test=         | L2：加载 =test/*-test.el= 跑 ERT（当前 215 条）                    |
 | =make py-check=     | =bin/= 下可执行 Python 脚本的 =py_compile= （无 python3 则跳过）   |
 | =make full-check=   | =check-parens= + =test= （不含 =py-check= ）                       |
 | =make clean=        | 清 =.elc= / 原生编译缓存 / =__pycache__= / 测试临时目录            |
