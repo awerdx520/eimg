@@ -234,8 +234,8 @@ def parse_pdf_pages(value: str) -> list[int]:
     """解析 `1-5` 或 `3` 形式的页码范围（1-based，闭区间）。
 
     这里只管语法与「页码 ≥ 1」「区间不倒序」。「页码是否超过文档实际页数」需要
-    先知道真实页数，由 `pdf_page_count`（pdfinfo）或 pdftoppm 的越界信号在
-    `recognize_pdf` 里判定 → 退出码 3。
+    先知道真实页数，由 `recognize_pdf`（pdfinfo 总页数前置校验）或 `rasterize_pdf`
+    （pdftoppm 越界信号 / 渲染页数少于请求页数）判定 → 退出码 3。
     """
     text = value.strip()
     if not text:
@@ -2030,7 +2030,8 @@ def pdf_page_count(path: Path) -> int | None:
     """用 `pdfinfo` 取 PDF 真实页数；pdfinfo 缺失 / 失败 / 输出不可解析时返回 None。
 
     页数只用于把「页码越界」的报错说清楚（「页码 9 超出范围（共 3 页）」），
-    拿不到就不该阻断识别——返回 None，由 pdftoppm 的越界信号兜底判定。
+    拿不到就不该阻断识别——返回 None，由 `rasterize_pdf` 的渲染页数判据（及
+    pdftoppm 的越界信号）兜底判定。
     """
     executable = shutil.which("pdfinfo")
     if not executable:
@@ -2063,6 +2064,7 @@ def _pdf_overflow_message(
     requested: list[int],
     total: int | None,
     first_overflow: int | None = None,
+    rendered: int | None = None,
 ) -> str:
     """页码越界的统一文案（退出码 3，含「无法读取输入」与「超出范围」）。
 
@@ -2070,6 +2072,11 @@ def _pdf_overflow_message(
     `min(requested)`：那会报成「页码 2 超出范围」，而 2 明明是有效页，
     用户按提示改参数会越改越糊涂。pdftoppm 报越界（rc 99）时手头没有具体
     越界页，才退回 `min(requested)`——那种情形下它确实已经越界。
+
+    `rendered` 是**实际渲染出的页数**（`rasterize_pdf` 的产物长度）。它只在
+    `total is None`（拿不到 pdfinfo 总页数）时参与文案：给出「请求 n 页只渲染
+    出 m 页」的新文案，把「少了几页」这件事说清楚；`total` 已知时一律用带总
+    页数的那条，忽略 `rendered`。
     """
     span = (
         f"{requested[0]}-{requested[-1]}" if len(requested) > 1 else str(requested[0])
@@ -2079,6 +2086,12 @@ def _pdf_overflow_message(
         return (
             f"无法读取输入: {path}（页码 {first} 超出范围（共 {total} 页），"
             f"请求 {span}）"
+        )
+    if rendered is not None:
+        return (
+            f"无法读取输入: {path}（页码 {first} 超出范围：请求 {span} 共 "
+            f"{len(requested)} 页，实际只渲染出 {rendered} 页；"
+            f"未安装 pdfinfo，无法给出总页数）"
         )
     return (
         f"无法读取输入: {path}（页码 {span} 超出范围，"
@@ -2098,9 +2111,10 @@ def rasterize_pdf(
     `pages` 为 None 表示整本。多页一次调用 `-f/-l` 渲完：每页起一次 pdftoppm
     会把整本的 xref 重复解析 N 遍，10 页文档实测慢 5 倍以上。
 
-    三类失败分开报：
+    四类失败分开报：
     - 起始页超过文档末页（pdftoppm 退出码 99）→ 退出码 3，页码越界文案；
-    - 渲染零输出（无 pdfinfo 时唯一的越界判据）→ 同上；
+    - 渲染零输出（无 pdfinfo 时的越界判据之一）→ 同上；
+    - 请求 n 页但只渲染出 m 页（无 pdfinfo 时的部分越界判据）→ 退出码 3；
     - 其它非零退出码（文件损坏 / 加密）→ 退出码 3，带 stderr 末两行。
     """
     executable = shutil.which("pdftoppm")
@@ -2160,6 +2174,21 @@ def rasterize_pdf(
         if number is None:  # pdftoppm 命名固定，理论不会走到；兜底按起始页 + 下标
             number = (pages[0] if pages else 1) + index
         rasterized.append((number, image))
+
+    # 无 `pdfinfo` 时唯一可用的越界判据：请求 n 页却只渲染出 m 页。
+    # 有 `pdfinfo` 时前置校验已在 `recognize_pdf` 里拦过，这里不重复判定——
+    # 否则「单页渲染失败但 pdftoppm rc=0」会被误报成页码越界。
+    if pages and total is None and len(rasterized) < len(pages):
+        produced_numbers = {number for number, _ in rasterized}
+        first_overflow = next(
+            (page for page in pages if page not in produced_numbers), None
+        )
+        raise fail(
+            EXIT_BAD_INPUT,
+            _pdf_overflow_message(
+                path, pages, None, first_overflow, rendered=len(rasterized)
+            ),
+        )
     return rasterized
 
 
@@ -2286,10 +2315,11 @@ def recognize_pdf(path: Path, backend: dict, args) -> list[dict]:
 
     临时目录在 `finally` 里删：成功、后端报错、超时、Ctrl-C 四条路径都要清。
 
-    已知边界：拿不到 pdfinfo（未安装）时无法判断「请求区间部分越界」，此时
-    pdftoppm 自身会把区间截断到最后一页（`-f 2 -l 9` 打在 3 页文档上只输出
-    2、3 两页且 rc=0），我们照实返回识别到的页，不报错——没有总页数就没有
-    判据，「少了几页」这件事只能靠下游对页数自检。
+    拿不到 pdfinfo（未安装 / 失败）时，判据改为「渲染页数少于请求页数」：由
+    `rasterize_pdf` 比对请求页与实际渲染出的页数，少一页即按页码越界报退出码 3。
+    pdftoppm 自己会把区间静默截断到最后一页（`-f 2 -l 9` 打在 3 页文档上只输出
+    2、3 两页且 rc=0），所以「少了几页」必须由我们自检，不能指望它报错。
+    `pdfinfo` 只用于给出更准确的总页数文案（「共 3 页」），不再承担判据职责。
     """
     requested = getattr(args, "pdf_pages", None)
     dpi = getattr(args, "dpi", DEFAULT_DPI)

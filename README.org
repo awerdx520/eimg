@@ -36,8 +36,8 @@ eimg 把「采集图像 → 识别文字 → 产出可用文本或链接」收�
 - *=python3=* ： =bin/eimg-ocr= 与 =bin/eimg-ocr-setup= 都是 Python 脚本，跑 CLI 必须有系统
   python3；elisp 侧不直接依赖 Python（只经 CLI 子进程间接使用）。
 - 可选外部命令： =pdftoppm= 与 =pdfinfo= （poppler，PDF 栅格化 / 取总页数）、 =tesseract= 。
-  缺 =pdftoppm= 时 PDF 输入无法识别；缺 =pdfinfo= 时页码越界可能静默截断
-  （见「已知边界」）。
+  缺 =pdftoppm= 时 PDF 输入无法识别；缺 =pdfinfo= 时页码越界仍报退出码 3，
+  只是文案无法给出总页数（判据是「实际渲染页数少于请求页数」）。
 - 可选 *ollama* 后端：需要本地 ollama 服务 + 一个**显式配置**的视觉模型（本包不代跑
   ollama pull）。缺服务或缺模型即判该后端不可用， =auto= 会跳过它；可用性判据是 HTTP
   可达而非 =which ollama= ——典型形态是 ollama 装在 Windows 原生侧、WSL 里没有该命令，
@@ -453,9 +453,6 @@ CLI 默认）。 =transient= 不随 =eimg.el= 加载：不按菜单的人不为�
 
 - *阅读顺序只还原单栏横排* ：多栏（双栏论文 / 并排代码）会左右交错，竖排会一字一行。
   实现刻意只做「按 y 中心聚行 + 行内按 x0」，宁可排错也不猜版面。
-- *无 =pdfinfo= 时部分页码越界会静默截断* ： =--pdf-pages 2-9= 打在 3 页文档上，
-  =pdftoppm= 返回 0 且只输出 2、3 两页——没有总页数就没有判据。有 =pdfinfo= 时走
-  前置校验，越界报退出码 3。
 - *=--pdf-pages= 对多 PDF 混排重复生效* ：页码范围对每个输入文件都套用，第二个文件页数
   不足就整批以退出码 3 失败，前面已识别的结果被丢弃。批量场景先别带 =--pdf-pages= 。
 - *=eimg-ocr-region= 需要图形环境* ：无 =display-graphic-p= 时直接 =user-error= ，不去

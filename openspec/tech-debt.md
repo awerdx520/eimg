@@ -7,16 +7,6 @@
 - 每条必须有「现状 / 影响 / 验证方式 / 改进方向」四段；「改进方向」为「无」时必须写清是能力边界而非缺陷。
 - 标题带级别与成本：`（P1/P2/P3 · 成本 S/M/L）`。P1 = 修法明确且低风险；P2 = 需业务决策或中件；P3 = 需新能力或环境限制。
 
-## 无 pdfinfo 时部分页码越界会静默截断（P1 · 成本 S）
-
-现状：`--pdf-pages 2-9` 打在 3 页文档上，系统没有 `pdfinfo` 时 `pdftoppm -f 2 -l 9` 返回 rc=0 且只输出第 2、3 页，CLI 如实返回识别到的页而不报错——没有总页数就没有判据。有 `pdfinfo` 时走总页数前置校验，越界报退出码 3。
-
-影响：用户以为「2–9 页都识别了」，实际少了 4–9 页，而结果 JSON 里看不出任何异常。
-
-验证方式：构造 3 页 PDF，在 PATH 里剔除 `pdfinfo` 后跑 `--pdf-pages 2-9`，断言退出码 3 且 stderr 说明请求页数超出实际渲染页数；保留 `pdfinfo` 的同名用例断言既有行为不变。
-
-改进方向：不必引入硬依赖——把「退出码 3」的判据从「总页数」换成「请求页数 vs 实际渲染页数」：`pdftoppm` 只产出 m 页而请求 n 页（n > m）时即判越界，不装 `pdfinfo` 也能发现「少了几页」；`pdfinfo` 退化为「只用于给出更准确的文案」。
-
 ## `--pdf-pages` 对多 PDF 混排重复生效（P2 · 成本 S · 需先定语义）
 
 现状：多个 PDF 输入时页码范围对每个文件都套用；若第二个文件页数不足，整体以退出码 3 失败，前面文件已识别出的结果被一并丢弃（一次失败的识别成本是整批栅格化 + OCR）。
@@ -127,6 +117,7 @@ P1（坐标地基 + 联动高亮）验收后剩余五项，逐项标级别：
 - `+thomas/screenshot` 的返回值契约未经跨仓契约测试 —— 2026-10-27 关闭。证据：decisions D10 + `test/eimg-ocr-test.el` 第 8 节（四态契约）+ `eimg-capture-test-no-host-symbols`（源码边界）。
 - 交互命令没有 `;;;###autoload`，可用性隐式依赖宿主不延迟加载 —— 2026-10-27 关闭。证据：decisions D11 + `test/eimg-autoload-test.el` 7 条用例（cookie 覆盖、真跑 `loaddefs-generate` 的 13 条映射、仅加载 autoloads 时 `featurep` 为 nil）。
 - sentinel 状态判定不得依赖 event 文案 —— 2026-10-27 关闭。证据：decisions D7 + commit d128464。教训已固化为不变量：判据用 `process-status` + `process-exit-status`，禁止匹配事件串；风险形态是「英文 locale 全绿、中文 locale 全哑」的假绿。
+- 无 pdfinfo 时部分页码越界会静默截断 —— 2026-10-29 关闭。证据：decisions D16 + `test/eimg-ocr-pdf-test.el` 四条用例（`eimg-ocr-pdf-test-partial-overflow-without-pdfinfo` / `-partial-overflow-with-pdfinfo` / `-valid-range-without-pdfinfo` / `-single-page-beyond-without-pdfinfo`）+ `bin/eimg-ocr` 的 `rasterize_pdf` 渲染页数判据。
 
 ## 已转入 README（非债）
 
